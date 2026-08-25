@@ -539,6 +539,7 @@ class CompetitorAnalysisRequest(BaseModel):
 class CompetitorDifferentiationIdea(BaseModel):
     angle: str
     idea: str
+    evidence: str
 
 
 class CompetitorAnalysisResponse(BaseModel):
@@ -1839,10 +1840,10 @@ Content: {body_text}
 
 Based ONLY on the information above — don't invent facts, prices, or claims you can't see there — write:
 1. A short 2-3 sentence summary of what this competitor seems to focus on or offer.
-2. Exactly 3 distinct strategic angles this business could use to stand out, each grounded only in something actually missing or underused based on the competitor info above (and the real trending data, only where genuinely relevant — never claim it applies if it doesn't). Give each a short angle label (e.g. "Emotional Story", "Direct Offer", "Educational Angle", "Trend-Aware Angle" — pick whatever genuinely fits, don't force these exact ones) and one specific, actionable sentence.
+2. Exactly 3 distinct strategic angles this business could use to stand out, each grounded only in something actually missing or underused based on the competitor info above (and the real trending data, only where genuinely relevant — never claim it applies if it doesn't). Give each a short angle label (e.g. "Emotional Story", "Direct Offer", "Educational Angle", "Trend-Aware Angle" — pick whatever genuinely fits, don't force these exact ones), one specific actionable sentence, and one short "evidence" sentence naming the exact thing you saw (or didn't see) in the competitor content above — or, only for a trend-based angle, the specific trending search term — that this idea is based on. The evidence must point to something concrete and checkable, never a vague justification.
 
 Respond with ONLY this JSON format, nothing else:
-{{"summary": "...", "differentiation_ideas": [{{"angle": "...", "idea": "..."}}]}}
+{{"summary": "...", "differentiation_ideas": [{{"angle": "...", "idea": "...", "evidence": "..."}}]}}
 """
     response = with_retry(
         lambda: client.chat.completions.create(
@@ -1867,7 +1868,11 @@ Respond with ONLY this JSON format, nothing else:
         idea_text = str(item.get("idea") or "").strip()
         if not idea_text:
             continue
-        ideas.append({"angle": str(item.get("angle") or "Idea").strip(), "idea": idea_text})
+        ideas.append({
+            "angle": str(item.get("angle") or "Idea").strip(),
+            "idea": idea_text,
+            "evidence": str(item.get("evidence") or "").strip(),
+        })
     return {
         "summary": str(parsed.get("summary") or "").strip(),
         "differentiation_ideas": ideas,
