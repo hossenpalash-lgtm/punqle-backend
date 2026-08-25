@@ -590,8 +590,9 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
 YOUTUBE_CATEGORY_ID = "22"  # People & Blogs — generic small-business default; no category picker in v1
-# Flip to "public" only after a live-verified real upload succeeds end to end.
-YOUTUBE_UPLOAD_PRIVACY_STATUS = "unlisted"
+# Live-verified end to end (real connect, generate, publish, viewed on
+# YouTube) on 2026-08-25 before flipping this from "unlisted" to "public".
+YOUTUBE_UPLOAD_PRIVACY_STATUS = "public"
 # Optional — subscriptions/checkout are disabled (503) until these are set.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
