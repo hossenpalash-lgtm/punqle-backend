@@ -312,6 +312,22 @@ class MetaPublishResponse(BaseModel):
     instagram: Optional[MetaPlatformResult] = None
 
 
+class YouTubeConnectUrlResponse(BaseModel):
+    authorize_url: str
+
+
+class YouTubeStatusResponse(BaseModel):
+    connected: bool
+    channel_title: Optional[str] = None
+
+
+class YouTubePublishResponse(BaseModel):
+    posted: bool
+    video_id: Optional[str] = None
+    video_url: Optional[str] = None
+    error: Optional[str] = None
+
+
 class AdCaptionVariant(BaseModel):
     facebook_caption: str
     whatsapp_message: str
@@ -569,6 +585,13 @@ META_APP_ID = os.getenv("META_APP_ID", "").strip()
 META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 META_GRAPH_VERSION = "v21.0"
 META_GRAPH_URL = f"https://graph.facebook.com/{META_GRAPH_VERSION}"
+# Optional — only YouTube connect+publish needs these.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
+YOUTUBE_CATEGORY_ID = "22"  # People & Blogs — generic small-business default; no category picker in v1
+# Flip to "public" only after a live-verified real upload succeeds end to end.
+YOUTUBE_UPLOAD_PRIVACY_STATUS = "unlisted"
 # Optional — subscriptions/checkout are disabled (503) until these are set.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -1755,6 +1778,72 @@ def _meta_graph_error_message(resp: requests.Response) -> tuple[str, Optional[in
         return err.get("message") or "Meta returned an error.", err.get("code")
     except Exception:
         return "Meta returned an error.", None
+
+
+_YOUTUBE_STATE_SEP = "."
+
+
+def _sign_youtube_state(user_id: str) -> str:
+    """Same purpose/shape as _sign_meta_state — ties the OAuth state param
+    to a specific Punqle user, since the redirect back from Google is a
+    plain browser navigation and can't carry our normal Bearer auth
+    header."""
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{user_id}{_YOUTUBE_STATE_SEP}{nonce}"
+    signature = hmac.new(GOOGLE_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}{_YOUTUBE_STATE_SEP}{signature}"
+
+
+def _verify_youtube_state(state: str) -> str:
+    parts = (state or "").split(_YOUTUBE_STATE_SEP)
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    user_id, nonce, signature = parts
+    payload = f"{user_id}{_YOUTUBE_STATE_SEP}{nonce}"
+    expected = hmac.new(GOOGLE_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    return user_id
+
+
+def _refresh_youtube_token(user_id: str, refresh_token: str) -> Optional[str]:
+    """Returns a fresh access_token and persists it + the new
+    token_expires_at, or None (deleting the connection row) if the
+    refresh_token itself is dead. While the app is unverified with Google
+    ("Testing" publishing status), every refresh_token for a sensitive
+    scope expires after exactly 7 days — this isn't a rare edge case
+    during that window, it's the expected weekly outcome for every
+    connected user until App Review clears."""
+    resp = requests.post("https://oauth2.googleapis.com/token", data={
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+    }, timeout=15)
+    if not resp.ok:
+        supabase.table("youtube_connections").delete().eq("owner_id", user_id).execute()
+        return None
+    data = resp.json()
+    access_token = data["access_token"]
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 3600))).isoformat()
+    supabase.table("youtube_connections").update({
+        "access_token": access_token,
+        "token_expires_at": expires_at,
+    }).eq("owner_id", user_id).execute()
+    # Refresh-grant responses never re-issue a refresh_token — leave that
+    # column untouched here rather than overwriting it with a missing key.
+    return access_token
+
+
+def _get_valid_youtube_token(user_id: str) -> Optional[str]:
+    res = supabase.table("youtube_connections").select("*").eq("owner_id", user_id).execute()
+    if not res.data:
+        return None
+    conn = res.data[0]
+    expires_at = datetime.fromisoformat(conn["token_expires_at"])
+    if expires_at <= datetime.now(timezone.utc) + timedelta(seconds=60):
+        return _refresh_youtube_token(user_id, conn["refresh_token"])
+    return conn["access_token"]
 
 
 _MAX_ARTICLE_CHARS = 6000  # plenty for GPT to find several distinct angles without blowing up the prompt
@@ -3168,6 +3257,226 @@ def _publish_to_instagram(ig_user_id: str, page_access_token: str, image_bytes: 
         return {"posted": False, "error": "Couldn't reach Instagram. Please try again."}
     finally:
         _pop_temp_image(token)
+
+
+@app.get("/youtube/connect-url", response_model=YouTubeConnectUrlResponse, tags=["youtube"])
+def get_youtube_connect_url(user_id: str = Depends(get_current_user_id)):
+    """Returns the Google OAuth dialog URL for the frontend to navigate
+    the browser to directly — same shape as /meta/connect-url.
+    access_type=offline + prompt=consent together are what guarantee a
+    refresh_token comes back; without prompt=consent, a user
+    re-authorizing after already having granted this scope once gets no
+    refresh_token on that later grant, silently breaking reconnect."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="Connecting YouTube isn't available right now.")
+    state = _sign_youtube_state(user_id)
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": f"{BACKEND_URL}/youtube/callback",
+        "response_type": "code",
+        "scope": YOUTUBE_UPLOAD_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return {"authorize_url": f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"}
+
+
+@app.get("/youtube/callback", tags=["youtube"])
+def youtube_oauth_callback(request: Request):
+    """Google redirects the business owner's browser here after they
+    approve (or decline) the connection — a plain GET navigation, not an
+    authenticated API call, so this route trusts our own signed state
+    param instead of a Bearer token (same shape as /meta/callback)."""
+    try:
+        params = dict(request.query_params)
+        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+            return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+        error = params.get("error")
+        code = params.get("code", "")
+        if error or not code:
+            return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+
+        user_id = _verify_youtube_state(params.get("state", ""))
+        redirect_uri = f"{BACKEND_URL}/youtube/callback"
+
+        token_resp = with_retry(
+            lambda: requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not token_resp.ok:
+            logger.error("Google code exchange failed: %s", token_resp.text)
+            return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+        tokens = token_resp.json()
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        if not access_token or not refresh_token:
+            # No refresh_token here means access_type=offline/prompt=consent
+            # didn't do its job (or Google decided not to re-consent) —
+            # without it we can't do anything past the 1-hour access token.
+            return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 3600))).isoformat()
+
+        channel_resp = with_retry(
+            lambda: requests.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "snippet", "mine": "true"},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not channel_resp.ok:
+            logger.error("YouTube channels.list failed: %s", channel_resp.text)
+            return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+        items = channel_resp.json().get("items", [])
+        if not items:
+            # e.g. the business's real content lives on a separate Brand
+            # Account channel — mine=true only returns channels tied
+            # directly to this Google Account's own identity.
+            return RedirectResponse(f"{FRONTEND_URL}/?youtube=error&reason=no_channel")
+        channel = items[0]
+
+        with_retry(lambda: supabase.table("youtube_connections").upsert({
+            "owner_id": user_id,
+            "channel_id": channel["id"],
+            "channel_title": channel["snippet"]["title"],
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_expires_at": expires_at,
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="owner_id").execute())
+        return RedirectResponse(f"{FRONTEND_URL}/?youtube=connected")
+    except HTTPException:
+        return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+    except requests.RequestException:
+        return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        return RedirectResponse(f"{FRONTEND_URL}/?youtube=error")
+
+
+@app.get("/youtube/status", response_model=YouTubeStatusResponse, tags=["youtube"])
+def get_youtube_status(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("youtube_connections")
+            .select("channel_title")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get youtube connection status")
+        if res.data:
+            return {"connected": True, "channel_title": res.data[0]["channel_title"]}
+        return {"connected": False, "channel_title": None}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/youtube/disconnect", tags=["youtube"])
+def disconnect_youtube(user_id: str = Depends(get_current_user_id)):
+    try:
+        supabase.table("youtube_connections").delete().eq("owner_id", user_id).execute()
+        return {"disconnected": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/youtube/publish", response_model=YouTubePublishResponse, tags=["youtube"])
+@limiter.limit("10/minute")
+def publish_to_youtube(
+    request: Request,
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    description: str = Form(""),
+    aspect_ratio: str = Form(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Publishes an already-generated (already-paid-for) video straight
+    to the business's connected YouTube channel — no credit is spent
+    here, same "free packaging" principle as /meta/publish. Uses the
+    resumable upload protocol (an init POST returning a session URL, then
+    one PUT with the full body) rather than a single-request multipart
+    upload — Google's simple multipart upload is hard-capped at 5MB,
+    which an 8-second 720p clip sits close enough to that it isn't a
+    safe bet."""
+    try:
+        access_token = _get_valid_youtube_token(user_id)
+        if not access_token:
+            res = with_retry(lambda: supabase.table("youtube_connections")
+                .select("channel_id")
+                .eq("owner_id", user_id)
+                .execute())
+            res = ensure_supabase_response(res, "get youtube connection")
+            if not res.data:
+                raise HTTPException(status_code=400, detail="Connect YouTube first.")
+            raise HTTPException(status_code=400, detail="Your YouTube connection expired — please reconnect.")
+
+        video_bytes = file.file.read()
+        final_title = f"{title} #Shorts" if aspect_ratio == "9:16" else title
+
+        init_resp = with_retry(
+            lambda: requests.post(
+                "https://www.googleapis.com/upload/youtube/v3/videos",
+                params={"uploadType": "resumable", "part": "snippet,status"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json; charset=UTF-8",
+                    "X-Upload-Content-Type": "video/mp4",
+                    "X-Upload-Content-Length": str(len(video_bytes)),
+                },
+                json={
+                    "snippet": {
+                        "title": final_title[:100],
+                        "description": description,
+                        "categoryId": YOUTUBE_CATEGORY_ID,
+                    },
+                    "status": {"privacyStatus": YOUTUBE_UPLOAD_PRIVACY_STATUS},
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not init_resp.ok:
+            logger.error("YouTube upload init failed: %s", init_resp.text)
+            return {"posted": False, "error": "YouTube rejected the upload request."}
+        upload_url = init_resp.headers.get("Location")
+        if not upload_url:
+            return {"posted": False, "error": "YouTube didn't return an upload session."}
+
+        put_resp = requests.put(
+            upload_url,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "video/mp4"},
+            data=video_bytes,
+            timeout=60,
+        )
+        if not put_resp.ok:
+            logger.error("YouTube video upload failed: %s", put_resp.text)
+            return {"posted": False, "error": "Couldn't upload the video to YouTube."}
+        video_id = put_resp.json().get("id")
+        return {
+            "posted": True,
+            "video_id": video_id,
+            "video_url": f"https://youtu.be/{video_id}" if video_id else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/ads/blog-to-posts", response_model=BlogToPostsResponse, tags=["ads"])
