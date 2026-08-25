@@ -33,6 +33,7 @@ import hmac
 import hashlib
 import secrets
 import stripe
+from pytrends.request import TrendReq
 from urllib.parse import urlparse, urlencode
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -1097,6 +1098,36 @@ Respond with ONLY this JSON format, nothing else:
     ] or [{"facebook_caption": "", "whatsapp_message": ""}]
 
 
+def _fetch_trending_related_terms(query: str) -> list[str]:
+    """Real, current Google Trends related-search data for the given
+    query — grounds hashtag suggestions in what people are actually
+    searching for right now, instead of only GPT's static training-data
+    knowledge (which has a fixed cutoff and no live signal). Best-effort:
+    pytrends talks to Google Trends' unofficial internal API, which can
+    be slow or occasionally fail — any error here just means no trend
+    grounding for this one request, not a broken hashtag suggestion."""
+    try:
+        pytrends = TrendReq(hl="en-US", tz=360, timeout=(5, 8))
+        pytrends.build_payload([query[:100]], timeframe="now 7-d")
+        related = pytrends.related_queries()
+        data = related.get(query[:100]) or {}
+        terms = []
+        for key in ("rising", "top"):
+            df = data.get(key)
+            if df is not None and not df.empty:
+                terms.extend(df["query"].tolist())
+        seen = set()
+        deduped = []
+        for t in terms:
+            if t.lower() not in seen:
+                seen.add(t.lower())
+                deduped.append(t)
+        return deduped[:10]
+    except Exception as e:
+        logger.warning("Google Trends lookup failed (non-fatal): %s", e)
+        return []
+
+
 def _suggest_hashtags(item_description: str, category: str) -> list[str]:
     """Free — text-only, same economics as translate-captions. Separate
     from _generate_ad_copy's caption text on purpose: Predis's own
@@ -1104,10 +1135,17 @@ def _suggest_hashtags(item_description: str, category: str) -> list[str]:
     caption, letting the user toggle individual tags rather than getting
     them locked into whatever the AI wrote inline."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    trending_terms = _fetch_trending_related_terms(item_description)
+    trending_context = (
+        f"\nReal, currently trending related searches (from Google Trends, last 7 days) — "
+        f"weave in a few of these as hashtags only where genuinely relevant, don't force ones "
+        f"that don't fit: {', '.join(trending_terms)}\n"
+        if trending_terms else ""
+    )
     prompt = f"""Suggest 12 relevant hashtags for a small business Facebook/Instagram post. Mix a few broad/popular tags with several niche/specific ones. Don't include the # symbol, no spaces within a tag.
 
 {category_guidance}
-
+{trending_context}
 The post is about: {item_description}
 
 Respond with ONLY this JSON format, nothing else:
