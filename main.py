@@ -539,6 +539,39 @@ class GenerateCaptionsResponse(BaseModel):
     captions: list[AdCaptionVariant]
 
 
+class AdCaptionVariantWithAngle(BaseModel):
+    angle: str
+    facebook_caption: str
+    whatsapp_message: str
+
+
+class GenerateAdCaptionsRequest(BaseModel):
+    item_description: str
+    goal: str
+    angle: Optional[str] = None  # None = "Let Punqle choose" — no forced primary angle
+    count: int = 3
+
+    @field_validator("goal")
+    @classmethod
+    def validate_goal(cls, v):
+        if v not in ("sales", "leads", "traffic", "bookings"):
+            raise ValueError("goal must be one of sales, leads, traffic, bookings")
+        return v
+
+    @field_validator("count")
+    @classmethod
+    def validate_count(cls, v):
+        if v not in (1, 3, 5):
+            raise ValueError("count must be 1, 3, or 5")
+        return v
+
+
+class GenerateAdCaptionsResponse(BaseModel):
+    captions: list[AdCaptionVariantWithAngle]
+    recommended_index: int
+    recommended_reason: str
+
+
 class BlogToPostsRequest(BaseModel):
     url: str
 
@@ -1341,6 +1374,87 @@ Respond with ONLY this JSON format, nothing else:
         }
         for c in captions[:3]
     ] or [{"facebook_caption": "", "whatsapp_message": ""}]
+
+
+AD_GOAL_GUIDANCE = {
+    "sales": "Goal: drive an immediate purchase decision.",
+    "leads": "Goal: get the reader to inquire, message, or sign up — not necessarily buy right now.",
+    "traffic": "Goal: get the reader to visit the store, website, or profile.",
+    "bookings": "Goal: get the reader to book an appointment or reserve a slot.",
+}
+AD_GOAL_CTA = {"sales": "Shop Now", "leads": "Get Quote", "traffic": "Learn More", "bookings": "Book Now"}
+
+
+def _generate_ad_captions(item_description: str, category: str, goal: str, primary_angle: Optional[str], count: int) -> dict:
+    """Free — text-only GPT call, same economics as _generate_captions_with_style.
+    Powers Ad Creation: unlike Image Post's tone/length axes, each variant
+    here is deliberately built around a different persuasion angle, so N
+    "versions" reads as N distinct ways to sell the same offer, not N
+    visual variations of the same pitch."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    goal_guidance = AD_GOAL_GUIDANCE[goal]
+    cta = AD_GOAL_CTA[goal]
+    angle_instruction = (
+        f'The first variant MUST use this angle: "{primary_angle}". The remaining variants must each use a '
+        "genuinely different persuasion angle from this one and each other"
+        if primary_angle else
+        "Each variant must use a genuinely different persuasion angle from the others"
+    )
+    prompt = f"""You are a direct-response ad copywriter for small businesses.
+
+{category_guidance}
+{goal_guidance}
+
+Write exactly {count} distinct ad copy variants for the product/offer below. {angle_instruction} (e.g. "Benefit", "Problem → Solution", "Offer", "Social Proof", "Comparison", "Emotional" — pick whichever angles genuinely fit this offer, don't force one that doesn't apply).
+
+Every variant must end with a clear call to action: "{cta}".
+
+Each variant has three parts:
+1. "angle" — a short label for the persuasion angle used (2-4 words)
+2. "facebook_caption" — a short, engaging ad caption (2-4 lines, ending with the call to action)
+3. "whatsapp_message" — an even shorter WhatsApp version (1-2 lines)
+
+Keep any numbers/prices exactly as given — don't invent new prices or offers.
+
+After writing all variants, pick the ONE you genuinely think is strongest for this specific offer and goal, and say why in one short sentence — not a fabricated score, just your honest reasoning.
+
+Product/offer description: {item_description}
+
+Respond with ONLY this JSON format, nothing else:
+{{"captions": [{{"angle": "...", "facebook_caption": "...", "whatsapp_message": "..."}}], "recommended_index": 0, "recommended_reason": "..."}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You write short, high-converting ad copy for small business owners, grounded only in what's actually given to you."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.8,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    captions_raw = parsed.get("captions") or []
+    captions = [
+        {
+            "angle": c.get("angle", "").strip() or "Idea",
+            "facebook_caption": c.get("facebook_caption", ""),
+            "whatsapp_message": c.get("whatsapp_message", ""),
+        }
+        for c in captions_raw[:count]
+    ] or [{"angle": "Idea", "facebook_caption": "", "whatsapp_message": ""}]
+    recommended_index = parsed.get("recommended_index")
+    if not isinstance(recommended_index, int) or not (0 <= recommended_index < len(captions)):
+        recommended_index = 0
+    return {
+        "captions": captions,
+        "recommended_index": recommended_index,
+        "recommended_reason": str(parsed.get("recommended_reason") or "").strip(),
+    }
 
 
 def _generate_idea_labs_ideas(category: str) -> list[str]:
@@ -2593,6 +2707,31 @@ def generate_captions(
         category = _get_business_category(user_id)
         captions = _generate_captions_with_style(text, category, req.tone, req.length)
         return {"captions": captions}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-ad-captions", response_model=GenerateAdCaptionsResponse, tags=["ads"])
+@limiter.limit("15/minute")
+def generate_ad_captions(
+    request: Request,
+    req: GenerateAdCaptionsRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only GPT call, same economics as generate-captions.
+    Powers Ad Creation's angle-labeled variants; deliberately separate
+    from the tone/length-driven /ads/generate-captions since goal/angle
+    is a genuinely different axis, not a style tweak on the same one."""
+    try:
+        text = (req.item_description or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Tell us what you're advertising first.")
+        category = _get_business_category(user_id)
+        result = _generate_ad_captions(text, category, req.goal, req.angle, req.count)
+        return result
     except HTTPException:
         raise
     except Exception as e:
