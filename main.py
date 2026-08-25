@@ -536,10 +536,15 @@ class CompetitorAnalysisRequest(BaseModel):
     url: str
 
 
+class CompetitorDifferentiationIdea(BaseModel):
+    angle: str
+    idea: str
+
+
 class CompetitorAnalysisResponse(BaseModel):
     competitor_name: str
     summary: str
-    differentiation_ideas: list[str]
+    differentiation_ideas: list[CompetitorDifferentiationIdea]
 
 
 # -----------------------
@@ -1813,20 +1818,31 @@ Respond with ONLY this JSON format, nothing else:
 
 def _generate_competitor_analysis(title: str, body_text: str, category: str) -> dict:
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    # Real, current search-interest grounding (same helper/data source as
+    # suggest-hashtags) — not competitor-specific data (no ad-library or
+    # social-metrics access exists), just an honest signal for whether
+    # something in this space is genuinely trending right now, so an
+    # angle can reference it when true instead of only ever guessing.
+    trending_terms = _fetch_trending_related_terms(title or body_text[:100])
+    trending_context = (
+        f"\nReal, currently trending related searches (from Google Trends, last 7 days) in this space — "
+        f"reference one only if it genuinely fits an angle, don't force it: {', '.join(trending_terms)}\n"
+        if trending_terms else ""
+    )
     prompt = f"""You are a marketing strategist helping a small business understand a competitor.
 
 {category_guidance}
-
+{trending_context}
 Here is publicly visible information about a competitor:
 Name/Title: {title or "(unknown)"}
 Content: {body_text}
 
 Based ONLY on the information above — don't invent facts, prices, or claims you can't see there — write:
 1. A short 2-3 sentence summary of what this competitor seems to focus on or offer.
-2. 5 specific, actionable ways this business could differentiate itself or find a content angle the competitor likely isn't using.
+2. Exactly 3 distinct strategic angles this business could use to stand out, each grounded only in something actually missing or underused based on the competitor info above (and the real trending data, only where genuinely relevant — never claim it applies if it doesn't). Give each a short angle label (e.g. "Emotional Story", "Direct Offer", "Educational Angle", "Trend-Aware Angle" — pick whatever genuinely fits, don't force these exact ones) and one specific, actionable sentence.
 
 Respond with ONLY this JSON format, nothing else:
-{{"summary": "...", "differentiation_ideas": ["idea 1", "idea 2"]}}
+{{"summary": "...", "differentiation_ideas": [{{"angle": "...", "idea": "..."}}]}}
 """
     response = with_retry(
         lambda: client.chat.completions.create(
@@ -1843,10 +1859,18 @@ Respond with ONLY this JSON format, nothing else:
     m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
     ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
     parsed = json.loads(ai_text_clean)
-    ideas = parsed.get("differentiation_ideas") or []
+    ideas_raw = parsed.get("differentiation_ideas") or []
+    ideas = []
+    for item in ideas_raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        idea_text = str(item.get("idea") or "").strip()
+        if not idea_text:
+            continue
+        ideas.append({"angle": str(item.get("angle") or "Idea").strip(), "idea": idea_text})
     return {
         "summary": str(parsed.get("summary") or "").strip(),
-        "differentiation_ideas": [str(i).strip() for i in ideas if str(i).strip()][:6],
+        "differentiation_ideas": ideas,
     }
 
 
