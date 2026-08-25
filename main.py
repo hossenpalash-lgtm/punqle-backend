@@ -206,12 +206,24 @@ class GenerateVideoRequest(BaseModel):
     image_base64: Optional[str] = None
     image_mime_type: Optional[str] = None
     aspect_ratio: str = "16:9"
+    # Both optional, both None for every existing Social Content caller —
+    # only Ad Creation's Video Ad flow sets these, to make the on-screen
+    # headline genuinely goal/angle-aware. See _generate_video_headline.
+    goal: Optional[str] = None
+    angle: Optional[str] = None
 
     @field_validator("aspect_ratio")
     @classmethod
     def validate_video_aspect_ratio(cls, v):
         if v not in ("16:9", "9:16"):
             raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
+
+    @field_validator("goal")
+    @classmethod
+    def validate_video_goal(cls, v):
+        if v is not None and v not in ("sales", "leads", "traffic", "bookings"):
+            raise ValueError("Invalid goal")
         return v
 
 
@@ -2358,17 +2370,27 @@ VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 
 
-def _generate_video_headline(item_description: str, category: str) -> str:
+def _generate_video_headline(item_description: str, category: str, goal: Optional[str] = None, primary_angle: Optional[str] = None) -> str:
     """Free — a short on-screen hook, distinct from the longer Facebook
     caption text (_generate_ad_copy): Veo has no reliable way to render
     text itself (same limitation as the image model), so a real headline
     only exists once burned on afterward — this generates what to burn.
     Kept short on purpose so it fits one line at a legible size without
-    needing the wrapping logic compositeImage.ts uses for images."""
+    needing the wrapping logic compositeImage.ts uses for images.
+
+    goal/primary_angle are only ever set by Ad Creation's Video Ad flow —
+    every Social Content caller omits them, leaving this prompt byte-
+    identical to before."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    ad_context = ""
+    if goal:
+        ad_context = f"\n{AD_GOAL_GUIDANCE[goal]}"
+        if primary_angle:
+            ad_context += f' Lean into this angle: "{primary_angle}".'
     prompt = f"""You are writing a short on-screen text hook for a social media ad video for a small business.
 
 {category_guidance}
+{ad_context}
 
 The video is about: {item_description}
 
@@ -2470,7 +2492,7 @@ def start_video_generation(
             )
 
         category = _get_business_category(user_id)
-        headline = _generate_video_headline(item_description, category)
+        headline = _generate_video_headline(item_description, category, req.goal, req.angle)
 
         prompt = (
             f"A short, eye-catching social media ad video for a small business. {item_description}. "
