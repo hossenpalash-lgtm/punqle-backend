@@ -247,6 +247,31 @@ class VideoStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+class TryOnStartRequest(BaseModel):
+    model_image_base64: str
+    model_image_mime_type: str = "image/jpeg"
+    # Either a catalog product's existing image_url (skips a fetch/base64
+    # round trip, FASHN accepts URLs directly) or an uploaded photo's
+    # base64 — the endpoint requires exactly one of these two to be set.
+    product_image_url: Optional[str] = None
+    product_image_base64: Optional[str] = None
+    product_image_mime_type: Optional[str] = None
+
+
+class TryOnStartResponse(BaseModel):
+    id: str
+
+
+class TryOnStatusRequest(BaseModel):
+    id: str
+
+
+class TryOnStatusResponse(BaseModel):
+    done: bool
+    image_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 class ImportedProductOut(BaseModel):
     id: str
     name: str
@@ -621,6 +646,8 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 # Optional — only stock-photo search needs this, same reasoning as above.
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+# Optional — only Try-On needs this.
+FASHN_API_KEY = os.getenv("FASHN_API_KEY", "").strip()
 # Optional — only Shopify connect needs these.
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
@@ -2369,6 +2396,9 @@ VIDEO_CREDIT_COST = 10  # ~10x an image credit, matching Veo 3.1 Lite's real ~$0
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 
+TRYON_CREDIT_COST = 2  # tryon-v1.6 is a flat 1 FASHN credit ≈ $0.075/generation, same cost-to-credit ratio as VIDEO_CREDIT_COST
+FASHN_API_BASE = "https://api.fashn.ai/v1"
+
 
 def _generate_video_headline(item_description: str, category: str, goal: Optional[str] = None, primary_angle: Optional[str] = None) -> str:
     """Free — a short on-screen hook, distinct from the longer Facebook
@@ -2558,6 +2588,117 @@ def check_video_status(
         return {
             "done": True,
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tryon/generate", response_model=TryOnStartResponse, tags=["tryon"])
+@limiter.limit("10/minute")
+def start_tryon(
+    request: Request,
+    req: TryOnStartRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Starts a FASHN virtual try-on job. Mirrors start_video_generation's
+    shape exactly: doesn't spend a credit here (check-then-charge-on-
+    success, only in check_tryon_status once a real result comes back) —
+    just kicks the job off with FASHN and hands back their own job id for
+    the frontend to poll. No DB row is ever created for this — unlike
+    /ads/generate, this never calls _save_generated_post, deliberately:
+    the uploaded photo is a person's face, not a product shot, and has no
+    business sitting in a shared history table."""
+    try:
+        if not FASHN_API_KEY:
+            raise HTTPException(status_code=503, detail="Try-On isn't enabled yet.")
+        credits = _get_ad_credits(user_id)
+        if credits < TRYON_CREDIT_COST:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Try-On needs {TRYON_CREDIT_COST} credits — you have {credits}.",
+            )
+        if not req.product_image_url and not req.product_image_base64:
+            raise HTTPException(status_code=400, detail="A product photo is required.")
+
+        model_image = f"data:{req.model_image_mime_type};base64,{req.model_image_base64}"
+        product_image = req.product_image_url or f"data:{req.product_image_mime_type};base64,{req.product_image_base64}"
+
+        resp = with_retry(
+            lambda: requests.post(
+                f"{FASHN_API_BASE}/run",
+                headers={"Authorization": f"Bearer {FASHN_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model_name": "tryon-v1.6",
+                    "inputs": {
+                        "model_image": model_image,
+                        "garment_image": product_image,
+                        "mode": "performance",
+                    },
+                },
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise HTTPException(status_code=502, detail="Try-On couldn't start. Please try again.")
+        return {"id": data["id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tryon/status", response_model=TryOnStatusResponse, tags=["tryon"])
+@limiter.limit("30/minute")
+def check_tryon_status(
+    request: Request,
+    req: TryOnStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Stateless polling, same reasoning as check_video_status — the job
+    id round-trips through the client rather than being kept server-side,
+    so a mid-generation backend restart can't strand anyone's job."""
+    try:
+        if not FASHN_API_KEY:
+            raise HTTPException(status_code=503, detail="Try-On isn't enabled yet.")
+
+        resp = with_retry(
+            lambda: requests.get(
+                f"{FASHN_API_BASE}/status/{req.id}",
+                headers={"Authorization": f"Bearer {FASHN_API_KEY}"},
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+
+        if status in ("starting", "in_queue", "processing"):
+            return {"done": False, "image_base64": None, "credits_remaining": None}
+
+        if status == "failed":
+            error = data.get("error") or {}
+            raise HTTPException(status_code=502, detail=error.get("message") or "Try-On failed. Please try again.")
+
+        output = data.get("output") or []
+        if status != "completed" or not output:
+            raise HTTPException(status_code=502, detail="Try-On didn't return a result. Please try again.")
+
+        image_bytes, _ = _fetch_url_bytes(output[0])
+        new_credits = _spend_ad_credits(user_id, TRYON_CREDIT_COST)
+        return {
+            "done": True,
+            "image_base64": base64.b64encode(image_bytes).decode("ascii"),
             "credits_remaining": new_credits,
         }
     except HTTPException:
