@@ -342,6 +342,7 @@ class MetaPlatformResult(BaseModel):
     post_id: Optional[str] = None
     media_id: Optional[str] = None
     error: Optional[str] = None
+    scheduled: Optional[bool] = None
 
 
 class MetaPublishResponse(BaseModel):
@@ -363,6 +364,7 @@ class YouTubePublishResponse(BaseModel):
     video_id: Optional[str] = None
     video_url: Optional[str] = None
     error: Optional[str] = None
+    scheduled: Optional[bool] = None
 
 
 class AdCaptionVariant(BaseModel):
@@ -3425,6 +3427,30 @@ def get_meta_temp_image(token: str):
     return Response(content=image_bytes, media_type=mime_type)
 
 
+def _parse_scheduled_time(scheduled_time: Optional[str]) -> Optional[datetime]:
+    """Shared validation for both Facebook and YouTube scheduling —
+    Meta requires 10 minutes-30 days out (sources vary 30-75 days; using
+    the conservative bound so we never claim a window Meta might reject).
+    Returns the validated, timezone-aware datetime, or None if
+    scheduled_time wasn't provided (meaning: publish immediately, today's
+    exact existing behavior). Callers convert to whatever shape their
+    own API needs (Meta: unix timestamp, YouTube: RFC3339 string)."""
+    if not scheduled_time:
+        return None
+    try:
+        dt = datetime.fromisoformat(scheduled_time.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scheduled time.")
+    now = datetime.now(timezone.utc)
+    if dt < now + timedelta(minutes=10):
+        raise HTTPException(status_code=400, detail="Scheduled time must be at least 10 minutes from now.")
+    if dt > now + timedelta(days=30):
+        raise HTTPException(status_code=400, detail="Scheduled time can't be more than 30 days out.")
+    return dt
+
+
 @app.post("/meta/publish", response_model=MetaPublishResponse, tags=["meta"])
 @limiter.limit("10/minute")
 def publish_to_meta(
@@ -3433,6 +3459,7 @@ def publish_to_meta(
     caption: str = Form(...),
     post_to_facebook: bool = Form(...),
     post_to_instagram: bool = Form(...),
+    scheduled_time: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) image straight
@@ -3441,9 +3468,17 @@ def publish_to_meta(
     Carousel Builder's ZIP download. Facebook and Instagram are
     independent Graph API calls with no shared rollback, so a partial
     success (one platform posts, the other fails) is surfaced rather
-    than hidden or rolled back."""
+    than hidden or rolled back.
+
+    scheduled_time (optional, ISO8601) only affects Facebook — Meta's
+    Graph API has no scheduling parameter for Instagram's Content
+    Publishing endpoints, so Instagram always posts immediately
+    regardless of this field. The frontend is responsible for disclosing
+    that to the user before submitting, not this endpoint."""
     if not post_to_facebook and not post_to_instagram:
         raise HTTPException(status_code=400, detail="Choose at least one platform to post to.")
+    scheduled_dt = _parse_scheduled_time(scheduled_time)
+    scheduled_unix = int(scheduled_dt.timestamp()) if scheduled_dt else None
     try:
         res = with_retry(lambda: supabase.table("meta_connections")
             .select("page_id, page_access_token, ig_user_id")
@@ -3464,6 +3499,7 @@ def publish_to_meta(
         if post_to_facebook:
             result["facebook"] = _publish_to_facebook_page(
                 connection["page_id"], connection["page_access_token"], image_bytes, mime_type, caption, user_id,
+                scheduled_unix,
             )
 
         if post_to_instagram:
@@ -3486,12 +3522,21 @@ def _disconnect_meta_on_expired_token(user_id: str) -> None:
         pass
 
 
-def _publish_to_facebook_page(page_id: str, page_access_token: str, image_bytes: bytes, mime_type: str, caption: str, user_id: str) -> dict:
+def _publish_to_facebook_page(
+    page_id: str, page_access_token: str, image_bytes: bytes, mime_type: str, caption: str, user_id: str,
+    scheduled_unix: Optional[int] = None,
+) -> dict:
     try:
+        post_data = {"caption": caption, "access_token": page_access_token}
+        if scheduled_unix is not None:
+            # Meta schedules at the Page-post level (same endpoint,
+            # same photo — it just doesn't go live until this time).
+            post_data["published"] = "false"
+            post_data["scheduled_publish_time"] = str(scheduled_unix)
         resp = with_retry(
             lambda: requests.post(
                 f"{META_GRAPH_URL}/{page_id}/photos",
-                data={"caption": caption, "access_token": page_access_token},
+                data=post_data,
                 files={"source": ("image.jpg", image_bytes, mime_type)},
                 timeout=30,
             ),
@@ -3499,8 +3544,8 @@ def _publish_to_facebook_page(page_id: str, page_access_token: str, image_bytes:
             attempts=2,
         )
         if resp.ok:
-            data = resp.json()
-            return {"posted": True, "post_id": data.get("post_id") or data.get("id")}
+            resp_data = resp.json()
+            return {"posted": True, "post_id": resp_data.get("post_id") or resp_data.get("id"), "scheduled": scheduled_unix is not None}
         message, code = _meta_graph_error_message(resp)
         if code == 190:
             _disconnect_meta_on_expired_token(user_id)
@@ -3705,6 +3750,7 @@ def publish_to_youtube(
     title: str = Form(...),
     description: str = Form(""),
     aspect_ratio: str = Form(...),
+    scheduled_time: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) video straight
@@ -3714,8 +3760,13 @@ def publish_to_youtube(
     one PUT with the full body) rather than a single-request multipart
     upload — Google's simple multipart upload is hard-capped at 5MB,
     which an 8-second 720p clip sits close enough to that it isn't a
-    safe bet."""
+    safe bet.
+
+    scheduled_time (optional, ISO8601): YouTube natively supports this —
+    upload as "private" with a future publishAt, and YouTube itself
+    flips it public at that time. No polling/job needed on our side."""
     try:
+        scheduled_dt = _parse_scheduled_time(scheduled_time)
         access_token = _get_valid_youtube_token(user_id)
         if not access_token:
             res = with_retry(lambda: supabase.table("youtube_connections")
@@ -3729,6 +3780,12 @@ def publish_to_youtube(
 
         video_bytes = file.file.read()
         final_title = f"{title} #Shorts" if aspect_ratio == "9:16" else title
+
+        status: dict = {"privacyStatus": YOUTUBE_UPLOAD_PRIVACY_STATUS}
+        if scheduled_dt is not None:
+            # A scheduled video must be "private" until publishAt — YouTube
+            # rejects publishAt on anything already "public".
+            status = {"privacyStatus": "private", "publishAt": scheduled_dt.isoformat().replace("+00:00", "Z")}
 
         init_resp = with_retry(
             lambda: requests.post(
@@ -3746,7 +3803,7 @@ def publish_to_youtube(
                         "description": description,
                         "categoryId": YOUTUBE_CATEGORY_ID,
                     },
-                    "status": {"privacyStatus": YOUTUBE_UPLOAD_PRIVACY_STATUS},
+                    "status": status,
                 },
                 timeout=15,
             ),
@@ -3774,6 +3831,7 @@ def publish_to_youtube(
             "posted": True,
             "video_id": video_id,
             "video_url": f"https://youtu.be/{video_id}" if video_id else None,
+            "scheduled": scheduled_dt is not None,
         }
     except HTTPException:
         raise
