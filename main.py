@@ -33,6 +33,7 @@ import hmac
 import hashlib
 import secrets
 import stripe
+from PIL import Image, ImageDraw, ImageFont
 from pytrends.request import TrendReq
 from urllib.parse import urlparse, urlencode
 from bs4 import BeautifulSoup
@@ -2449,17 +2450,6 @@ Respond with ONLY the headline text, nothing else.
     return headline[:60]
 
 
-def _escape_ffmpeg_drawtext(text: str) -> str:
-    """drawtext's own mini-syntax treats \\, ', %, and : as special —
-    escape in the order that keeps escaping itself from being re-escaped."""
-    return (
-        text.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-    )
-
-
 # Veo always renders at exactly one of these two 720p frame sizes (see
 # GenerateVideosConfig's resolution="720p" in start_video_generation) —
 # known deterministically, so the logo's target pixel size can be
@@ -2471,6 +2461,36 @@ def _escape_ffmpeg_drawtext(text: str) -> str:
 _VIDEO_DIMENSIONS = {"16:9": (1280, 720), "9:16": (720, 1280)}
 
 
+def _render_headline_png(headline: str, video_w: int, video_h: int) -> bytes:
+    """Renders the headline + its caption-bar background as a transparent
+    RGBA PNG the full size of the video frame, composited on afterward via
+    ffmpeg's overlay filter — same role compositeImage.ts's caption bar
+    plays for images. Text is rendered with Pillow rather than ffmpeg's
+    own drawtext filter: the Linux static ffmpeg binary imageio-ffmpeg
+    bundles on Render doesn't have drawtext compiled in (confirmed live —
+    "No such filter: 'drawtext'" — even though the same code worked
+    against the macOS binary used for local testing), so text rendering
+    moved here entirely and only the (filter-agnostic) overlay compositing
+    is left to ffmpeg."""
+    font = ImageFont.truetype(VIDEO_FONT_PATH, round(video_w * 0.0344))
+    canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    text_bbox = draw.textbbox((0, 0), headline, font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    pad = round(video_w * 0.01875)
+    bottom_margin = round(video_h * 0.0694)
+    box_bottom = video_h - bottom_margin
+    box_top = box_bottom - text_h - 2 * pad
+    box_left = (video_w - text_w) / 2 - pad
+    box_right = (video_w + text_w) / 2 + pad
+    draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(0, 0, 0, 153))
+    draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), headline, font=font, fill=(255, 255, 255, 255))
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _burn_text_on_video(
     video_bytes: bytes,
     headline: str,
@@ -2478,19 +2498,17 @@ def _burn_text_on_video(
     logo_base64: Optional[str] = None,
     logo_mime_type: Optional[str] = None,
 ) -> bytes:
-    """Bakes the headline onto the video as a bottom caption bar (the
-    same visual role compositeImage.ts's caption bar plays for images —
-    real text the AI model itself can't reliably render) and, if the
-    business has a Brand Kit logo set, overlays it top-left — the video
-    equivalent of compositeImage.ts's logo badge, previously image-only
-    since Veo's own prompt explicitly asks for no on-screen logos. ffmpeg
-    comes from imageio-ffmpeg's bundled binary, no system ffmpeg install
-    needed (same reasoning as this app's earlier frame-extraction work)."""
+    """Bakes the headline onto the video as a bottom caption bar (real
+    text the AI model itself can't reliably render) and, if the business
+    has a Brand Kit logo set, overlays it top-left — the video equivalent
+    of compositeImage.ts's logo badge, previously image-only since Veo's
+    own prompt explicitly asks for no on-screen logos. ffmpeg comes from
+    imageio-ffmpeg's bundled binary, no system ffmpeg install needed."""
     if not headline and not logo_base64:
         return video_bytes
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    video_w, _video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
     # Logo sized as 15% of frame width, inset 4% from the top-left corner
     # — matches the proportions of the image flow's logo badge closely
     # enough without needing canvas-text.ts's white backing-plate logic
@@ -2505,31 +2523,30 @@ def _burn_text_on_video(
             f.write(video_bytes)
 
         cmd = [ffmpeg_exe, "-y", "-i", input_path]
-        # Sized relative to the video's own width/height (not fixed
-        # pixels) — a fixed 44px font tuned for a 1280px-wide 16:9 frame
-        # overflowed both edges on a 720px-wide 9:16 frame once the
-        # aspect-ratio picker shipped. Ratios below match what the old
-        # fixed values worked out to on the original 1280x720 frame.
-        drawtext = (
-            f"drawtext=fontfile={VIDEO_FONT_PATH}:text='{_escape_ffmpeg_drawtext(headline)}':"
-            "fontcolor=white:fontsize=w*0.0344:box=1:boxcolor=black@0.6:boxborderw=w*0.01875:"
-            "x=(w-text_w)/2:y=h-text_h-h*0.0694"
-        ) if headline else None
+        chain_parts = []
+        stage = "[0:v]"
+        next_input_idx = 1
 
         if logo_base64:
             logo_path = os.path.join(tmp_dir, "logo")
             with open(logo_path, "wb") as f:
                 f.write(base64.b64decode(logo_base64))
             cmd += ["-i", logo_path]
-            chain = f"[1:v]scale={logo_w}:-1[logo];[0:v][logo]overlay=x={inset}:y={inset}"
-            if drawtext:
-                chain += f"[withlogo];[withlogo]{drawtext}[out]"
-            else:
-                chain += "[out]"
-            cmd += ["-filter_complex", chain, "-map", "[out]", "-map", "0:a?"]
-        else:
-            cmd += ["-vf", drawtext]
+            out_label = "[withlogo]" if headline else "[out]"
+            chain_parts.append(f"[{next_input_idx}:v]scale={logo_w}:-1[logoscaled]")
+            chain_parts.append(f"{stage}[logoscaled]overlay=x={inset}:y={inset}{out_label}")
+            stage = out_label
+            next_input_idx += 1
 
+        if headline:
+            headline_path = os.path.join(tmp_dir, "headline.png")
+            with open(headline_path, "wb") as f:
+                f.write(_render_headline_png(headline, video_w, video_h))
+            cmd += ["-i", headline_path]
+            chain_parts.append(f"{stage}[{next_input_idx}:v]overlay=x=0:y=0[out]")
+            next_input_idx += 1
+
+        cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]", "-map", "0:a?"]
         cmd += ["-c:a", "copy", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
