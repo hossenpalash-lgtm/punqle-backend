@@ -2501,7 +2501,9 @@ def _is_light_color(rgb: tuple) -> bool:
     return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6
 
 
-def _render_caption_bar_png(text: str, video_w: int, video_h: int, brand_color: Optional[str] = None) -> bytes:
+def _render_caption_bar_png(
+    text: str, video_w: int, video_h: int, brand_color: Optional[str] = None, text_position: str = "bottom",
+) -> bytes:
     """Renders text + its caption-bar background as a transparent RGBA
     PNG the full size of the video frame, composited on afterward via
     ffmpeg's overlay filter — same role compositeImage.ts's caption bar
@@ -2518,7 +2520,11 @@ def _render_caption_bar_png(text: str, video_w: int, video_h: int, brand_color: 
     brand_color (a "#RRGGBB" hex string, same as the image flow's Brand
     Kit) tints the bar background when set; same fallback (plain black)
     and alpha as before when it's None, so accounts without a brand
-    color see byte-identical output to before this was added."""
+    color see byte-identical output to before this was added.
+
+    text_position defaults to "bottom" — every existing caller's exact
+    prior placement, unchanged. "top"/"center" are only reachable from
+    the Edit Video panel."""
     font = ImageFont.truetype(VIDEO_FONT_PATH, round(video_w * 0.0344))
     canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
@@ -2526,9 +2532,15 @@ def _render_caption_bar_png(text: str, video_w: int, video_h: int, brand_color: 
     text_w = text_bbox[2] - text_bbox[0]
     text_h = text_bbox[3] - text_bbox[1]
     pad = round(video_w * 0.01875)
-    bottom_margin = round(video_h * 0.0694)
-    box_bottom = video_h - bottom_margin
-    box_top = box_bottom - text_h - 2 * pad
+    margin = round(video_h * 0.0694)
+    box_h = text_h + 2 * pad
+    if text_position == "top":
+        box_top = margin
+    elif text_position == "center":
+        box_top = (video_h - box_h) / 2
+    else:
+        box_top = video_h - margin - box_h
+    box_bottom = box_top + box_h
     box_left = (video_w - text_w) / 2 - pad
     box_right = (video_w + text_w) / 2 + pad
     bar_rgb = _hex_to_rgb(brand_color) if brand_color else (0, 0, 0)
@@ -2540,6 +2552,9 @@ def _render_caption_bar_png(text: str, video_w: int, video_h: int, brand_color: 
     return buf.getvalue()
 
 
+_LOGO_CORNERS = {"top-left", "top-right", "bottom-left", "bottom-right"}
+
+
 def _burn_text_on_video(
     video_bytes: bytes,
     headline: str,
@@ -2548,30 +2563,40 @@ def _burn_text_on_video(
     logo_mime_type: Optional[str] = None,
     hook_duration_seconds: Optional[float] = None,
     brand_color: Optional[str] = None,
+    text_position: str = "bottom",
+    logo_position: str = "top-left",
+    muted: bool = False,
 ) -> bytes:
-    """Bakes the headline onto the video as a bottom caption bar (real
-    text the AI model itself can't reliably render) and, if the business
-    has a Brand Kit logo set, overlays it top-left — the video equivalent
-    of compositeImage.ts's logo badge, previously image-only since Veo's
+    """Bakes the headline onto the video as a caption bar (real text the
+    AI model itself can't reliably render) and, if the business has a
+    Brand Kit logo set, overlays it — the video equivalent of
+    compositeImage.ts's logo badge, previously image-only since Veo's
     own prompt explicitly asks for no on-screen logos. ffmpeg comes from
     imageio-ffmpeg's bundled binary, no system ffmpeg install needed.
 
     hook_duration_seconds is None for every existing caller (check_video_
     status included) — full-duration headline, unchanged default
-    behavior. Only the voiceover flow passes a real value, to gate the
+    behavior. Only the Edit Video flow passes a real value, to gate the
     headline down to a short opening hook before its own synced captions
-    take over — see _compose_voiceover_video."""
-    if not headline and not logo_base64:
+    take over — see _render_edited_video.
+
+    text_position/logo_position/muted all default to every prior
+    caller's exact existing behavior (bottom, top-left, audio kept) —
+    only the Edit Video panel ever passes non-default values."""
+    if not headline and not logo_base64 and not muted:
         return video_bytes
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
-    # Logo sized as 15% of frame width, inset 4% from the top-left corner
+    # Logo sized as 15% of frame width, inset 4% from whichever corner
     # — matches the proportions of the image flow's logo badge closely
     # enough without needing canvas-text.ts's white backing-plate logic
     # ported into ffmpeg for this first version.
     logo_w = round(video_w * 0.15)
     inset = round(video_w * 0.04)
+    logo_position = logo_position if logo_position in _LOGO_CORNERS else "top-left"
+    logo_x = f"main_w-overlay_w-{inset}" if "right" in logo_position else str(inset)
+    logo_y = f"main_h-overlay_h-{inset}" if "bottom" in logo_position else str(inset)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "input.mp4")
@@ -2591,27 +2616,33 @@ def _burn_text_on_video(
             cmd += ["-i", logo_path]
             out_label = "[withlogo]" if headline else "[out]"
             chain_parts.append(f"[{next_input_idx}:v]scale={logo_w}:-1[logoscaled]")
-            chain_parts.append(f"{stage}[logoscaled]overlay=x={inset}:y={inset}{out_label}")
+            chain_parts.append(f"{stage}[logoscaled]overlay=x={logo_x}:y={logo_y}{out_label}")
             stage = out_label
             next_input_idx += 1
 
         if headline:
             headline_path = os.path.join(tmp_dir, "headline.png")
             with open(headline_path, "wb") as f:
-                f.write(_render_caption_bar_png(headline, video_w, video_h, brand_color))
+                f.write(_render_caption_bar_png(headline, video_w, video_h, brand_color, text_position))
             cmd += ["-i", headline_path]
             enable_clause = f":enable='lt(t,{hook_duration_seconds})'" if hook_duration_seconds else ""
             chain_parts.append(f"{stage}[{next_input_idx}:v]overlay=x=0:y=0{enable_clause}[out]")
             next_input_idx += 1
 
-        cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]", "-map", "0:a?"]
+        if not chain_parts:
+            chain_parts.append(f"{stage}null[out]")
+
+        cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]"]
+        cmd += [] if muted else ["-map", "0:a?"]
         # Render's free tier caps the whole process at 512MB — libx264's
         # default settings (multi-threaded lookahead + B-frame buffering)
         # OOM-killed the instance mid-encode in a live test. These flags
         # trade a little encode speed/file-size efficiency for a much
         # smaller memory footprint; still well inside the 120s timeout
         # for an 8s clip.
-        cmd += ["-c:a", "copy", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-threads", "1", output_path]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-threads", "1"]
+        cmd += ["-an"] if muted else ["-c:a", "copy"]
+        cmd += [output_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             logger.error("ffmpeg overlay failed: %s", result.stderr[-2000:])
@@ -2735,11 +2766,14 @@ def check_video_status(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _synthesize_voiceover(narration: str) -> bytes:
+_TTS_VOICES = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+
+
+def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
     response = with_retry(
         lambda: client.audio.speech.create(
             model=TTS_MODEL,
-            voice=TTS_VOICE,
+            voice=voice if voice in _TTS_VOICES else TTS_VOICE,
             input=narration[:MAX_NARRATION_CHARS],
             response_format="mp3",
         ),
@@ -2793,43 +2827,26 @@ def _group_words_into_captions(words: list, hook_duration: float, max_segments: 
     return segments
 
 
-def _compose_voiceover_video(
-    operation: dict,
-    headline: str,
-    narration: str,
-    aspect_ratio: str,
-    logo_base64: Optional[str],
-    logo_mime_type: Optional[str],
-    brand_color: Optional[str] = None,
-) -> bytes:
-    """Re-downloads the same Veo output fresh (cheap re-fetch of an
-    already-generated file, not a re-generation) so this can burn a
-    SHORT hook + logo from a clean slate, independent of whatever
-    check_video_status already returned to the client — that version has
-    the full-duration headline permanently baked into its pixels, which
-    is exactly the behavior every non-voiceover video must keep
-    unchanged. Only videos where the user explicitly adds voiceover ever
-    go through this function."""
+def _download_operation_video(operation: dict) -> bytes:
+    """Re-downloads a Veo output fresh via its operation handle — cheap
+    re-fetch of an already-generated file, not a re-generation. Used
+    only by the Edit Video flow (_render_edited_video); check_video_
+    status has its own inline version of this, deliberately left
+    untouched so its already-verified default behavior can't regress."""
     op = genai_types.GenerateVideosOperation.model_validate(operation)
     op = gemini_client.operations.get(op)
     if not op.done:
         raise Exception("This video isn't ready yet.")
     result = op.result or op.response
     if not result or not result.generated_videos:
-        raise Exception("This video has expired — generate a new one to add voiceover.")
-    video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
+        raise Exception("This video has expired — generate a new one to edit it.")
+    return gemini_client.files.download(file=result.generated_videos[0].video)
 
-    hook_duration = HOOK_DURATION_SECONDS if headline.strip() else 0.0
-    video_bytes = _burn_text_on_video(
-        video_bytes, headline.strip(), aspect_ratio, logo_base64, logo_mime_type,
-        hook_duration_seconds=HOOK_DURATION_SECONDS if headline.strip() else None,
-        brand_color=brand_color,
-    )
 
-    audio_bytes = _synthesize_voiceover(narration)
-    words = _transcribe_word_timestamps(audio_bytes)
-    caption_segments = _group_words_into_captions(words, hook_duration, MAX_CAPTION_SEGMENTS)
-
+def _compose_audio_and_captions(video_bytes: bytes, audio_bytes: bytes, caption_segments: list, aspect_ratio: str) -> bytes:
+    """Overlays each timed caption segment and replaces the video's
+    audio track with the given voiceover audio entirely (not mixed —
+    no audio-mixing precedent exists anywhere in this codebase)."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
 
@@ -2850,7 +2867,7 @@ def _compose_voiceover_video(
         for i, seg in enumerate(caption_segments):
             seg_path = os.path.join(tmp_dir, f"cap{i}.png")
             with open(seg_path, "wb") as f:
-                f.write(_render_caption_bar_png(seg["text"], video_w, video_h, brand_color))
+                f.write(_render_caption_bar_png(seg["text"], video_w, video_h))
             cmd += ["-i", seg_path]
             is_last = i == len(caption_segments) - 1
             out_label = "[out]" if is_last else f"[cap{i}out]"
@@ -2879,64 +2896,149 @@ def _compose_voiceover_video(
             return f.read()
 
 
-class AddVoiceoverRequest(BaseModel):
+def _render_edited_video(
+    operation: dict,
+    headline: str,
+    aspect_ratio: str,
+    logo_base64: Optional[str],
+    logo_mime_type: Optional[str],
+    logo_position: str,
+    brand_color: Optional[str],
+    text_position: str,
+    narration: str,
+    voice: str,
+    voiceover_enabled: bool,
+    captions_enabled: bool,
+    muted: bool,
+) -> tuple:
+    """Single entry point for the Edit Video panel — always starts from
+    a fresh re-download (never the already-composited video the client
+    currently shows), so headline/logo/color/position edits are free
+    (no video-generation cost) and independent of whatever was baked in
+    before. Returns (video_bytes, voiceover_was_synthesized) so the
+    caller knows whether to charge for it.
+
+    muted takes precedence over voiceover_enabled — no point paying for
+    speech that's immediately silenced."""
+    video_bytes = _download_operation_video(operation)
+    headline = headline.strip()
+
+    if voiceover_enabled and narration.strip() and not muted:
+        hook_duration = HOOK_DURATION_SECONDS if headline else 0.0
+        video_bytes = _burn_text_on_video(
+            video_bytes, headline, aspect_ratio, logo_base64, logo_mime_type,
+            hook_duration_seconds=HOOK_DURATION_SECONDS if headline else None,
+            brand_color=brand_color, text_position=text_position, logo_position=logo_position,
+        )
+        audio_bytes = _synthesize_voiceover(narration, voice)
+        caption_segments = []
+        if captions_enabled:
+            words = _transcribe_word_timestamps(audio_bytes)
+            caption_segments = _group_words_into_captions(words, hook_duration, MAX_CAPTION_SEGMENTS)
+        video_bytes = _compose_audio_and_captions(video_bytes, audio_bytes, caption_segments, aspect_ratio)
+        return video_bytes, True
+
+    video_bytes = _burn_text_on_video(
+        video_bytes, headline, aspect_ratio, logo_base64, logo_mime_type,
+        brand_color=brand_color, text_position=text_position, logo_position=logo_position, muted=muted,
+    )
+    return video_bytes, False
+
+
+_TEXT_POSITIONS = {"top", "center", "bottom"}
+
+
+class EditVideoRequest(BaseModel):
     operation: dict
-    # Not re-burned for the whole video — only used to decide whether
-    # captions should wait until HOOK_DURATION_SECONDS (a hook was shown)
-    # or start at t=0 (no hook was ever set for this video).
     headline: str = ""
-    narration: str
+    narration: str = ""
     aspect_ratio: str = "16:9"
+    show_logo: bool = True
+    logo_position: str = "top-left"
+    use_brand_color: bool = True
+    text_position: str = "bottom"
+    voiceover_enabled: bool = False
+    voice: str = TTS_VOICE
+    captions_enabled: bool = True
+    muted: bool = False
 
     @field_validator("aspect_ratio")
     @classmethod
-    def validate_voiceover_aspect_ratio(cls, v):
+    def validate_edit_aspect_ratio(cls, v):
         if v not in ("16:9", "9:16"):
             raise ValueError("aspect_ratio must be '16:9' or '9:16'")
         return v
 
+    @field_validator("logo_position")
+    @classmethod
+    def validate_logo_position(cls, v):
+        if v not in _LOGO_CORNERS:
+            raise ValueError(f"logo_position must be one of {_LOGO_CORNERS}")
+        return v
 
-class AddVoiceoverResponse(BaseModel):
+    @field_validator("text_position")
+    @classmethod
+    def validate_text_position(cls, v):
+        if v not in _TEXT_POSITIONS:
+            raise ValueError(f"text_position must be one of {_TEXT_POSITIONS}")
+        return v
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice(cls, v):
+        if v not in _TTS_VOICES:
+            raise ValueError(f"voice must be one of {_TTS_VOICES}")
+        return v
+
+
+class EditVideoResponse(BaseModel):
     video_base64: str
     credits_remaining: int
+    credits_charged: int
 
 
-@app.post("/ads/add-voiceover", response_model=AddVoiceoverResponse, tags=["ads"])
+@app.post("/ads/edit-video", response_model=EditVideoResponse, tags=["ads"])
 @limiter.limit("10/minute")
-def add_voiceover(
+def edit_video(
     request: Request,
-    req: AddVoiceoverRequest,
+    req: EditVideoRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Optional post-generation action — real spoken narration + captions
-    synced to it, replacing the video's audio track entirely. Only ever
-    called when the user explicitly clicks "Add voiceover" on an already-
-    generated video's result screen; check_video_status's own default
-    behavior is completely unaffected by this endpoint's existence."""
+    """Post-generation edit panel — headline/logo/brand-color/position/
+    voiceover/captions/mute, all reusing a fresh re-download of the same
+    Veo output rather than regenerating it. Only ever called when the
+    user explicitly opens "Edit Video" on an already-generated video's
+    result screen; check_video_status's own default behavior (and its
+    credit cost) is completely unaffected by this endpoint's existence.
+    Free unless voiceover audio actually gets (re)synthesized."""
     try:
         if gemini_client is None:
-            raise HTTPException(status_code=503, detail="Voiceover isn't available right now.")
-        credits = _get_ad_credits(user_id)
-        if credits < VOICEOVER_CREDIT_COST:
-            raise HTTPException(
-                status_code=402,
-                detail=f"Voiceover needs {VOICEOVER_CREDIT_COST} credits — you have {credits}.",
-            )
-        narration = (req.narration or "").strip()
-        if not narration:
-            raise HTTPException(status_code=400, detail="No narration script to speak.")
+            raise HTTPException(status_code=503, detail="Video editing isn't available right now.")
+        wants_voiceover = req.voiceover_enabled and req.narration.strip() and not req.muted
+        cost = VOICEOVER_CREDIT_COST if wants_voiceover else 0
+        if cost:
+            credits = _get_ad_credits(user_id)
+            if credits < cost:
+                raise HTTPException(status_code=402, detail=f"Voiceover needs {cost} credits — you have {credits}.")
 
         profile = _get_business_profile(user_id)
-        result_bytes = _compose_voiceover_video(
-            req.operation, req.headline, narration, req.aspect_ratio,
-            profile.get("logo_base64"), profile.get("logo_mime_type"),
-            brand_color=profile.get("brand_color"),
+        logo_base64 = profile.get("logo_base64") if req.show_logo else None
+        logo_mime_type = profile.get("logo_mime_type") if req.show_logo else None
+        brand_color = profile.get("brand_color") if req.use_brand_color else None
+
+        video_bytes, used_voiceover = _render_edited_video(
+            req.operation, req.headline, req.aspect_ratio,
+            logo_base64, logo_mime_type, req.logo_position,
+            brand_color, req.text_position,
+            req.narration, req.voice, req.voiceover_enabled, req.captions_enabled, req.muted,
         )
 
-        new_credits = _spend_ad_credits(user_id, VOICEOVER_CREDIT_COST)
+        charged = cost if used_voiceover else 0
+        new_credits = _spend_ad_credits(user_id, charged) if charged else _get_ad_credits(user_id)
         return {
-            "video_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "video_base64": base64.b64encode(video_bytes).decode("ascii"),
             "credits_remaining": new_credits,
+            "credits_charged": charged,
         }
     except HTTPException:
         raise
