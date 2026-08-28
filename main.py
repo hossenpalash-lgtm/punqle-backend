@@ -2487,7 +2487,21 @@ Respond with ONLY this JSON format, nothing else:
 _VIDEO_DIMENSIONS = {"16:9": (1280, 720), "9:16": (720, 1280)}
 
 
-def _render_caption_bar_png(text: str, video_w: int, video_h: int) -> bytes:
+def _hex_to_rgb(hex_color: str) -> tuple:
+    h = hex_color.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _is_light_color(rgb: tuple) -> bool:
+    # Same perceptual-luminance formula (BT.601 weights, 0.6 threshold)
+    # canvas-text.ts's isLight() uses for the image flow's brand-colored
+    # caption bar — kept identical so a business's brand color reads the
+    # same way (white vs near-black text) on both images and video.
+    r, g, b = rgb
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6
+
+
+def _render_caption_bar_png(text: str, video_w: int, video_h: int, brand_color: Optional[str] = None) -> bytes:
     """Renders text + its caption-bar background as a transparent RGBA
     PNG the full size of the video frame, composited on afterward via
     ffmpeg's overlay filter — same role compositeImage.ts's caption bar
@@ -2499,7 +2513,12 @@ def _render_caption_bar_png(text: str, video_w: int, video_h: int) -> bytes:
     compiled in (confirmed live — "No such filter: 'drawtext'" — even
     though the same code worked against the macOS binary used for local
     testing), so text rendering moved here entirely and only the
-    (filter-agnostic) overlay compositing is left to ffmpeg."""
+    (filter-agnostic) overlay compositing is left to ffmpeg.
+
+    brand_color (a "#RRGGBB" hex string, same as the image flow's Brand
+    Kit) tints the bar background when set; same fallback (plain black)
+    and alpha as before when it's None, so accounts without a brand
+    color see byte-identical output to before this was added."""
     font = ImageFont.truetype(VIDEO_FONT_PATH, round(video_w * 0.0344))
     canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
@@ -2512,8 +2531,10 @@ def _render_caption_bar_png(text: str, video_w: int, video_h: int) -> bytes:
     box_top = box_bottom - text_h - 2 * pad
     box_left = (video_w - text_w) / 2 - pad
     box_right = (video_w + text_w) / 2 + pad
-    draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(0, 0, 0, 153))
-    draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), text, font=font, fill=(255, 255, 255, 255))
+    bar_rgb = _hex_to_rgb(brand_color) if brand_color else (0, 0, 0)
+    text_rgb = (26, 26, 26) if brand_color and _is_light_color(bar_rgb) else (255, 255, 255)
+    draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(*bar_rgb, 153))
+    draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), text, font=font, fill=(*text_rgb, 255))
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
     return buf.getvalue()
@@ -2526,6 +2547,7 @@ def _burn_text_on_video(
     logo_base64: Optional[str] = None,
     logo_mime_type: Optional[str] = None,
     hook_duration_seconds: Optional[float] = None,
+    brand_color: Optional[str] = None,
 ) -> bytes:
     """Bakes the headline onto the video as a bottom caption bar (real
     text the AI model itself can't reliably render) and, if the business
@@ -2576,7 +2598,7 @@ def _burn_text_on_video(
         if headline:
             headline_path = os.path.join(tmp_dir, "headline.png")
             with open(headline_path, "wb") as f:
-                f.write(_render_caption_bar_png(headline, video_w, video_h))
+                f.write(_render_caption_bar_png(headline, video_w, video_h, brand_color))
             cmd += ["-i", headline_path]
             enable_clause = f":enable='lt(t,{hook_duration_seconds})'" if hook_duration_seconds else ""
             chain_parts.append(f"{stage}[{next_input_idx}:v]overlay=x=0:y=0{enable_clause}[out]")
@@ -2691,6 +2713,7 @@ def check_video_status(
                 video_bytes = _burn_text_on_video(
                     video_bytes, headline, req.aspect_ratio,
                     profile.get("logo_base64"), profile.get("logo_mime_type"),
+                    brand_color=profile.get("brand_color"),
                 )
             except Exception as e:
                 # The raw video is still a perfectly usable result without
@@ -2777,6 +2800,7 @@ def _compose_voiceover_video(
     aspect_ratio: str,
     logo_base64: Optional[str],
     logo_mime_type: Optional[str],
+    brand_color: Optional[str] = None,
 ) -> bytes:
     """Re-downloads the same Veo output fresh (cheap re-fetch of an
     already-generated file, not a re-generation) so this can burn a
@@ -2799,6 +2823,7 @@ def _compose_voiceover_video(
     video_bytes = _burn_text_on_video(
         video_bytes, headline.strip(), aspect_ratio, logo_base64, logo_mime_type,
         hook_duration_seconds=HOOK_DURATION_SECONDS if headline.strip() else None,
+        brand_color=brand_color,
     )
 
     audio_bytes = _synthesize_voiceover(narration)
@@ -2825,7 +2850,7 @@ def _compose_voiceover_video(
         for i, seg in enumerate(caption_segments):
             seg_path = os.path.join(tmp_dir, f"cap{i}.png")
             with open(seg_path, "wb") as f:
-                f.write(_render_caption_bar_png(seg["text"], video_w, video_h))
+                f.write(_render_caption_bar_png(seg["text"], video_w, video_h, brand_color))
             cmd += ["-i", seg_path]
             is_last = i == len(caption_segments) - 1
             out_label = "[out]" if is_last else f"[cap{i}out]"
@@ -2905,6 +2930,7 @@ def add_voiceover(
         result_bytes = _compose_voiceover_video(
             req.operation, req.headline, narration, req.aspect_ratio,
             profile.get("logo_base64"), profile.get("logo_mime_type"),
+            brand_color=profile.get("brand_color"),
         )
 
         new_credits = _spend_ad_credits(user_id, VOICEOVER_CREDIT_COST)
