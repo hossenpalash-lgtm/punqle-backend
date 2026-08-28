@@ -2843,10 +2843,20 @@ def _download_operation_video(operation: dict) -> bytes:
     return gemini_client.files.download(file=result.generated_videos[0].video)
 
 
-def _compose_audio_and_captions(video_bytes: bytes, audio_bytes: bytes, caption_segments: list, aspect_ratio: str) -> bytes:
+def _compose_audio_and_captions(
+    video_bytes: bytes,
+    audio_bytes: bytes,
+    caption_segments: list,
+    aspect_ratio: str,
+    brand_color: Optional[str] = None,
+    text_position: str = "bottom",
+) -> bytes:
     """Overlays each timed caption segment and replaces the video's
     audio track with the given voiceover audio entirely (not mixed —
-    no audio-mixing precedent exists anywhere in this codebase)."""
+    no audio-mixing precedent exists anywhere in this codebase).
+    brand_color/text_position match whatever the hook was rendered
+    with, so captions don't visually jump to a different look/spot
+    once the hook window ends."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
 
@@ -2867,7 +2877,7 @@ def _compose_audio_and_captions(video_bytes: bytes, audio_bytes: bytes, caption_
         for i, seg in enumerate(caption_segments):
             seg_path = os.path.join(tmp_dir, f"cap{i}.png")
             with open(seg_path, "wb") as f:
-                f.write(_render_caption_bar_png(seg["text"], video_w, video_h))
+                f.write(_render_caption_bar_png(seg["text"], video_w, video_h, brand_color, text_position))
             cmd += ["-i", seg_path]
             is_last = i == len(caption_segments) - 1
             out_label = "[out]" if is_last else f"[cap{i}out]"
@@ -2935,7 +2945,7 @@ def _render_edited_video(
         if captions_enabled:
             words = _transcribe_word_timestamps(audio_bytes)
             caption_segments = _group_words_into_captions(words, hook_duration, MAX_CAPTION_SEGMENTS)
-        video_bytes = _compose_audio_and_captions(video_bytes, audio_bytes, caption_segments, aspect_ratio)
+        video_bytes = _compose_audio_and_captions(video_bytes, audio_bytes, caption_segments, aspect_ratio, brand_color, text_position)
         return video_bytes, True
 
     video_bytes = _burn_text_on_video(
