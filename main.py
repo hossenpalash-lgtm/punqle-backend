@@ -209,7 +209,7 @@ class GenerateVideoRequest(BaseModel):
     aspect_ratio: str = "16:9"
     # Both optional, both None for every existing Social Content caller —
     # only Ad Creation's Video Ad flow sets these, to make the on-screen
-    # headline genuinely goal/angle-aware. See _generate_video_headline.
+    # headline genuinely goal/angle-aware. See _generate_video_script.
     goal: Optional[str] = None
     angle: Optional[str] = None
 
@@ -231,6 +231,7 @@ class GenerateVideoRequest(BaseModel):
 class VideoOperationOut(BaseModel):
     operation: dict
     headline: str
+    narration: str = ""
 
 
 class VideoStatusRequest(BaseModel):
@@ -2406,48 +2407,73 @@ VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font
 TRYON_CREDIT_COST = 2  # tryon-v1.6 is a flat 1 FASHN credit ≈ $0.075/generation, same cost-to-credit ratio as VIDEO_CREDIT_COST
 FASHN_API_BASE = "https://api.fashn.ai/v1"
 
+# Real cost here is tiny (~$0.003/clip: tts-1 at $15/1M chars on a ~150
+# char script, whisper-1 at $0.006/min on an ~8s clip) — priced above
+# raw cost like every other credit constant in this file, not a strict
+# passthrough, since this is also the heaviest ffmpeg workload in the app.
+VOICEOVER_CREDIT_COST = 2
+TTS_MODEL = "tts-1"
+TTS_VOICE = "alloy"
+# whisper-1 specifically (not gpt-4o-transcribe/mini) — the SDK's own
+# type signatures only allow response_format="verbose_json" +
+# timestamp_granularities=["word"] (real per-word timing) on whisper-1.
+TRANSCRIBE_MODEL = "whisper-1"
+HOOK_DURATION_SECONDS = 1.5
+WORDS_PER_CAPTION = 4
+MAX_CAPTION_SEGMENTS = 6
+MAX_NARRATION_CHARS = 220  # safety clamp — expected script is ~110-160 chars
 
-def _generate_video_headline(item_description: str, category: str, goal: Optional[str] = None, primary_angle: Optional[str] = None) -> str:
-    """Free — a short on-screen hook, distinct from the longer Facebook
-    caption text (_generate_ad_copy): Veo has no reliable way to render
-    text itself (same limitation as the image model), so a real headline
-    only exists once burned on afterward — this generates what to burn.
-    Kept short on purpose so it fits one line at a legible size without
-    needing the wrapping logic compositeImage.ts uses for images.
+
+def _generate_video_script(item_description: str, category: str, goal: Optional[str] = None, primary_angle: Optional[str] = None) -> dict:
+    """Free — one call that writes BOTH the short on-screen hook (Veo has
+    no reliable way to render text itself, same limitation as the image
+    model, so a real headline only exists once burned on afterward) AND a
+    longer voiceover-ready narration script, for the optional "Add
+    voiceover" action on the result screen. Deliberately one call, not
+    two — the narration is just a second field in the same JSON response,
+    so a video that never gets voiceover added costs nothing extra.
 
     goal/primary_angle are only ever set by Ad Creation's Video Ad flow —
     every Social Content caller omits them, leaving this prompt byte-
-    identical to before."""
+    identical to before for the hook half."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     ad_context = ""
     if goal:
         ad_context = f"\n{AD_GOAL_GUIDANCE[goal]}"
         if primary_angle:
             ad_context += f' Lean into this angle: "{primary_angle}".'
-    prompt = f"""You are writing a short on-screen text hook for a social media ad video for a small business.
+    prompt = f"""You are writing on-screen text and a voiceover script for a social media ad video for a small business.
 
 {category_guidance}
 {ad_context}
 
 The video is about: {item_description}
 
-Write ONE short, punchy headline for this video — 4 to 8 words, under 40 characters, no hashtags, no emoji, no quotation marks. It should work as a bold on-screen caption overlaid on the video, not a full sentence.
+Write TWO things:
+1. "hook" — ONE short, punchy on-screen text hook, 4 to 8 words, under 40 characters, no hashtags, no emoji, no quotation marks. It should work as a bold on-screen caption overlaid on the video, not a full sentence.
+2. "narration" — a natural-sounding 1-2 sentence voiceover script a narrator would SAY out loud for the whole ~8 second video, roughly 15 to 22 words. Conversational and energetic, no hashtags, no emoji, no quotation marks, no stage directions.
 
-Respond with ONLY the headline text, nothing else.
+Respond with ONLY this JSON format, nothing else:
+{{"hook": "", "narration": ""}}
 """
     response = with_retry(
         lambda: client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You write short, punchy on-screen video hooks for small business ads."},
+                {"role": "system", "content": "You write short, punchy on-screen video hooks and natural voiceover scripts for small business ads."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
-    headline = response.choices[0].message.content.strip().strip('"').strip("'")
-    return headline[:60]
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    hook = (parsed.get("hook") or "").strip().strip('"').strip("'")[:60]
+    narration = (parsed.get("narration") or "").strip().strip('"').strip("'")[:MAX_NARRATION_CHARS]
+    return {"headline": hook, "narration": narration}
 
 
 # Veo always renders at exactly one of these two 720p frame sizes (see
@@ -2461,21 +2487,23 @@ Respond with ONLY the headline text, nothing else.
 _VIDEO_DIMENSIONS = {"16:9": (1280, 720), "9:16": (720, 1280)}
 
 
-def _render_headline_png(headline: str, video_w: int, video_h: int) -> bytes:
-    """Renders the headline + its caption-bar background as a transparent
-    RGBA PNG the full size of the video frame, composited on afterward via
+def _render_caption_bar_png(text: str, video_w: int, video_h: int) -> bytes:
+    """Renders text + its caption-bar background as a transparent RGBA
+    PNG the full size of the video frame, composited on afterward via
     ffmpeg's overlay filter — same role compositeImage.ts's caption bar
-    plays for images. Text is rendered with Pillow rather than ffmpeg's
-    own drawtext filter: the Linux static ffmpeg binary imageio-ffmpeg
-    bundles on Render doesn't have drawtext compiled in (confirmed live —
-    "No such filter: 'drawtext'" — even though the same code worked
-    against the macOS binary used for local testing), so text rendering
-    moved here entirely and only the (filter-agnostic) overlay compositing
-    is left to ffmpeg."""
+    plays for images. Used for both the on-screen hook and, later, each
+    synced-caption segment in the voiceover flow, since they share the
+    exact same bar/font/positioning look. Text is rendered with Pillow
+    rather than ffmpeg's own drawtext filter: the Linux static ffmpeg
+    binary imageio-ffmpeg bundles on Render doesn't have drawtext
+    compiled in (confirmed live — "No such filter: 'drawtext'" — even
+    though the same code worked against the macOS binary used for local
+    testing), so text rendering moved here entirely and only the
+    (filter-agnostic) overlay compositing is left to ffmpeg."""
     font = ImageFont.truetype(VIDEO_FONT_PATH, round(video_w * 0.0344))
     canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
-    text_bbox = draw.textbbox((0, 0), headline, font=font)
+    text_bbox = draw.textbbox((0, 0), text, font=font)
     text_w = text_bbox[2] - text_bbox[0]
     text_h = text_bbox[3] - text_bbox[1]
     pad = round(video_w * 0.01875)
@@ -2485,7 +2513,7 @@ def _render_headline_png(headline: str, video_w: int, video_h: int) -> bytes:
     box_left = (video_w - text_w) / 2 - pad
     box_right = (video_w + text_w) / 2 + pad
     draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(0, 0, 0, 153))
-    draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), headline, font=font, fill=(255, 255, 255, 255))
+    draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), text, font=font, fill=(255, 255, 255, 255))
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
     return buf.getvalue()
@@ -2497,13 +2525,20 @@ def _burn_text_on_video(
     aspect_ratio: str = "16:9",
     logo_base64: Optional[str] = None,
     logo_mime_type: Optional[str] = None,
+    hook_duration_seconds: Optional[float] = None,
 ) -> bytes:
     """Bakes the headline onto the video as a bottom caption bar (real
     text the AI model itself can't reliably render) and, if the business
     has a Brand Kit logo set, overlays it top-left — the video equivalent
     of compositeImage.ts's logo badge, previously image-only since Veo's
     own prompt explicitly asks for no on-screen logos. ffmpeg comes from
-    imageio-ffmpeg's bundled binary, no system ffmpeg install needed."""
+    imageio-ffmpeg's bundled binary, no system ffmpeg install needed.
+
+    hook_duration_seconds is None for every existing caller (check_video_
+    status included) — full-duration headline, unchanged default
+    behavior. Only the voiceover flow passes a real value, to gate the
+    headline down to a short opening hook before its own synced captions
+    take over — see _compose_voiceover_video."""
     if not headline and not logo_base64:
         return video_bytes
 
@@ -2541,9 +2576,10 @@ def _burn_text_on_video(
         if headline:
             headline_path = os.path.join(tmp_dir, "headline.png")
             with open(headline_path, "wb") as f:
-                f.write(_render_headline_png(headline, video_w, video_h))
+                f.write(_render_caption_bar_png(headline, video_w, video_h))
             cmd += ["-i", headline_path]
-            chain_parts.append(f"{stage}[{next_input_idx}:v]overlay=x=0:y=0[out]")
+            enable_clause = f":enable='lt(t,{hook_duration_seconds})'" if hook_duration_seconds else ""
+            chain_parts.append(f"{stage}[{next_input_idx}:v]overlay=x=0:y=0{enable_clause}[out]")
             next_input_idx += 1
 
         cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]", "-map", "0:a?"]
@@ -2597,7 +2633,7 @@ def start_video_generation(
             )
 
         category = _get_business_category(user_id)
-        headline = _generate_video_headline(item_description, category, req.goal, req.angle)
+        script = _generate_video_script(item_description, category, req.goal, req.angle)
 
         prompt = (
             f"A short, eye-catching social media ad video for a small business. {item_description}. "
@@ -2613,7 +2649,7 @@ def start_video_generation(
                 duration_seconds="8",
             ),
         )
-        return {"operation": operation.model_dump(mode="json"), "headline": headline}
+        return {"operation": operation.model_dump(mode="json"), "headline": script["headline"], "narration": script["narration"]}
     except HTTPException:
         raise
     except Exception as e:
@@ -2667,6 +2703,213 @@ def check_video_status(
         return {
             "done": True,
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _synthesize_voiceover(narration: str) -> bytes:
+    response = with_retry(
+        lambda: client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=narration[:MAX_NARRATION_CHARS],
+            response_format="mp3",
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    return response.content
+
+
+def _transcribe_word_timestamps(audio_bytes: bytes) -> list:
+    """Whisper on our own just-synthesized TTS audio, not to figure out
+    WHAT was said (we already know — we wrote the script) but WHEN each
+    word actually lands, since TTS speech pacing/pauses aren't uniform
+    and captions that drift from the real audio look broken."""
+    response = with_retry(
+        lambda: client.audio.transcriptions.create(
+            model=TRANSCRIBE_MODEL,
+            file=("voiceover.mp3", audio_bytes, "audio/mpeg"),
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    return [{"word": w.word, "start": w.start, "end": w.end} for w in (response.words or [])]
+
+
+def _group_words_into_captions(words: list, hook_duration: float, max_segments: int) -> list:
+    """Buckets Whisper's per-word timestamps into ~4-word caption
+    phrases. Anything spoken before hook_duration is skipped/clamped —
+    the on-screen hook already occupies that window. Hard-caps segment
+    count, merging overflow into the last segment rather than silently
+    dropping the tail of the narration."""
+    captionable = [w for w in words if w["end"] > hook_duration]
+    if not captionable:
+        return []
+    segments = []
+    for i in range(0, len(captionable), WORDS_PER_CAPTION):
+        chunk = captionable[i:i + WORDS_PER_CAPTION]
+        segments.append({
+            "text": " ".join(w["word"].strip() for w in chunk),
+            "start": max(chunk[0]["start"], hook_duration),
+            "end": chunk[-1]["end"],
+        })
+    if len(segments) > max_segments:
+        keep, overflow = segments[:max_segments - 1], segments[max_segments - 1:]
+        keep.append({
+            "text": " ".join(s["text"] for s in overflow),
+            "start": overflow[0]["start"],
+            "end": overflow[-1]["end"],
+        })
+        segments = keep
+    return segments
+
+
+def _compose_voiceover_video(
+    operation: dict,
+    headline: str,
+    narration: str,
+    aspect_ratio: str,
+    logo_base64: Optional[str],
+    logo_mime_type: Optional[str],
+) -> bytes:
+    """Re-downloads the same Veo output fresh (cheap re-fetch of an
+    already-generated file, not a re-generation) so this can burn a
+    SHORT hook + logo from a clean slate, independent of whatever
+    check_video_status already returned to the client — that version has
+    the full-duration headline permanently baked into its pixels, which
+    is exactly the behavior every non-voiceover video must keep
+    unchanged. Only videos where the user explicitly adds voiceover ever
+    go through this function."""
+    op = genai_types.GenerateVideosOperation.model_validate(operation)
+    op = gemini_client.operations.get(op)
+    if not op.done:
+        raise Exception("This video isn't ready yet.")
+    result = op.result or op.response
+    if not result or not result.generated_videos:
+        raise Exception("This video has expired — generate a new one to add voiceover.")
+    video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
+
+    hook_duration = HOOK_DURATION_SECONDS if headline.strip() else 0.0
+    video_bytes = _burn_text_on_video(
+        video_bytes, headline.strip(), aspect_ratio, logo_base64, logo_mime_type,
+        hook_duration_seconds=HOOK_DURATION_SECONDS if headline.strip() else None,
+    )
+
+    audio_bytes = _synthesize_voiceover(narration)
+    words = _transcribe_word_timestamps(audio_bytes)
+    caption_segments = _group_words_into_captions(words, hook_duration, MAX_CAPTION_SEGMENTS)
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        audio_path = os.path.join(tmp_dir, "voiceover.mp3")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+        with open(input_path, "wb") as f:
+            f.write(video_bytes)
+        with open(audio_path, "wb") as f:
+            f.write(audio_bytes)
+
+        cmd = [ffmpeg_exe, "-y", "-i", input_path, "-i", audio_path]
+        chain_parts = []
+        stage = "[0:v]"
+        next_input_idx = 2
+
+        for i, seg in enumerate(caption_segments):
+            seg_path = os.path.join(tmp_dir, f"cap{i}.png")
+            with open(seg_path, "wb") as f:
+                f.write(_render_caption_bar_png(seg["text"], video_w, video_h))
+            cmd += ["-i", seg_path]
+            is_last = i == len(caption_segments) - 1
+            out_label = "[out]" if is_last else f"[cap{i}out]"
+            chain_parts.append(
+                f"{stage}[{next_input_idx}:v]overlay=x=0:y=0:enable='between(t,{seg['start']:.2f},{seg['end']:.2f})'{out_label}"
+            )
+            stage = out_label
+            next_input_idx += 1
+
+        if not caption_segments:
+            chain_parts.append(f"{stage}null[out]")
+
+        cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]", "-map", "1:a"]
+        cmd += [
+            "-af", "apad", "-shortest",
+            "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-threads", "1",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+        result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result_proc.returncode != 0:
+            logger.error("ffmpeg voiceover compose failed: %s", result_proc.stderr[-2000:])
+            raise Exception("Couldn't add the voiceover to the video.")
+
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+class AddVoiceoverRequest(BaseModel):
+    operation: dict
+    # Not re-burned for the whole video — only used to decide whether
+    # captions should wait until HOOK_DURATION_SECONDS (a hook was shown)
+    # or start at t=0 (no hook was ever set for this video).
+    headline: str = ""
+    narration: str
+    aspect_ratio: str = "16:9"
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_voiceover_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16"):
+            raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
+
+
+class AddVoiceoverResponse(BaseModel):
+    video_base64: str
+    credits_remaining: int
+
+
+@app.post("/ads/add-voiceover", response_model=AddVoiceoverResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def add_voiceover(
+    request: Request,
+    req: AddVoiceoverRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Optional post-generation action — real spoken narration + captions
+    synced to it, replacing the video's audio track entirely. Only ever
+    called when the user explicitly clicks "Add voiceover" on an already-
+    generated video's result screen; check_video_status's own default
+    behavior is completely unaffected by this endpoint's existence."""
+    try:
+        if gemini_client is None:
+            raise HTTPException(status_code=503, detail="Voiceover isn't available right now.")
+        credits = _get_ad_credits(user_id)
+        if credits < VOICEOVER_CREDIT_COST:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Voiceover needs {VOICEOVER_CREDIT_COST} credits — you have {credits}.",
+            )
+        narration = (req.narration or "").strip()
+        if not narration:
+            raise HTTPException(status_code=400, detail="No narration script to speak.")
+
+        profile = _get_business_profile(user_id)
+        result_bytes = _compose_voiceover_video(
+            req.operation, req.headline, narration, req.aspect_ratio,
+            profile.get("logo_base64"), profile.get("logo_mime_type"),
+        )
+
+        new_credits = _spend_ad_credits(user_id, VOICEOVER_CREDIT_COST)
+        return {
+            "video_base64": base64.b64encode(result_bytes).decode("ascii"),
             "credits_remaining": new_credits,
         }
     except HTTPException:
