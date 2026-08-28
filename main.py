@@ -239,6 +239,10 @@ class VideoStatusRequest(BaseModel):
     # it is at poll time is what gets burned onto the finished video. Empty
     # string means the user cleared it deliberately — skip burn-in entirely.
     headline: str = ""
+    # Needed to size the logo overlay correctly (Veo's two possible 720p
+    # frame sizes differ) — defaults to "16:9" so older frontend builds
+    # that don't send this yet still get a sane result, not an error.
+    aspect_ratio: str = "16:9"
 
 
 class VideoStatusResponse(BaseModel):
@@ -2456,35 +2460,81 @@ def _escape_ffmpeg_drawtext(text: str) -> str:
     )
 
 
-def _burn_text_on_video(video_bytes: bytes, headline: str) -> bytes:
-    """Bakes the headline onto the video as a bottom caption bar, the
+# Veo always renders at exactly one of these two 720p frame sizes (see
+# GenerateVideosConfig's resolution="720p" in start_video_generation) —
+# known deterministically, so the logo's target pixel size can be
+# computed in Python rather than asking ffmpeg to read the main video's
+# own dimensions at filter-graph time (tried via scale2ref first; it's
+# deprecated and produced an empty/unfiltered output in a live test —
+# a fixed-size scale computed from these known dims is simpler and
+# actually works, verified against both aspect ratios before shipping).
+_VIDEO_DIMENSIONS = {"16:9": (1280, 720), "9:16": (720, 1280)}
+
+
+def _burn_text_on_video(
+    video_bytes: bytes,
+    headline: str,
+    aspect_ratio: str = "16:9",
+    logo_base64: Optional[str] = None,
+    logo_mime_type: Optional[str] = None,
+) -> bytes:
+    """Bakes the headline onto the video as a bottom caption bar (the
     same visual role compositeImage.ts's caption bar plays for images —
-    real text the AI model itself can't reliably render. ffmpeg comes
-    from imageio-ffmpeg's bundled binary, no system ffmpeg install
+    real text the AI model itself can't reliably render) and, if the
+    business has a Brand Kit logo set, overlays it top-left — the video
+    equivalent of compositeImage.ts's logo badge, previously image-only
+    since Veo's own prompt explicitly asks for no on-screen logos. ffmpeg
+    comes from imageio-ffmpeg's bundled binary, no system ffmpeg install
     needed (same reasoning as this app's earlier frame-extraction work)."""
+    if not headline and not logo_base64:
+        return video_bytes
+
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    escaped = _escape_ffmpeg_drawtext(headline)
+    video_w, _video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+    # Logo sized as 15% of frame width, inset 4% from the top-left corner
+    # — matches the proportions of the image flow's logo badge closely
+    # enough without needing canvas-text.ts's white backing-plate logic
+    # ported into ffmpeg for this first version.
+    logo_w = round(video_w * 0.15)
+    inset = round(video_w * 0.04)
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "input.mp4")
         output_path = os.path.join(tmp_dir, "output.mp4")
         with open(input_path, "wb") as f:
             f.write(video_bytes)
 
+        cmd = [ffmpeg_exe, "-y", "-i", input_path]
         # Sized relative to the video's own width/height (not fixed
         # pixels) — a fixed 44px font tuned for a 1280px-wide 16:9 frame
         # overflowed both edges on a 720px-wide 9:16 frame once the
         # aspect-ratio picker shipped. Ratios below match what the old
         # fixed values worked out to on the original 1280x720 frame.
-        vf = (
-            f"drawtext=fontfile={VIDEO_FONT_PATH}:text='{escaped}':"
+        drawtext = (
+            f"drawtext=fontfile={VIDEO_FONT_PATH}:text='{_escape_ffmpeg_drawtext(headline)}':"
             "fontcolor=white:fontsize=w*0.0344:box=1:boxcolor=black@0.6:boxborderw=w*0.01875:"
             "x=(w-text_w)/2:y=h-text_h-h*0.0694"
-        )
-        cmd = [ffmpeg_exe, "-y", "-i", input_path, "-vf", vf, "-c:a", "copy", output_path]
+        ) if headline else None
+
+        if logo_base64:
+            logo_path = os.path.join(tmp_dir, "logo")
+            with open(logo_path, "wb") as f:
+                f.write(base64.b64decode(logo_base64))
+            cmd += ["-i", logo_path]
+            chain = f"[1:v]scale={logo_w}:-1[logo];[0:v][logo]overlay=x={inset}:y={inset}"
+            if drawtext:
+                chain += f"[withlogo];[withlogo]{drawtext}[out]"
+            else:
+                chain += "[out]"
+            cmd += ["-filter_complex", chain, "-map", "[out]", "-map", "0:a?"]
+        else:
+            cmd += ["-vf", drawtext]
+
+        cmd += ["-c:a", "copy", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
-            logger.error("ffmpeg drawtext failed: %s", result.stderr[-2000:])
-            raise Exception("Couldn't add text to the video.")
+            logger.error("ffmpeg overlay failed: %s", result.stderr[-2000:])
+            raise Exception("Couldn't add text/logo to the video.")
 
         with open(output_path, "rb") as f:
             return f.read()
@@ -2576,15 +2626,19 @@ def check_video_status(
         video_bytes = gemini_client.files.download(file=generated.video)
 
         headline = (req.headline or "").strip()
-        if headline:
+        profile = _get_business_profile(user_id)
+        if headline or profile.get("logo_base64"):
             try:
-                video_bytes = _burn_text_on_video(video_bytes, headline)
+                video_bytes = _burn_text_on_video(
+                    video_bytes, headline, req.aspect_ratio,
+                    profile.get("logo_base64"), profile.get("logo_mime_type"),
+                )
             except Exception as e:
                 # The raw video is still a perfectly usable result without
-                # its caption — not worth failing (and losing) an already-
-                # generated, already-about-to-be-charged-for video over a
-                # text-overlay step failing.
-                logger.error("Text burn-in failed, returning video without it: %s", str(e), exc_info=True)
+                # its caption/logo — not worth failing (and losing) an
+                # already-generated, already-about-to-be-charged-for video
+                # over a text/logo-overlay step failing.
+                logger.error("Text/logo burn-in failed, returning video without it: %s", str(e), exc_info=True)
 
         new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST)
         return {
