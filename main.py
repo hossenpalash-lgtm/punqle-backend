@@ -2547,7 +2547,13 @@ def _burn_text_on_video(
             next_input_idx += 1
 
         cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]", "-map", "0:a?"]
-        cmd += ["-c:a", "copy", output_path]
+        # Render's free tier caps the whole process at 512MB — libx264's
+        # default settings (multi-threaded lookahead + B-frame buffering)
+        # OOM-killed the instance mid-encode in a live test. These flags
+        # trade a little encode speed/file-size efficiency for a much
+        # smaller memory footprint; still well inside the 120s timeout
+        # for an 8s clip.
+        cmd += ["-c:a", "copy", "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-threads", "1", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             logger.error("ffmpeg overlay failed: %s", result.stderr[-2000:])
