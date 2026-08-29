@@ -3885,6 +3885,53 @@ def get_meta_temp_image(token: str):
     return Response(content=image_bytes, media_type=mime_type)
 
 
+SCHEDULED_POSTS_MAX_AGE_DAYS = 90
+
+
+def _save_scheduled_post(
+    user_id: str,
+    platform: str,
+    caption: str,
+    image_base64: Optional[str],
+    scheduled_time: datetime,
+    posted: bool,
+    external_post_id: Optional[str],
+    error: Optional[str],
+    source: str = "single",
+    content_plan_id: Optional[str] = None,
+    content_plan_day: Optional[str] = None,
+    description: Optional[str] = None,
+) -> None:
+    """Best-effort, same shape as _save_generated_post — a tracking-row
+    failure must never break the actual publish response the user is
+    already waiting on. This is the only place scheduling state is
+    persisted anywhere in this codebase; before this, /meta/publish and
+    /youtube/publish handed a future time to the platform and forgot it
+    entirely. Age-based prune (not count-based like generated_posts)
+    since this table needs to keep every row while it's still relevant
+    to "this week's calendar," not just the N most recent."""
+    try:
+        with_retry(lambda: supabase.table("scheduled_posts").insert({
+            "owner_id": user_id,
+            "platform": platform,
+            "external_post_id": external_post_id,
+            "caption": caption,
+            "description": description,
+            "image_base64": image_base64,
+            "scheduled_time": scheduled_time.isoformat(),
+            "status": "scheduled" if posted else "failed",
+            "error": error,
+            "source": source,
+            "content_plan_id": content_plan_id,
+            "content_plan_day": content_plan_day,
+        }).execute())
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=SCHEDULED_POSTS_MAX_AGE_DAYS)).isoformat()
+        supabase.table("scheduled_posts").delete().eq("owner_id", user_id) \
+            .lt("scheduled_time", cutoff).in_("status", ["published", "failed"]).execute()
+    except Exception as e:
+        logger.error("Failed to save scheduled post tracking row: %s", str(e), exc_info=True)
+
+
 def _parse_scheduled_time(scheduled_time: Optional[str]) -> Optional[datetime]:
     """Shared validation for both Facebook and YouTube scheduling —
     Meta requires 10 minutes-30 days out (sources vary 30-75 days; using
@@ -3918,6 +3965,9 @@ def publish_to_meta(
     post_to_facebook: bool = Form(...),
     post_to_instagram: bool = Form(...),
     scheduled_time: Optional[str] = Form(None),
+    source: str = Form("single"),
+    content_plan_id: Optional[str] = Form(None),
+    content_plan_day: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) image straight
@@ -3959,6 +4009,13 @@ def publish_to_meta(
                 connection["page_id"], connection["page_access_token"], image_bytes, mime_type, caption, user_id,
                 scheduled_unix,
             )
+            if scheduled_dt is not None:
+                fb = result["facebook"]
+                _save_scheduled_post(
+                    user_id, "facebook", caption, base64.b64encode(image_bytes).decode(), scheduled_dt,
+                    fb.get("posted", False), fb.get("post_id"), fb.get("error"),
+                    source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+                )
 
         if post_to_instagram:
             result["instagram"] = _publish_to_instagram(
@@ -4250,6 +4307,9 @@ def publish_to_youtube(
     description: str = Form(""),
     aspect_ratio: str = Form(...),
     scheduled_time: Optional[str] = Form(None),
+    source: str = Form("single"),
+    content_plan_id: Optional[str] = Form(None),
+    content_plan_day: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) video straight
@@ -4309,29 +4369,331 @@ def publish_to_youtube(
             exceptions=(requests.RequestException,),
             attempts=2,
         )
+        # Funneled through one outcome dict (rather than returning at each
+        # branch) so the scheduled-post tracking hook below fires exactly
+        # once regardless of which step failed.
+        outcome: dict = {
+            "posted": False, "video_id": None, "video_url": None,
+            "error": None, "scheduled": scheduled_dt is not None,
+        }
         if not init_resp.ok:
             logger.error("YouTube upload init failed: %s", init_resp.text)
-            return {"posted": False, "error": "YouTube rejected the upload request."}
-        upload_url = init_resp.headers.get("Location")
-        if not upload_url:
-            return {"posted": False, "error": "YouTube didn't return an upload session."}
+            outcome["error"] = "YouTube rejected the upload request."
+        else:
+            upload_url = init_resp.headers.get("Location")
+            if not upload_url:
+                outcome["error"] = "YouTube didn't return an upload session."
+            else:
+                put_resp = requests.put(
+                    upload_url,
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "video/mp4"},
+                    data=video_bytes,
+                    timeout=60,
+                )
+                if not put_resp.ok:
+                    logger.error("YouTube video upload failed: %s", put_resp.text)
+                    outcome["error"] = "Couldn't upload the video to YouTube."
+                else:
+                    video_id = put_resp.json().get("id")
+                    outcome["posted"] = True
+                    outcome["video_id"] = video_id
+                    outcome["video_url"] = f"https://youtu.be/{video_id}" if video_id else None
 
-        put_resp = requests.put(
-            upload_url,
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "video/mp4"},
-            data=video_bytes,
-            timeout=60,
+        if scheduled_dt is not None:
+            _save_scheduled_post(
+                user_id, "youtube", final_title, None, scheduled_dt,
+                outcome["posted"], outcome["video_id"], outcome["error"],
+                source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+                description=description,
+            )
+        return outcome
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# CONTENT CALENDAR (scheduled_posts read/reschedule/post-now/cancel)
+# -----------------------
+
+class ScheduledPostOut(BaseModel):
+    id: str
+    platform: str
+    external_post_id: Optional[str] = None
+    caption: str
+    description: Optional[str] = None
+    image_base64: Optional[str] = None
+    scheduled_time: str
+    status: str
+    error: Optional[str] = None
+    source: str
+    content_plan_id: Optional[str] = None
+    content_plan_day: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class ScheduledPostsListResponse(BaseModel):
+    posts: list[ScheduledPostOut]
+
+
+class UpdateScheduledPostRequest(BaseModel):
+    caption: Optional[str] = None
+    scheduled_time: Optional[str] = None
+
+
+def _effective_status(row: dict) -> str:
+    """A 'scheduled' row whose time has passed reads as 'published'
+    everywhere (list responses AND every mutation's permission gate)
+    without ever writing that back — optimistic/assumed, not verified
+    against Meta/YouTube (the connected Meta token lacks
+    pages_read_engagement, so there's no way to actually ask). A small,
+    accepted gap rather than new permission-scope + polling
+    infrastructure."""
+    if row["status"] == "scheduled":
+        dt = datetime.fromisoformat(row["scheduled_time"].replace("Z", "+00:00"))
+        if dt < datetime.now(timezone.utc):
+            return "published"
+    return row["status"]
+
+
+def _get_owned_scheduled_post(post_id: str, user_id: str) -> dict:
+    res = with_retry(lambda: supabase.table("scheduled_posts").select("*")
+        .eq("id", post_id).eq("owner_id", user_id).execute())
+    res = ensure_supabase_response(res, "get scheduled post")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Scheduled post not found.")
+    return res.data[0]
+
+
+def _require_reschedulable(row: dict) -> None:
+    if _effective_status(row) != "scheduled":
+        raise HTTPException(status_code=400, detail="Only pending scheduled posts can be changed.")
+
+
+def _update_facebook_scheduled_post(user_id: str, row: dict, new_caption: str, new_dt: datetime) -> dict:
+    """Delete-and-recreate, not in-place edit — whether Meta's Graph API
+    supports editing scheduled_publish_time/message in place on an
+    unpublished post via POST /{post-id} is unverified, and assuming
+    Graph API scheduling behavior from memory (rather than checking
+    live) is exactly how the original scheduling feature silently broke
+    (see _publish_to_facebook_page's docstring). This composes only
+    primitives already confirmed live: a real DELETE, and the same
+    two-step schedule flow already proven correct. The new post is
+    created FIRST and only deleted after that succeeds — not the other
+    way around — so a failure never leaves the user with neither post."""
+    res = with_retry(lambda: supabase.table("meta_connections")
+        .select("page_id, page_access_token").eq("owner_id", user_id).execute())
+    res = ensure_supabase_response(res, "get meta connection")
+    if not res.data:
+        return {"ok": False, "error": "Facebook isn't connected anymore."}
+    connection = res.data[0]
+    if not row.get("image_base64"):
+        return {"ok": False, "error": "Original image is no longer available for this post."}
+    image_bytes = base64.b64decode(row["image_base64"])
+    result = _publish_to_facebook_page(
+        connection["page_id"], connection["page_access_token"], image_bytes, "image/jpeg",
+        new_caption, user_id, int(new_dt.timestamp()),
+    )
+    if not result.get("posted"):
+        return {"ok": False, "error": result.get("error") or "Couldn't reschedule on Facebook."}
+    if row.get("external_post_id"):
+        requests.delete(
+            f"{META_GRAPH_URL}/{row['external_post_id']}",
+            params={"access_token": connection["page_access_token"]}, timeout=30,
         )
-        if not put_resp.ok:
-            logger.error("YouTube video upload failed: %s", put_resp.text)
-            return {"posted": False, "error": "Couldn't upload the video to YouTube."}
-        video_id = put_resp.json().get("id")
-        return {
-            "posted": True,
-            "video_id": video_id,
-            "video_url": f"https://youtu.be/{video_id}" if video_id else None,
-            "scheduled": scheduled_dt is not None,
+    return {"ok": True, "external_post_id": result.get("post_id")}
+
+
+def _update_youtube_scheduled_video(user_id: str, video_id: str, new_title: str, description: str, new_dt: datetime) -> dict:
+    """videos.update is a non-partial update — the full snippet+status
+    must be resent together, or the omitted fields (description,
+    categoryId) get silently blanked on the live video."""
+    access_token = _get_valid_youtube_token(user_id)
+    if not access_token:
+        return {"ok": False, "error": "YouTube isn't connected anymore."}
+    resp = with_retry(
+        lambda: requests.put(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "snippet,status"},
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={
+                "id": video_id,
+                "snippet": {"title": new_title[:100], "description": description, "categoryId": YOUTUBE_CATEGORY_ID},
+                "status": {"privacyStatus": "private", "publishAt": new_dt.isoformat().replace("+00:00", "Z")},
+            },
+            timeout=30,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not resp.ok:
+        logger.error("YouTube video update failed: %s", resp.text)
+        return {"ok": False, "error": "YouTube rejected the update."}
+    return {"ok": True}
+
+
+def _post_now_facebook(user_id: str, post_id: str) -> dict:
+    res = with_retry(lambda: supabase.table("meta_connections")
+        .select("page_access_token").eq("owner_id", user_id).execute())
+    res = ensure_supabase_response(res, "get meta connection")
+    if not res.data:
+        return {"ok": False, "error": "Facebook isn't connected anymore."}
+    resp = with_retry(
+        lambda: requests.post(
+            f"{META_GRAPH_URL}/{post_id}",
+            data={"published": "true", "access_token": res.data[0]["page_access_token"]},
+            timeout=30,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not resp.ok:
+        message, _code = _meta_graph_error_message(resp)
+        return {"ok": False, "error": message}
+    return {"ok": True}
+
+
+def _post_now_youtube(user_id: str, video_id: str) -> dict:
+    access_token = _get_valid_youtube_token(user_id)
+    if not access_token:
+        return {"ok": False, "error": "YouTube isn't connected anymore."}
+    resp = with_retry(
+        lambda: requests.put(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "status"},
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"id": video_id, "status": {"privacyStatus": "public"}},
+            timeout=30,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not resp.ok:
+        return {"ok": False, "error": "YouTube rejected the request."}
+    return {"ok": True}
+
+
+def _cancel_facebook_scheduled_post(user_id: str, post_id: str) -> dict:
+    res = with_retry(lambda: supabase.table("meta_connections")
+        .select("page_access_token").eq("owner_id", user_id).execute())
+    res = ensure_supabase_response(res, "get meta connection")
+    if not res.data:
+        return {"ok": False, "error": "Facebook isn't connected anymore."}
+    resp = requests.delete(
+        f"{META_GRAPH_URL}/{post_id}", params={"access_token": res.data[0]["page_access_token"]}, timeout=30,
+    )
+    if not resp.ok:
+        message, _code = _meta_graph_error_message(resp)
+        return {"ok": False, "error": message}
+    return {"ok": True}
+
+
+def _cancel_youtube_scheduled_video(user_id: str, video_id: str) -> dict:
+    access_token = _get_valid_youtube_token(user_id)
+    if not access_token:
+        return {"ok": False, "error": "YouTube isn't connected anymore."}
+    resp = requests.delete(
+        "https://www.googleapis.com/youtube/v3/videos",
+        params={"id": video_id}, headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+    )
+    if not resp.ok:
+        return {"ok": False, "error": "YouTube rejected the delete request."}
+    return {"ok": True}
+
+
+@app.get("/scheduled-posts", response_model=ScheduledPostsListResponse, tags=["scheduling"])
+def list_scheduled_posts(start: str, end: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("scheduled_posts").select("*")
+            .eq("owner_id", user_id).gte("scheduled_time", start).lte("scheduled_time", end)
+            .order("scheduled_time").execute())
+        res = ensure_supabase_response(res, "list scheduled posts")
+        posts = [{**row, "status": _effective_status(row)} for row in res.data]
+        return {"posts": posts}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/scheduled-posts/{post_id}/update", response_model=ScheduledPostOut, tags=["scheduling"])
+@limiter.limit("10/minute")
+def update_scheduled_post(request: Request, post_id: str, req: UpdateScheduledPostRequest, user_id: str = Depends(get_current_user_id)):
+    if req.caption is None and req.scheduled_time is None:
+        raise HTTPException(status_code=400, detail="Nothing to update.")
+    try:
+        row = _get_owned_scheduled_post(post_id, user_id)
+        _require_reschedulable(row)
+
+        new_caption = req.caption if req.caption is not None else row["caption"]
+        new_dt = _parse_scheduled_time(req.scheduled_time) if req.scheduled_time is not None \
+            else datetime.fromisoformat(row["scheduled_time"].replace("Z", "+00:00"))
+
+        updates = {
+            "caption": new_caption, "scheduled_time": new_dt.isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        if row["platform"] == "facebook":
+            result = _update_facebook_scheduled_post(user_id, row, new_caption, new_dt)
+            if not result.get("ok"):
+                raise HTTPException(status_code=502, detail=result.get("error") or "Couldn't reschedule on Facebook.")
+            updates["external_post_id"] = result.get("external_post_id")
+        else:
+            result = _update_youtube_scheduled_video(user_id, row["external_post_id"], new_caption, row.get("description") or "", new_dt)
+            if not result.get("ok"):
+                raise HTTPException(status_code=502, detail=result.get("error") or "Couldn't reschedule on YouTube.")
+
+        update_res = with_retry(lambda: supabase.table("scheduled_posts").update(updates)
+            .eq("id", post_id).eq("owner_id", user_id).execute())
+        update_res = ensure_supabase_response(update_res, "update scheduled post")
+        return update_res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/scheduled-posts/{post_id}/post-now", response_model=ScheduledPostOut, tags=["scheduling"])
+@limiter.limit("10/minute")
+def post_scheduled_now(request: Request, post_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        row = _get_owned_scheduled_post(post_id, user_id)
+        _require_reschedulable(row)
+        if not row.get("external_post_id"):
+            raise HTTPException(status_code=400, detail="Nothing to post — the original schedule call didn't produce a post.")
+        result = _post_now_facebook(user_id, row["external_post_id"]) if row["platform"] == "facebook" \
+            else _post_now_youtube(user_id, row["external_post_id"])
+        if not result.get("ok"):
+            raise HTTPException(status_code=502, detail=result.get("error") or "Couldn't post now.")
+        update_res = with_retry(lambda: supabase.table("scheduled_posts").update(
+            {"status": "published", "updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", post_id).eq("owner_id", user_id).execute())
+        update_res = ensure_supabase_response(update_res, "post scheduled post now")
+        return update_res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/scheduled-posts/{post_id}", tags=["scheduling"])
+@limiter.limit("10/minute")
+def cancel_scheduled_post(request: Request, post_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        row = _get_owned_scheduled_post(post_id, user_id)
+        _require_reschedulable(row)
+        if row.get("external_post_id"):
+            result = _cancel_facebook_scheduled_post(user_id, row["external_post_id"]) if row["platform"] == "facebook" \
+                else _cancel_youtube_scheduled_video(user_id, row["external_post_id"])
+            if not result.get("ok"):
+                raise HTTPException(status_code=502, detail=result.get("error") or "Couldn't cancel on the platform.")
+        supabase.table("scheduled_posts").delete().eq("id", post_id).eq("owner_id", user_id).execute()
+        return {"deleted": True}
     except HTTPException:
         raise
     except Exception as e:
