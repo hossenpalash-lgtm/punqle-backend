@@ -3984,23 +3984,64 @@ def _publish_to_facebook_page(
     page_id: str, page_access_token: str, image_bytes: bytes, mime_type: str, caption: str, user_id: str,
     scheduled_unix: Optional[int] = None,
 ) -> dict:
+    """Immediate posting is a single call to /{page-id}/photos (published
+    defaults to true). Scheduling is NOT the same call with published=
+    false + scheduled_publish_time added — that combination is silently
+    accepted by Meta's API (real 200, real-looking id) but never actually
+    becomes a visible scheduled post and never publishes; confirmed live
+    by creating one, then checking it via a direct object GET and via
+    Business Suite's own Scheduled tab — neither showed it. The
+    documented, verified-working way to schedule a photo post is two
+    calls: upload the photo unpublished (no scheduling params), then
+    create the actual Page post on /{page-id}/feed with
+    attached_media referencing that photo id, published=false, and
+    scheduled_publish_time — confirmed live: this one showed a real
+    scheduled_publish_time on a direct GET of the resulting post id."""
     try:
-        post_data = {"caption": caption, "access_token": page_access_token}
         if scheduled_unix is not None:
-            # Meta schedules at the Page-post level (same endpoint,
-            # same photo — it just doesn't go live until this time).
-            post_data["published"] = "false"
-            post_data["scheduled_publish_time"] = str(scheduled_unix)
-        resp = with_retry(
-            lambda: requests.post(
-                f"{META_GRAPH_URL}/{page_id}/photos",
-                data=post_data,
-                files={"source": ("image.jpg", image_bytes, mime_type)},
-                timeout=30,
-            ),
-            exceptions=(requests.RequestException,),
-            attempts=2,
-        )
+            photo_resp = with_retry(
+                lambda: requests.post(
+                    f"{META_GRAPH_URL}/{page_id}/photos",
+                    data={"published": "false", "access_token": page_access_token},
+                    files={"source": ("image.jpg", image_bytes, mime_type)},
+                    timeout=30,
+                ),
+                exceptions=(requests.RequestException,),
+                attempts=2,
+            )
+            if not photo_resp.ok:
+                message, code = _meta_graph_error_message(photo_resp)
+                if code == 190:
+                    _disconnect_meta_on_expired_token(user_id)
+                    return {"posted": False, "error": "Your Meta connection expired — please reconnect."}
+                return {"posted": False, "error": message}
+            photo_id = photo_resp.json().get("id")
+            resp = with_retry(
+                lambda: requests.post(
+                    f"{META_GRAPH_URL}/{page_id}/feed",
+                    data={
+                        "message": caption,
+                        "published": "false",
+                        "scheduled_publish_time": str(scheduled_unix),
+                        "attached_media[0]": json.dumps({"media_fbid": photo_id}),
+                        "access_token": page_access_token,
+                    },
+                    timeout=30,
+                ),
+                exceptions=(requests.RequestException,),
+                attempts=2,
+            )
+        else:
+            resp = with_retry(
+                lambda: requests.post(
+                    f"{META_GRAPH_URL}/{page_id}/photos",
+                    data={"caption": caption, "access_token": page_access_token},
+                    files={"source": ("image.jpg", image_bytes, mime_type)},
+                    timeout=30,
+                ),
+                exceptions=(requests.RequestException,),
+                attempts=2,
+            )
         if resp.ok:
             resp_data = resp.json()
             return {"posted": True, "post_id": resp_data.get("post_id") or resp_data.get("id"), "scheduled": scheduled_unix is not None}
