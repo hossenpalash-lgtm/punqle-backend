@@ -3932,6 +3932,25 @@ def _save_scheduled_post(
         logger.error("Failed to save scheduled post tracking row: %s", str(e), exc_info=True)
 
 
+def _find_existing_scheduled_post(user_id: str, platform: str, content_plan_id: str, content_plan_day: str) -> Optional[dict]:
+    """Idempotency guard for weekly_plan-sourced scheduling only — a
+    single-post schedule has no stable identity to dedupe against (a
+    user might legitimately schedule the same image twice), but a
+    Weekly Plan day does: (owner, platform, content_plan_id, day). A
+    slow "Schedule this week" click with no visible loading feedback,
+    followed by a reload + re-click, is a real scenario (nearly
+    triggered live during this feature's own testing) that would
+    otherwise create a genuine duplicate post on Facebook/YouTube every
+    time it's retried. Only an already-'scheduled' (still pending) row
+    blocks a retry — a 'failed' row should still be retryable."""
+    res = with_retry(lambda: supabase.table("scheduled_posts").select("*")
+        .eq("owner_id", user_id).eq("platform", platform)
+        .eq("content_plan_id", content_plan_id).eq("content_plan_day", content_plan_day)
+        .eq("status", "scheduled").execute())
+    res = ensure_supabase_response(res, "check existing scheduled post")
+    return res.data[0] if res.data else None
+
+
 def _parse_scheduled_time(scheduled_time: Optional[str]) -> Optional[datetime]:
     """Shared validation for both Facebook and YouTube scheduling —
     Meta requires 10 minutes-30 days out (sources vary 30-75 days; using
@@ -4005,17 +4024,25 @@ def publish_to_meta(
         result: dict = {}
 
         if post_to_facebook:
-            result["facebook"] = _publish_to_facebook_page(
-                connection["page_id"], connection["page_access_token"], image_bytes, mime_type, caption, user_id,
-                scheduled_unix,
+            existing = (
+                _find_existing_scheduled_post(user_id, "facebook", content_plan_id, content_plan_day)
+                if scheduled_dt is not None and source == "weekly_plan" and content_plan_id and content_plan_day
+                else None
             )
-            if scheduled_dt is not None:
-                fb = result["facebook"]
-                _save_scheduled_post(
-                    user_id, "facebook", caption, base64.b64encode(image_bytes).decode(), scheduled_dt,
-                    fb.get("posted", False), fb.get("post_id"), fb.get("error"),
-                    source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+            if existing:
+                result["facebook"] = {"posted": True, "post_id": existing.get("external_post_id"), "scheduled": True}
+            else:
+                result["facebook"] = _publish_to_facebook_page(
+                    connection["page_id"], connection["page_access_token"], image_bytes, mime_type, caption, user_id,
+                    scheduled_unix,
                 )
+                if scheduled_dt is not None:
+                    fb = result["facebook"]
+                    _save_scheduled_post(
+                        user_id, "facebook", caption, base64.b64encode(image_bytes).decode(), scheduled_dt,
+                        fb.get("posted", False), fb.get("post_id"), fb.get("error"),
+                        source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+                    )
 
         if post_to_instagram:
             result["instagram"] = _publish_to_instagram(
@@ -4326,6 +4353,16 @@ def publish_to_youtube(
     flips it public at that time. No polling/job needed on our side."""
     try:
         scheduled_dt = _parse_scheduled_time(scheduled_time)
+
+        if scheduled_dt is not None and source == "weekly_plan" and content_plan_id and content_plan_day:
+            existing = _find_existing_scheduled_post(user_id, "youtube", content_plan_id, content_plan_day)
+            if existing:
+                video_id = existing.get("external_post_id")
+                return {
+                    "posted": True, "video_id": video_id,
+                    "video_url": f"https://youtu.be/{video_id}" if video_id else None, "scheduled": True,
+                }
+
         access_token = _get_valid_youtube_token(user_id)
         if not access_token:
             res = with_retry(lambda: supabase.table("youtube_connections")
