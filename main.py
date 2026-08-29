@@ -4969,10 +4969,17 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
     in this codebase (Veo/FASHN's own "polling" is entirely frontend-
     driven against a stateless endpoint), so this fits the same shape
     rather than inventing new infrastructure. A short freshness window
-    (organic_post_metrics rows are append-only snapshots) avoids
-    hammering either platform's API on every tab open, while still
-    leaving room for a trend-over-time view later with no schema
-    change. Capped at the 50 most recent published posts per call."""
+    avoids hammering either platform's API on every tab open. Each
+    fetch writes a new organic_post_metrics row (a real historical
+    snapshot, not an overwritten running total — a post's likes at
+    10:00/10:15/10:30 are 3 separate rows, giving a trend-over-time
+    view later with no schema change), upserted on
+    (scheduled_post_id, fetch_bucket) so two near-simultaneous requests
+    for the same post in the same freshness window (a double-clicked
+    Refresh, two open tabs) can't create a genuine duplicate row — the
+    second write lands on the first's row instead of siblings. This
+    does NOT collapse history across windows, only within one. Capped
+    at the 50 most recent published posts per call."""
     try:
         res = with_retry(lambda: supabase.table("scheduled_posts").select("*")
             .eq("owner_id", user_id).order("scheduled_time", desc=True).limit(50).execute())
@@ -5018,11 +5025,11 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                 stats = youtube_stats.get(row["external_post_id"])
                 if stats is None:
                     continue
-                with_retry(lambda s=stats, r=row: supabase.table("organic_post_metrics").insert({
+                with_retry(lambda s=stats, r=row: supabase.table("organic_post_metrics").upsert({
                     "scheduled_post_id": r["id"], "platform": "youtube", "external_post_id": r["external_post_id"],
                     "views": s["views"], "likes": s["likes"], "comments": s["comments"], "shares": None,
                     "raw": s["raw"],
-                }).execute())
+                }, on_conflict="scheduled_post_id,fetch_bucket").execute())
             else:
                 if not fb_token:
                     unavailable_reasons[row["id"]] = "Connect Facebook to see engagement."
@@ -5031,11 +5038,11 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                 if metrics is None:
                     unavailable_reasons[row["id"]] = reason or "Couldn't fetch Facebook engagement."
                     continue
-                with_retry(lambda m=metrics, r=row: supabase.table("organic_post_metrics").insert({
+                with_retry(lambda m=metrics, r=row: supabase.table("organic_post_metrics").upsert({
                     "scheduled_post_id": r["id"], "platform": "facebook", "external_post_id": r["external_post_id"],
                     "views": None, "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
                     "raw": m["raw"],
-                }).execute())
+                }, on_conflict="scheduled_post_id,fetch_bucket").execute())
 
         if any(row["id"] not in unavailable_reasons for row in stale_rows):
             latest_snapshot = _latest_snapshots()
