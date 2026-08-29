@@ -278,6 +278,19 @@ class TryOnStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+class TryOnAnimateStartRequest(BaseModel):
+    image_base64: str  # the Try-On result's own image (checkTryOnStatus's
+                        # existing "data:image/png" convention — PNG)
+
+
+class TryOnAnimateOperationOut(BaseModel):
+    operation: dict
+
+
+class TryOnAnimateStatusRequest(BaseModel):
+    operation: dict
+
+
 class ImportedProductOut(BaseModel):
     id: str
     name: str
@@ -3159,6 +3172,103 @@ def check_tryon_status(
         return {
             "done": True,
             "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_TRYON_ANIMATE_PROMPT = (
+    "The person in the photo moves naturally and confidently — turning, taking a "
+    "few steps, and showing the outfit from different angles. Camera moves "
+    "smoothly around them. Natural, realistic movement and lighting. No "
+    "on-screen text, captions, or logos."
+)
+
+
+@app.post("/tryon/animate", response_model=TryOnAnimateOperationOut, tags=["tryon"])
+@limiter.limit("5/minute")
+def start_tryon_animation(
+    request: Request,
+    req: TryOnAnimateStartRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Feeds an already-generated Try-On still image into Veo 3.1 as the
+    starting frame — confirmed live (2026-08-29) that Veo's `image` param
+    is a true starting frame, not a loose style reference, and preserves
+    the subject's identity/outfit well across an 8s clip. Deliberately a
+    separate endpoint from start_video_generation/check_video_status, not
+    a reuse: that pair unconditionally burns the business's headline/logo
+    onto the video whenever either is set, which would be wrong here —
+    this is a photo of a customer, not the business's ad content, and
+    stamping a business's logo onto a random customer's own body photo
+    makes no sense. Same check-then-charge-on-success credit model as
+    every other AI action; reuses VIDEO_CREDIT_COST directly since the
+    marginal cost is exactly one Veo 3.1 Lite 8s/720p call — FASHN was
+    already charged when the still image was generated."""
+    try:
+        if gemini_client is None:
+            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+        credits = _get_ad_credits(user_id)
+        if credits < VIDEO_CREDIT_COST:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Animating needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
+            )
+        image = genai_types.Image(image_bytes=base64.b64decode(req.image_base64), mime_type="image/png")
+        operation = gemini_client.models.generate_videos(
+            model=VEO_MODEL,
+            prompt=_TRYON_ANIMATE_PROMPT,
+            image=image,
+            config=genai_types.GenerateVideosConfig(
+                aspect_ratio="9:16",
+                resolution="720p",
+                duration_seconds="8",
+            ),
+        )
+        return {"operation": operation.model_dump(mode="json")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tryon/animate-status", response_model=VideoStatusResponse, tags=["tryon"])
+@limiter.limit("30/minute")
+def check_tryon_animation_status(
+    request: Request,
+    req: TryOnAnimateStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Stateless polling, same shape as check_video_status — but never
+    calls _burn_text_on_video (see start_tryon_animation's docstring for
+    why). No DB persistence, matching Try-On's existing precedent: a
+    person's photo (animated or not) has no business sitting in a shared
+    history table."""
+    try:
+        if gemini_client is None:
+            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+        operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
+        operation = gemini_client.operations.get(operation)
+        if not operation.done:
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        if operation.error:
+            raise HTTPException(status_code=502, detail="Animating this photo failed. Please try again.")
+
+        result = operation.result or operation.response
+        if not result or not result.generated_videos:
+            raise HTTPException(status_code=502, detail="Didn't get a video back. Please try again.")
+        video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
+
+        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST)
+        return {
+            "done": True,
+            "video_base64": base64.b64encode(video_bytes).decode("ascii"),
             "credits_remaining": new_credits,
         }
     except HTTPException:
