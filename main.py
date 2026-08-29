@@ -5170,6 +5170,7 @@ async def generate_content_plan_post(
 
         new_credits = _spend_ad_credit(user_id)
         supabase.table("content_plans").update({"posts": posts}).eq("id", plan_id).execute()
+        _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
         return {
             "captions": copy,
