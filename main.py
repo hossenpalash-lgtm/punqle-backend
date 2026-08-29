@@ -4011,16 +4011,25 @@ def _save_scheduled_post(
     content_plan_id: Optional[str] = None,
     content_plan_day: Optional[str] = None,
     description: Optional[str] = None,
+    immediate: bool = False,
 ) -> None:
     """Best-effort, same shape as _save_generated_post — a tracking-row
     failure must never break the actual publish response the user is
-    already waiting on. This is the only place scheduling state is
-    persisted anywhere in this codebase; before this, /meta/publish and
-    /youtube/publish handed a future time to the platform and forgot it
-    entirely. Age-based prune (not count-based like generated_posts)
+    already waiting on. This is the only place scheduling/publish state
+    is persisted anywhere in this codebase; before this, /meta/publish
+    and /youtube/publish handed a real post/video id back to the caller
+    and forgot it entirely once the HTTP response was consumed — true
+    for BOTH scheduled and immediate "post now" publishes. `immediate`
+    marks the latter: a real, synchronous platform confirmation, so it's
+    saved directly as 'published' rather than 'scheduled' (better than
+    the scheduled path's own optimistic time-based flip in
+    _effective_status, not just equivalent to it — this row was never
+    speculative). Age-based prune (not count-based like generated_posts)
     since this table needs to keep every row while it's still relevant
-    to "this week's calendar," not just the N most recent."""
+    to "this week's calendar" or recent performance history, not just
+    the N most recent."""
     try:
+        status = "failed" if not posted else ("published" if immediate else "scheduled")
         with_retry(lambda: supabase.table("scheduled_posts").insert({
             "owner_id": user_id,
             "platform": platform,
@@ -4029,7 +4038,7 @@ def _save_scheduled_post(
             "description": description,
             "image_base64": image_base64,
             "scheduled_time": scheduled_time.isoformat(),
-            "status": "scheduled" if posted else "failed",
+            "status": status,
             "error": error,
             "source": source,
             "content_plan_id": content_plan_id,
@@ -4146,13 +4155,14 @@ def publish_to_meta(
                     connection["page_id"], connection["page_access_token"], image_bytes, mime_type, caption, user_id,
                     scheduled_unix,
                 )
-                if scheduled_dt is not None:
-                    fb = result["facebook"]
-                    _save_scheduled_post(
-                        user_id, "facebook", caption, base64.b64encode(image_bytes).decode(), scheduled_dt,
-                        fb.get("posted", False), fb.get("post_id"), fb.get("error"),
-                        source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
-                    )
+                fb = result["facebook"]
+                _save_scheduled_post(
+                    user_id, "facebook", caption, base64.b64encode(image_bytes).decode(),
+                    scheduled_dt or datetime.now(timezone.utc),
+                    fb.get("posted", False), fb.get("post_id"), fb.get("error"),
+                    source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+                    immediate=scheduled_dt is None,
+                )
 
         if post_to_instagram:
             result["instagram"] = _publish_to_instagram(
@@ -4546,13 +4556,12 @@ def publish_to_youtube(
                     outcome["video_id"] = video_id
                     outcome["video_url"] = f"https://youtu.be/{video_id}" if video_id else None
 
-        if scheduled_dt is not None:
-            _save_scheduled_post(
-                user_id, "youtube", final_title, None, scheduled_dt,
-                outcome["posted"], outcome["video_id"], outcome["error"],
-                source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
-                description=description,
-            )
+        _save_scheduled_post(
+            user_id, "youtube", final_title, None, scheduled_dt or datetime.now(timezone.utc),
+            outcome["posted"], outcome["video_id"], outcome["error"],
+            source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+            description=description, immediate=scheduled_dt is None,
+        )
         return outcome
     except HTTPException:
         raise
@@ -4841,6 +4850,210 @@ def cancel_scheduled_post(request: Request, post_id: str, user_id: str = Depends
                 raise HTTPException(status_code=502, detail=result.get("error") or "Couldn't cancel on the platform.")
         supabase.table("scheduled_posts").delete().eq("id", post_id).eq("owner_id", user_id).execute()
         return {"deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+PERFORMANCE_METRICS_FRESHNESS_MINUTES = 15
+
+
+def _fetch_youtube_video_stats(user_id: str, video_ids: list[str]) -> dict[str, dict]:
+    """Batches ids into videos.list?part=statistics calls (comma-joined,
+    up to 50 per call — one API call regardless of how many videos are
+    stale). Uses the already-granted youtube.readonly scope alongside
+    youtube.upload — no new permission, works today. favoriteCount is
+    dead (always 0 since 2015, left out); dislikeCount is private-to-
+    owner and technically readable but left out as low-value for V1."""
+    if not video_ids:
+        return {}
+    access_token = _get_valid_youtube_token(user_id)
+    if not access_token:
+        return {}
+    out: dict[str, dict] = {}
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        try:
+            resp = requests.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "statistics", "id": ",".join(batch)},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15,
+            )
+        except requests.RequestException:
+            continue
+        if not resp.ok:
+            continue
+        for item in resp.json().get("items", []):
+            stats = item.get("statistics", {})
+            out[item["id"]] = {
+                "views": int(stats["viewCount"]) if "viewCount" in stats else None,
+                "likes": int(stats["likeCount"]) if "likeCount" in stats else None,
+                "comments": int(stats["commentCount"]) if "commentCount" in stats else None,
+                "raw": stats,
+            }
+    return out
+
+
+def _fetch_facebook_post_engagement(post_id: str, page_access_token: str) -> tuple[Optional[dict], Optional[str]]:
+    """Returns (metrics, unavailable_reason) — exactly one is non-None.
+    Reads a Page's own post content fields (likes/comments/shares
+    counts), which pages_read_engagement covers — NOT the separate
+    Insights API (GET /{post-id}/insights, where impressions/reach live
+    and which needs a distinct, unrequested read_insights permission).
+    Whatever Meta actually says on failure is surfaced verbatim as the
+    reason rather than guess-classified (e.g. as "pending App Review")
+    — safer than silently mislabeling a token/rate-limit/deleted-post
+    error as a permission issue."""
+    try:
+        resp = requests.get(
+            f"{META_GRAPH_URL}/{post_id}",
+            params={
+                "fields": "likes.summary(true),comments.summary(true),shares",
+                "access_token": page_access_token,
+            },
+            timeout=15,
+        )
+    except requests.RequestException:
+        return None, "Couldn't reach Facebook."
+    if not resp.ok:
+        message, _code = _meta_graph_error_message(resp)
+        return None, message
+    data = resp.json()
+    return {
+        "likes": (data.get("likes") or {}).get("summary", {}).get("total_count"),
+        "comments": (data.get("comments") or {}).get("summary", {}).get("total_count"),
+        "shares": (data.get("shares") or {}).get("count", 0),
+        "raw": data,
+    }, None
+
+
+class PostMetricsOut(BaseModel):
+    views: Optional[int] = None
+    likes: Optional[int] = None
+    comments: Optional[int] = None
+    shares: Optional[int] = None
+    fetched_at: Optional[str] = None
+
+
+class PerformancePostOut(BaseModel):
+    id: str
+    platform: str
+    external_post_id: Optional[str] = None
+    caption: str
+    image_base64: Optional[str] = None
+    scheduled_time: str
+    metrics: Optional[PostMetricsOut] = None
+    metrics_unavailable_reason: Optional[str] = None
+
+
+class PerformancePostsResponse(BaseModel):
+    posts: list[PerformancePostOut]
+
+
+@app.get("/performance/posts", response_model=PerformancePostsResponse, tags=["performance"])
+def list_organic_performance(user_id: str = Depends(get_current_user_id)):
+    """Organic content performance only — no reach/impressions anywhere
+    in this function, on either platform: Facebook's Insights API needs
+    read_insights (never requested), YouTube's impression/CTR data lives
+    only in the separate YouTube Analytics API (needs yt-analytics.
+    readonly, never requested). What's real here: YouTube views/likes/
+    comments (works today) and Facebook likes/comments/shares (works
+    once the pending pages_read_engagement App Review clears — until
+    then Meta's own permission error is surfaced per-post via
+    metrics_unavailable_reason, not a hard failure).
+
+    Fetch-on-view, not a background job — no cron/queue exists anywhere
+    in this codebase (Veo/FASHN's own "polling" is entirely frontend-
+    driven against a stateless endpoint), so this fits the same shape
+    rather than inventing new infrastructure. A short freshness window
+    (organic_post_metrics rows are append-only snapshots) avoids
+    hammering either platform's API on every tab open, while still
+    leaving room for a trend-over-time view later with no schema
+    change. Capped at the 50 most recent published posts per call."""
+    try:
+        res = with_retry(lambda: supabase.table("scheduled_posts").select("*")
+            .eq("owner_id", user_id).order("scheduled_time", desc=True).limit(50).execute())
+        res = ensure_supabase_response(res, "list posts for performance")
+        rows = [r for r in res.data if r.get("external_post_id") and _effective_status(r) == "published"]
+        if not rows:
+            return {"posts": []}
+
+        row_ids = [r["id"] for r in rows]
+
+        def _latest_snapshots() -> dict:
+            snap_res = with_retry(lambda: supabase.table("organic_post_metrics").select("*")
+                .in_("scheduled_post_id", row_ids).order("fetched_at", desc=True).execute())
+            snap_res = ensure_supabase_response(snap_res, "list metric snapshots")
+            latest: dict[str, dict] = {}
+            for snap in snap_res.data:
+                sid = snap["scheduled_post_id"]
+                if sid not in latest:  # first hit per id = most recent, given the desc order
+                    latest[sid] = snap
+            return latest
+
+        latest_snapshot = _latest_snapshots()
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=PERFORMANCE_METRICS_FRESHNESS_MINUTES)
+        stale_rows = [
+            r for r in rows
+            if r["id"] not in latest_snapshot
+            or datetime.fromisoformat(latest_snapshot[r["id"]]["fetched_at"].replace("Z", "+00:00")) < cutoff
+        ]
+
+        youtube_ids = [r["external_post_id"] for r in stale_rows if r["platform"] == "youtube"]
+        youtube_stats = _fetch_youtube_video_stats(user_id, youtube_ids)
+
+        fb_token = None
+        if any(r["platform"] == "facebook" for r in stale_rows):
+            conn_res = with_retry(lambda: supabase.table("meta_connections")
+                .select("page_access_token").eq("owner_id", user_id).execute())
+            conn_res = ensure_supabase_response(conn_res, "get meta connection for performance")
+            fb_token = conn_res.data[0]["page_access_token"] if conn_res.data else None
+
+        unavailable_reasons: dict[str, str] = {}
+        for row in stale_rows:
+            if row["platform"] == "youtube":
+                stats = youtube_stats.get(row["external_post_id"])
+                if stats is None:
+                    continue
+                with_retry(lambda s=stats, r=row: supabase.table("organic_post_metrics").insert({
+                    "scheduled_post_id": r["id"], "platform": "youtube", "external_post_id": r["external_post_id"],
+                    "views": s["views"], "likes": s["likes"], "comments": s["comments"], "shares": None,
+                    "raw": s["raw"],
+                }).execute())
+            else:
+                if not fb_token:
+                    unavailable_reasons[row["id"]] = "Connect Facebook to see engagement."
+                    continue
+                metrics, reason = _fetch_facebook_post_engagement(row["external_post_id"], fb_token)
+                if metrics is None:
+                    unavailable_reasons[row["id"]] = reason or "Couldn't fetch Facebook engagement."
+                    continue
+                with_retry(lambda m=metrics, r=row: supabase.table("organic_post_metrics").insert({
+                    "scheduled_post_id": r["id"], "platform": "facebook", "external_post_id": r["external_post_id"],
+                    "views": None, "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
+                    "raw": m["raw"],
+                }).execute())
+
+        if any(row["id"] not in unavailable_reasons for row in stale_rows):
+            latest_snapshot = _latest_snapshots()
+
+        posts = []
+        for row in rows:
+            snap = latest_snapshot.get(row["id"])
+            posts.append({
+                "id": row["id"], "platform": row["platform"], "external_post_id": row["external_post_id"],
+                "caption": row["caption"], "image_base64": row.get("image_base64"),
+                "scheduled_time": row["scheduled_time"],
+                "metrics": {
+                    "views": snap["views"], "likes": snap["likes"], "comments": snap["comments"],
+                    "shares": snap["shares"], "fetched_at": snap["fetched_at"],
+                } if snap else None,
+                "metrics_unavailable_reason": unavailable_reasons.get(row["id"]),
+            })
+        return {"posts": posts}
     except HTTPException:
         raise
     except Exception as e:
