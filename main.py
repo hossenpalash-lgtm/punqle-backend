@@ -301,6 +301,11 @@ class GenerateAvatarVideoRequest(BaseModel):
 
 class AvatarVideoOperationOut(BaseModel):
     video_id: str
+    # True when the requested tier wasn't supported by this specific
+    # avatar and generation automatically fell back to Standard instead
+    # of failing outright — see start_avatar_video_generation.
+    fell_back: bool = False
+    actual_tier: str = "standard"
 
 
 class AvatarVideoStatusRequest(BaseModel):
@@ -3187,27 +3192,45 @@ def start_avatar_video_generation(
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
         voice_id = _HEYGEN_VOICE_MALE_EN if req.gender == "male" else _HEYGEN_VOICE_FEMALE_EN
-        payload = {
-            "type": "avatar",
-            "avatar_id": req.avatar_id,
-            "script": narration[:2000],
-            "voice_id": voice_id,
-            "aspect_ratio": req.aspect_ratio,
-            "engine": {"type": _HEYGEN_ENGINE_BY_TIER[req.tier]},
-        }
-        r = requests.post(f"{HEYGEN_API_BASE}/v3/videos", headers=_heygen_headers(), json=payload, timeout=30)
+
+        def _try_heygen_generate(engine_type: str):
+            payload = {
+                "type": "avatar",
+                "avatar_id": req.avatar_id,
+                "script": narration[:2000],
+                "voice_id": voice_id,
+                "aspect_ratio": req.aspect_ratio,
+                "engine": {"type": engine_type},
+            }
+            return requests.post(f"{HEYGEN_API_BASE}/v3/videos", headers=_heygen_headers(), json=payload, timeout=30)
+
+        def _is_unsupported_engine_error(resp) -> bool:
+            if resp.status_code != 400:
+                return False
+            msg = (resp.json().get("error", {}).get("message") or "").lower()
+            return "does not support" in msg
+
+        r = _try_heygen_generate(_HEYGEN_ENGINE_BY_TIER[req.tier])
+        actual_tier = req.tier
+        fell_back = False
+
+        # Confirmed live: not every avatar in the catalog supports every
+        # engine tier (some reject Premium entirely). Rather than surface
+        # that as a dead-end failure the user has to notice, retry
+        # automatically with Standard/avatar_iii — confirmed to work on
+        # every avatar tried — and charge the lower, correct price for
+        # what was actually delivered instead of what was requested.
+        # check_avatar_video_status charges off avatar_video_jobs.tier
+        # below, so storing actual_tier there (not req.tier) is what
+        # makes the lower charge automatic — no separate credit-refund
+        # logic needed.
+        if req.tier == "premium" and _is_unsupported_engine_error(r):
+            r = _try_heygen_generate(_HEYGEN_ENGINE_BY_TIER["standard"])
+            actual_tier = "standard"
+            fell_back = True
+
         if r.status_code == 400:
-            # Confirmed live: not every avatar in the catalog supports
-            # every engine tier (e.g. some only render on avatar_iii) —
-            # HeyGen's own error message already says so in plain
-            # English, so surface it directly rather than a generic
-            # failure the user can't act on.
             heygen_message = r.json().get("error", {}).get("message") or ""
-            if "does not support" in heygen_message.lower():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"This avatar doesn't support {req.tier} quality — try a different avatar or tier.",
-                )
             raise HTTPException(status_code=400, detail=heygen_message or "Couldn't start the avatar video.")
         r.raise_for_status()
         video_id = r.json().get("data", {}).get("video_id")
@@ -3217,10 +3240,10 @@ def start_avatar_video_generation(
         with_retry(lambda: supabase.table("avatar_video_jobs").insert({
             "video_id": video_id,
             "owner_id": user_id,
-            "tier": req.tier,
+            "tier": actual_tier,
         }).execute())
 
-        return {"video_id": video_id}
+        return {"video_id": video_id, "fell_back": fell_back, "actual_tier": actual_tier}
     except HTTPException:
         raise
     except requests.RequestException as e:
