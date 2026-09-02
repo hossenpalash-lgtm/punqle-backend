@@ -265,6 +265,54 @@ class VideoScriptAnglesResponse(BaseModel):
     recommended_reason: str = ""
 
 
+class AvatarOptionOut(BaseModel):
+    avatar_id: str
+    name: str
+    gender: Optional[str] = None
+    preview_image_url: Optional[str] = None
+    preview_video_url: Optional[str] = None
+
+
+class AvatarOptionsResponse(BaseModel):
+    avatars: list[AvatarOptionOut]
+
+
+class GenerateAvatarVideoRequest(BaseModel):
+    narration: str
+    avatar_id: str
+    gender: Optional[str] = None  # the picked avatar's own gender, for voice matching
+    tier: str = "standard"
+    aspect_ratio: str = "9:16"
+
+    @field_validator("tier")
+    @classmethod
+    def validate_avatar_tier(cls, v):
+        if v not in ("standard", "premium"):
+            raise ValueError("tier must be 'standard' or 'premium'")
+        return v
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_avatar_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16"):
+            raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
+
+
+class AvatarVideoOperationOut(BaseModel):
+    video_id: str
+
+
+class AvatarVideoStatusRequest(BaseModel):
+    video_id: str
+
+
+class AvatarVideoStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 class VideoStatusRequest(BaseModel):
     operation: dict
     # Whatever the client currently has — the user can edit the AI-suggested
@@ -2577,6 +2625,26 @@ VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font
 TRYON_CREDIT_COST = 2  # tryon-v1.6 is a flat 1 FASHN credit ≈ $0.075/generation, same cost-to-credit ratio as VIDEO_CREDIT_COST
 FASHN_API_BASE = "https://api.fashn.ai/v1"
 
+# Talking-avatar video (HeyGen) — a second, parallel video path alongside
+# Veo, used only when Video Ad's Style step picks "Avatar". Real per-unit
+# costs confirmed live against HeyGen's own account 2026-09-03: Avatar III
+# (standard) ~$0.0167/sec ≈ $0.13/8s clip; Avatar V (premium) ~$0.05/sec ≈
+# $0.40/8s clip — the same real cost as a Veo video, so premium reuses
+# VIDEO_CREDIT_COST directly rather than inventing a second identical
+# constant.
+HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "").strip()
+HEYGEN_API_BASE = "https://api.heygen.com"
+AVATAR_STANDARD_CREDIT_COST = 4
+AVATAR_PREMIUM_CREDIT_COST = VIDEO_CREDIT_COST
+_HEYGEN_ENGINE_BY_TIER = {"standard": "avatar_iii", "premium": "avatar_v"}
+# Confirmed live against HeyGen's own /v2/voices catalog — English (this
+# app's main language, 2156 real options there) gets one solid default
+# per gender rather than a full voice-picker UI, matching the same
+# "nice-to-have, not required for V1" scope cut already made for avatar
+# demographic filtering.
+_HEYGEN_VOICE_FEMALE_EN = "330290724a1b470fb63153f34d4c0183"  # "Annie - Lifelike"
+_HEYGEN_VOICE_MALE_EN = "6be73833ef9a4eb0aeee399b8fe9d62b"  # "Andrew"
+
 # Real cost here is tiny (~$0.003/clip: tts-1 at $15/1M chars on a ~150
 # char script, whisper-1 at $0.006/min on an ~8s clip) — priced above
 # raw cost like every other credit constant in this file, not a strict
@@ -3045,6 +3113,160 @@ def check_video_status(
         }
     except HTTPException:
         raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _heygen_headers() -> dict:
+    if not HEYGEN_API_KEY:
+        raise HTTPException(status_code=503, detail="Avatar video isn't available right now.")
+    return {"X-Api-Key": HEYGEN_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
+
+
+@app.get("/ads/avatar-options", response_model=AvatarOptionsResponse, tags=["ads"])
+def list_avatar_options(user_id: str = Depends(get_current_user_id)):
+    """Free — thin proxy over HeyGen's own stock avatar catalog (1264+
+    real avatars confirmed live 2026-09-03), fetched live rather than
+    stored, since it's HeyGen's catalog, not Punqle's data. No credit
+    gate — browsing doesn't generate anything."""
+    try:
+        r = requests.get(f"{HEYGEN_API_BASE}/v2/avatars", headers=_heygen_headers(), timeout=20)
+        r.raise_for_status()
+        raw = r.json().get("data", {}).get("avatars", [])
+        avatars = [
+            {
+                "avatar_id": a.get("avatar_id"),
+                "name": a.get("avatar_name") or a.get("avatar_id"),
+                "gender": a.get("gender"),
+                "preview_image_url": a.get("preview_image_url"),
+                "preview_video_url": a.get("preview_video_url"),
+            }
+            for a in raw
+            if a.get("avatar_id")
+        ]
+        return {"avatars": avatars}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("HeyGen avatar list error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't load avatars right now.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-avatar-video", response_model=AvatarVideoOperationOut, tags=["ads"])
+@limiter.limit("5/minute")
+def start_avatar_video_generation(
+    request: Request,
+    req: GenerateAvatarVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Starts a HeyGen talking-avatar video job — same check-then-charge
+    shape as Veo's start_video_generation, and genuinely async on
+    HeyGen's side too (real spike: ~3 minutes for a ~7s clip), so this
+    only kicks the job off; credits are charged in
+    check_avatar_video_status once it actually succeeds.
+
+    Unlike Veo's fully stateless operation round-trip, this writes one
+    row to avatar_video_jobs — HeyGen's own status response never says
+    which engine/tier a video was rendered with, and tier changes the
+    credit price, so the tier has to be remembered server-side (keyed by
+    HeyGen's own video_id) rather than trusted from the client at poll
+    time — otherwise a client could under-report the tier and pay less
+    than what was actually generated."""
+    try:
+        narration = (req.narration or "").strip()
+        if not narration:
+            raise HTTPException(status_code=400, detail="Nothing for the avatar to say.")
+
+        cost = AVATAR_PREMIUM_CREDIT_COST if req.tier == "premium" else AVATAR_STANDARD_CREDIT_COST
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        voice_id = _HEYGEN_VOICE_MALE_EN if req.gender == "male" else _HEYGEN_VOICE_FEMALE_EN
+        payload = {
+            "type": "avatar",
+            "avatar_id": req.avatar_id,
+            "script": narration[:2000],
+            "voice_id": voice_id,
+            "aspect_ratio": req.aspect_ratio,
+            "engine": {"type": _HEYGEN_ENGINE_BY_TIER[req.tier]},
+        }
+        r = requests.post(f"{HEYGEN_API_BASE}/v3/videos", headers=_heygen_headers(), json=payload, timeout=30)
+        r.raise_for_status()
+        video_id = r.json().get("data", {}).get("video_id")
+        if not video_id:
+            raise HTTPException(status_code=502, detail="Couldn't start the avatar video.")
+
+        with_retry(lambda: supabase.table("avatar_video_jobs").insert({
+            "video_id": video_id,
+            "owner_id": user_id,
+            "tier": req.tier,
+        }).execute())
+
+        return {"video_id": video_id}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("HeyGen generate error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't start the avatar video.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/avatar-video-status", response_model=AvatarVideoStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_avatar_video_status(
+    request: Request,
+    req: AvatarVideoStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("avatar_video_jobs")
+            .select("*")
+            .eq("video_id", req.video_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get avatar video job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="Avatar video job not found.")
+        tier = job_res.data[0]["tier"]
+
+        r = requests.get(f"{HEYGEN_API_BASE}/v3/videos/{req.video_id}", headers=_heygen_headers(), timeout=20)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        status = data.get("status")
+
+        if status not in ("completed", "failed"):
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        # This row's only job was tier tracking — clean it up either way,
+        # success or failure, once we have a final answer.
+        with_retry(lambda: supabase.table("avatar_video_jobs").delete().eq("video_id", req.video_id).execute())
+
+        if status == "failed":
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("video_url")
+        if not video_url:
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=60)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        cost = AVATAR_PREMIUM_CREDIT_COST if tier == "premium" else AVATAR_STANDARD_CREDIT_COST
+        new_credits = _spend_ad_credits(user_id, cost)
+
+        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("HeyGen status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the avatar video's status.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
