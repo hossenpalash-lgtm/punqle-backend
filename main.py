@@ -453,6 +453,27 @@ class FetchProductLinkResponse(BaseModel):
     mime_type: Optional[str] = None
 
 
+class UnderstandProductLinkRequest(BaseModel):
+    url: str
+
+
+class ProductUnderstandingOut(BaseModel):
+    title: str
+    description: str
+    image_base64: Optional[str] = None
+    mime_type: Optional[str] = None
+    # Everything below is new vs. FetchProductLinkResponse — AI-grounded
+    # in the page's real body text, not just its one-line meta tag. See
+    # understand_product_link.
+    enriched_description: str
+    product_name: str
+    benefits: list[str]
+    features: list[str]
+    offer: Optional[str] = None
+    target_audience: Optional[str] = None
+    tone: Optional[str] = None
+
+
 BUSINESS_CATEGORIES = {
     "retail", "restaurant_cafe", "health_beauty", "professional_services",
     "home_services", "real_estate", "automotive", "education_coaching",
@@ -2077,6 +2098,111 @@ def _extract_article_text(url: str) -> tuple[str, str]:
     return title or "", body_text
 
 
+def _fetch_product_page_deep(url: str) -> dict:
+    """Free — one fetch, no AI call. Extends _fetch_product_from_link's
+    Open Graph parse with the page's real body text (same extraction
+    _extract_article_text uses), so understand_product_link can hand an
+    AI call actual page content instead of just a title/one-line meta
+    description. Deliberately a separate function rather than calling
+    both existing helpers — they'd each fetch the same URL a second time."""
+    html_bytes, _ = _fetch_url_bytes(url)
+    soup = BeautifulSoup(html_bytes, "html.parser")
+
+    def meta(*names: str) -> Optional[str]:
+        for name in names:
+            tag = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return None
+
+    title = meta("og:title", "twitter:title")
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    description = meta("og:description", "twitter:description", "description") or ""
+    image_url = meta("og:image", "twitter:image")
+
+    image_base64 = None
+    mime_type = None
+    if image_url:
+        try:
+            image_bytes, content_type = _fetch_url_bytes(image_url)
+            image_base64 = base64.b64encode(image_bytes).decode("ascii")
+            mime_type = content_type or "image/jpeg"
+        except (HTTPException, requests.RequestException):
+            pass
+
+    paragraphs = soup.find_all("p")
+    body_text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+    body_text = re.sub(r"\s+", " ", body_text).strip()[:_MAX_ARTICLE_CHARS]
+
+    return {
+        "title": title or "",
+        "description": description,
+        "image_base64": image_base64,
+        "mime_type": mime_type,
+        "body_text": body_text,
+    }
+
+
+def _generate_product_understanding(title: str, description: str, body_text: str, category: str) -> dict:
+    """Free — text-only GPT call. Turns a shallow Open Graph title +
+    one-line meta description into genuine product understanding by
+    reading the page's actual body text: real benefits/features actually
+    stated, any real offer/discount (never invented), who it's for, and
+    the brand's own tone — plus a richer synthesized description built
+    from all of it. Quick Create passes that richer description into
+    angle/caption generation instead of the bare meta description, so
+    the AI's angles are grounded in more than a one-line tag."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""You are analyzing a product page for a small business's ad campaign.
+
+{category_guidance}
+
+Page title: {title or "(none)"}
+Page meta description: {description or "(none)"}
+Page body text: {body_text or "(none)"}
+
+Based ONLY on what's actually stated above — never invent a price, discount, or claim that isn't there — extract:
+1. "product_name" — a short, clean product name (a few words)
+2. "benefits" — up to 4 short customer-facing benefits actually stated or clearly implied (not generic filler)
+3. "features" — up to 4 short concrete features/specs actually mentioned
+4. "offer" — a real discount/promo/price stated on the page, or null if none is mentioned
+5. "target_audience" — one short phrase for who this seems to be for, based on the actual content, or null if genuinely unclear
+6. "tone" — one short phrase describing the brand's voice from the writing itself (e.g. "playful and casual", "premium and minimal", "value-focused"), or null if unclear
+7. "summary" — a rich 2-3 sentence description of this product/offer for an ad copywriter to work from, naturally combining the above — a product brief, not a bullet list
+
+Respond with ONLY this JSON format, nothing else:
+{{"product_name": "", "benefits": [], "features": [], "offer": null, "target_audience": null, "tone": null, "summary": ""}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You extract accurate, grounded product understanding from real page content for small business ad campaigns — never inventing facts not present in the source.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    return {
+        "product_name": str(parsed.get("product_name") or "").strip(),
+        "benefits": [str(b).strip() for b in (parsed.get("benefits") or []) if str(b).strip()][:4],
+        "features": [str(f).strip() for f in (parsed.get("features") or []) if str(f).strip()][:4],
+        "offer": (str(parsed.get("offer")).strip() or None) if parsed.get("offer") else None,
+        "target_audience": (str(parsed.get("target_audience")).strip() or None) if parsed.get("target_audience") else None,
+        "tone": (str(parsed.get("tone")).strip() or None) if parsed.get("tone") else None,
+        "summary": str(parsed.get("summary") or "").strip(),
+    }
+
+
 def _generate_post_ideas_from_article(title: str, body_text: str, category: str) -> list[str]:
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     prompt = f"""You are a social media content strategist for a small business.
@@ -3655,6 +3781,58 @@ def fetch_product_link(
         if not result["title"] and not result["description"]:
             raise HTTPException(status_code=422, detail="Couldn't find product info at that link.")
         return result
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't reach that link.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/understand-product-link", response_model=ProductUnderstandingOut, tags=["ads"])
+@limiter.limit("10/minute")
+def understand_product_link(
+    request: Request,
+    req: UnderstandProductLinkRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — Quick Create's product-understanding step. fetch-product-link
+    itself is untouched by this (still a plain, instant meta-tag fetch) —
+    this is a separate, additive endpoint so the existing "paste a link"
+    shortcut inside the full Customize wizard keeps its current fast,
+    simple behavior unchanged. Only Quick Create (Image and Video) calls
+    this instead, trading a little latency for a real AI reading of the
+    page rather than just its Open Graph tags."""
+    try:
+        url = (req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="Paste a product page link.")
+        fetched = _fetch_product_page_deep(url)
+        if not fetched["title"] and not fetched["description"] and not fetched["body_text"]:
+            raise HTTPException(status_code=422, detail="Couldn't find product info at that link.")
+
+        category = _get_business_category(user_id)
+        understanding = _generate_product_understanding(
+            fetched["title"], fetched["description"], fetched["body_text"], category
+        )
+        enriched_description = understanding["summary"] or " — ".join(
+            filter(None, [fetched["title"], fetched["description"]])
+        )
+
+        return {
+            "title": fetched["title"],
+            "description": fetched["description"],
+            "image_base64": fetched["image_base64"],
+            "mime_type": fetched["mime_type"],
+            "enriched_description": enriched_description,
+            "product_name": understanding["product_name"],
+            "benefits": understanding["benefits"],
+            "features": understanding["features"],
+            "offer": understanding["offer"],
+            "target_audience": understanding["target_audience"],
+            "tone": understanding["tone"],
+        }
     except HTTPException:
         raise
     except requests.RequestException:
