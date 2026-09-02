@@ -261,6 +261,8 @@ class VideoScriptAngleOut(BaseModel):
 
 class VideoScriptAnglesResponse(BaseModel):
     angles: list[VideoScriptAngleOut]
+    recommended_index: int = 0
+    recommended_reason: str = ""
 
 
 class VideoStatusRequest(BaseModel):
@@ -2518,7 +2520,7 @@ Respond with ONLY this JSON format, nothing else:
     return {"headline": hook, "narration": narration}
 
 
-def _generate_video_script_angles(item_description: str, category: str, goal: str, count: int = 4) -> list[dict]:
+def _generate_video_script_angles(item_description: str, category: str, goal: str, count: int = 4) -> dict:
     """Free — text-only GPT call, same pattern as _generate_ad_captions but
     for full video scripts (on-screen hook + voiceover narration) instead
     of captions. Returns `count` candidates, each forced to a genuinely
@@ -2527,7 +2529,13 @@ def _generate_video_script_angles(item_description: str, category: str, goal: st
     Whatever gets picked is passed back into start_video_generation
     verbatim via GenerateVideoRequest.headline/narration — never
     regenerated — so the chosen script is exactly what ends up on the
-    video, not a fresh (non-deterministic) rewrite of it."""
+    video, not a fresh (non-deterministic) rewrite of it.
+
+    Also returns recommended_index/recommended_reason (same shape as
+    _generate_ad_captions) so Quick Create's Video option can auto-pick a
+    genuine best angle instead of always defaulting to index 0 — Quick
+    Create is meant to stay a single tap, so it never shows this picker,
+    it just uses the AI's own top choice."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     goal_guidance = AD_GOAL_GUIDANCE[goal]
     prompt = f"""You are writing on-screen text and voiceover scripts for social media ad videos for a small business.
@@ -2545,8 +2553,10 @@ Each option has four parts:
 3. "headline" — ONE short, punchy on-screen text hook, 4 to 8 words, under 40 characters, no hashtags, no emoji, no quotation marks
 4. "narration" — a natural-sounding 1-2 sentence voiceover script a narrator would SAY out loud for the whole ~8 second video, roughly 15 to 22 words. Conversational and energetic, no hashtags, no emoji, no quotation marks, no stage directions.
 
+After writing all options, pick the ONE you genuinely think is strongest for this specific offer and goal, and say why in one short sentence — not a fabricated score, just your honest reasoning.
+
 Respond with ONLY this JSON format, nothing else:
-{{"angles": [{{"angle": "...", "explanation": "...", "headline": "...", "narration": "..."}}]}}
+{{"angles": [{{"angle": "...", "explanation": "...", "headline": "...", "narration": "..."}}], "recommended_index": 0, "recommended_reason": "..."}}
 """
     response = with_retry(
         lambda: client.chat.completions.create(
@@ -2578,7 +2588,14 @@ Respond with ONLY this JSON format, nothing else:
     ]
     if not angles:
         raise ValueError("No script angles were generated.")
-    return angles
+    recommended_index = parsed.get("recommended_index")
+    if not isinstance(recommended_index, int) or not (0 <= recommended_index < len(angles)):
+        recommended_index = 0
+    return {
+        "angles": angles,
+        "recommended_index": recommended_index,
+        "recommended_reason": str(parsed.get("recommended_reason") or "").strip(),
+    }
 
 
 # Veo always renders at exactly one of these two 720p frame sizes (see
@@ -2774,8 +2791,7 @@ def generate_video_angles(
         if not item_description:
             raise HTTPException(status_code=400, detail="Tell us what the video is about.")
         category = _get_business_category(user_id)
-        angles = _generate_video_script_angles(item_description, category, req.goal)
-        return {"angles": angles}
+        return _generate_video_script_angles(item_description, category, req.goal)
     except HTTPException:
         raise
     except Exception as e:
