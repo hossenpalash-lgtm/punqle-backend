@@ -3196,6 +3196,19 @@ def start_avatar_video_generation(
             "engine": {"type": _HEYGEN_ENGINE_BY_TIER[req.tier]},
         }
         r = requests.post(f"{HEYGEN_API_BASE}/v3/videos", headers=_heygen_headers(), json=payload, timeout=30)
+        if r.status_code == 400:
+            # Confirmed live: not every avatar in the catalog supports
+            # every engine tier (e.g. some only render on avatar_iii) —
+            # HeyGen's own error message already says so in plain
+            # English, so surface it directly rather than a generic
+            # failure the user can't act on.
+            heygen_message = r.json().get("error", {}).get("message") or ""
+            if "does not support" in heygen_message.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This avatar doesn't support {req.tier} quality — try a different avatar or tier.",
+                )
+            raise HTTPException(status_code=400, detail=heygen_message or "Couldn't start the avatar video.")
         r.raise_for_status()
         video_id = r.json().get("data", {}).get("video_id")
         if not video_id:
