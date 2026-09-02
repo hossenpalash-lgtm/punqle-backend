@@ -212,6 +212,12 @@ class GenerateVideoRequest(BaseModel):
     # headline genuinely goal/angle-aware. See _generate_video_script.
     goal: Optional[str] = None
     angle: Optional[str] = None
+    # Set together when the caller already has an exact script picked (the
+    # Video Ad multi-angle picker) — skips _generate_video_script entirely
+    # so the video gets exactly the hook/narration the user reviewed and
+    # chose, not a fresh (non-deterministic) regeneration of it.
+    headline: Optional[str] = None
+    narration: Optional[str] = None
 
     @field_validator("aspect_ratio")
     @classmethod
@@ -232,6 +238,29 @@ class VideoOperationOut(BaseModel):
     operation: dict
     headline: str
     narration: str = ""
+
+
+class GenerateVideoAnglesRequest(BaseModel):
+    item_description: str
+    goal: str
+
+    @field_validator("goal")
+    @classmethod
+    def validate_video_angles_goal(cls, v):
+        if v not in ("sales", "leads", "traffic", "bookings"):
+            raise ValueError("Invalid goal")
+        return v
+
+
+class VideoScriptAngleOut(BaseModel):
+    angle: str
+    explanation: str
+    headline: str
+    narration: str
+
+
+class VideoScriptAnglesResponse(BaseModel):
+    angles: list[VideoScriptAngleOut]
 
 
 class VideoStatusRequest(BaseModel):
@@ -2489,6 +2518,69 @@ Respond with ONLY this JSON format, nothing else:
     return {"headline": hook, "narration": narration}
 
 
+def _generate_video_script_angles(item_description: str, category: str, goal: str, count: int = 4) -> list[dict]:
+    """Free — text-only GPT call, same pattern as _generate_ad_captions but
+    for full video scripts (on-screen hook + voiceover narration) instead
+    of captions. Returns `count` candidates, each forced to a genuinely
+    different persuasion angle, so the user picks a real written script up
+    front instead of a blind angle label before anything exists to compare.
+    Whatever gets picked is passed back into start_video_generation
+    verbatim via GenerateVideoRequest.headline/narration — never
+    regenerated — so the chosen script is exactly what ends up on the
+    video, not a fresh (non-deterministic) rewrite of it."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    goal_guidance = AD_GOAL_GUIDANCE[goal]
+    prompt = f"""You are writing on-screen text and voiceover scripts for social media ad videos for a small business.
+
+{category_guidance}
+{goal_guidance}
+
+The video is about: {item_description}
+
+Write exactly {count} distinct video script options. Each must use a genuinely different persuasion angle from the others (e.g. "Time Saver", "Problem → Solution", "Before/After", "Benefit", "Social Proof", "Comparison" — pick whichever angles genuinely fit this offer, don't force one that doesn't apply).
+
+Each option has four parts:
+1. "angle" — a short label for the persuasion angle used (2-4 words)
+2. "explanation" — one short sentence (under 15 words) explaining why this angle could work for this offer
+3. "headline" — ONE short, punchy on-screen text hook, 4 to 8 words, under 40 characters, no hashtags, no emoji, no quotation marks
+4. "narration" — a natural-sounding 1-2 sentence voiceover script a narrator would SAY out loud for the whole ~8 second video, roughly 15 to 22 words. Conversational and energetic, no hashtags, no emoji, no quotation marks, no stage directions.
+
+Respond with ONLY this JSON format, nothing else:
+{{"angles": [{{"angle": "...", "explanation": "...", "headline": "...", "narration": "..."}}]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write short, punchy on-screen video hooks and natural voiceover scripts for small business ads, each built around a distinct persuasion angle.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.8,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    angles_raw = parsed.get("angles") or []
+    angles = [
+        {
+            "angle": (a.get("angle") or "").strip() or "Idea",
+            "explanation": (a.get("explanation") or "").strip(),
+            "headline": (a.get("headline") or "").strip().strip('"').strip("'")[:60],
+            "narration": (a.get("narration") or "").strip().strip('"').strip("'")[:MAX_NARRATION_CHARS],
+        }
+        for a in angles_raw[:count]
+    ]
+    if not angles:
+        raise ValueError("No script angles were generated.")
+    return angles
+
+
 # Veo always renders at exactly one of these two 720p frame sizes (see
 # GenerateVideosConfig's resolution="720p" in start_video_generation) —
 # known deterministically, so the logo's target pixel size can be
@@ -2665,6 +2757,32 @@ def _burn_text_on_video(
             return f.read()
 
 
+@app.post("/ads/generate-video-angles", response_model=VideoScriptAnglesResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def generate_video_angles(
+    request: Request,
+    req: GenerateVideoAnglesRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only GPT call, same economics as generate_ad_captions.
+    Writes several distinct on-screen-hook + voiceover-narration
+    candidates so Video Ad's brief step can show real written scripts to
+    pick between, instead of a blind angle label. See
+    _generate_video_script_angles."""
+    try:
+        item_description = (req.item_description or "").strip()
+        if not item_description:
+            raise HTTPException(status_code=400, detail="Tell us what the video is about.")
+        category = _get_business_category(user_id)
+        angles = _generate_video_script_angles(item_description, category, req.goal)
+        return {"angles": angles}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ads/generate-video", response_model=VideoOperationOut, tags=["ads"])
 @limiter.limit("5/minute")
 def start_video_generation(
@@ -2698,8 +2816,19 @@ def start_video_generation(
                 mime_type=req.image_mime_type or "image/jpeg",
             )
 
-        category = _get_business_category(user_id)
-        script = _generate_video_script(item_description, category, req.goal, req.angle)
+        # Both set → the caller (Video Ad's angle picker) already has an
+        # exact script the user reviewed and chose; use it verbatim rather
+        # than calling the (non-deterministic) generator again, which
+        # would silently burn a different script onto the video than the
+        # one the user actually picked.
+        if req.headline is not None and req.narration is not None:
+            script = {
+                "headline": req.headline.strip()[:60],
+                "narration": req.narration.strip()[:MAX_NARRATION_CHARS],
+            }
+        else:
+            category = _get_business_category(user_id)
+            script = _generate_video_script(item_description, category, req.goal, req.angle)
 
         prompt = (
             f"A short, eye-catching social media ad video for a small business. {item_description}. "
