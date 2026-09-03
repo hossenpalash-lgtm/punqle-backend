@@ -3795,6 +3795,122 @@ def edit_video(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class AddCaptionsToAvatarVideoRequest(BaseModel):
+    video_base64: str
+    aspect_ratio: str = "9:16"
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_captions_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16"):
+            raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
+
+
+class AddCaptionsToAvatarVideoResponse(BaseModel):
+    video_base64: str
+
+
+def _extract_audio(video_bytes: bytes) -> bytes:
+    """Pulls the audio track out as mp3 — HeyGen's avatar output already
+    has real spoken audio baked in (unlike the Veo voiceover flow, which
+    synthesizes its own), so captioning it needs the audio pulled out
+    for transcription rather than starting from a script we wrote."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        output_path = os.path.join(tmp_dir, "audio.mp3")
+        with open(input_path, "wb") as f:
+            f.write(video_bytes)
+        cmd = [ffmpeg_exe, "-y", "-i", input_path, "-vn", "-c:a", "libmp3lame", "-q:a", "4", output_path]
+        result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result_proc.returncode != 0:
+            logger.error("ffmpeg audio extract failed: %s", result_proc.stderr[-2000:])
+            raise Exception("Couldn't read the video's audio.")
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+def _overlay_captions_on_video(
+    video_bytes: bytes, caption_segments: list, aspect_ratio: str, brand_color: Optional[str],
+) -> bytes:
+    """Burns timed caption bars onto a video WITHOUT touching its audio
+    track (-c:a copy) — unlike _compose_audio_and_captions, which
+    replaces audio with a freshly synthesized voiceover, this is for a
+    video (avatar, or avatar+b-roll+music already assembled) whose real
+    audio must survive exactly as it already is."""
+    if not caption_segments:
+        return video_bytes
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["9:16"])
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+        with open(input_path, "wb") as f:
+            f.write(video_bytes)
+
+        cmd = [ffmpeg_exe, "-y", "-i", input_path]
+        chain_parts = []
+        stage = "[0:v]"
+        next_input_idx = 1
+        for i, seg in enumerate(caption_segments):
+            seg_path = os.path.join(tmp_dir, f"cap{i}.png")
+            with open(seg_path, "wb") as f:
+                f.write(_render_caption_bar_png(seg["text"], video_w, video_h, brand_color, "bottom"))
+            cmd += ["-i", seg_path]
+            is_last = i == len(caption_segments) - 1
+            out_label = "[out]" if is_last else f"[cap{i}out]"
+            chain_parts.append(
+                f"{stage}[{next_input_idx}:v]overlay=x=0:y=0:enable='between(t,{seg['start']:.2f},{seg['end']:.2f})'{out_label}"
+            )
+            stage = out_label
+            next_input_idx += 1
+
+        cmd += ["-filter_complex", ";".join(chain_parts), "-map", "[out]", "-map", "0:a", "-c:v", "libx264",
+                "-preset", "ultrafast", "-bf", "0", "-threads", "1", "-c:a", "copy", output_path]
+        result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result_proc.returncode != 0:
+            logger.error("ffmpeg caption overlay failed: %s", result_proc.stderr[-2000:])
+            raise Exception("Couldn't add captions to the video.")
+
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+@app.post("/ads/avatar-video-add-captions", response_model=AddCaptionsToAvatarVideoResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def add_captions_to_avatar_video(
+    request: Request,
+    req: AddCaptionsToAvatarVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — real cost is a fraction of a cent (whisper-1 at $0.006/min
+    on an ~8-15s clip), same "near-zero real cost, don't charge for it"
+    call already made for background music. Transcribes whatever audio
+    the current video actually has (avatar dialogue, possibly with
+    music already mixed under it) rather than the known script text,
+    since HeyGen's real speech pacing/pauses aren't uniform — same
+    reasoning _transcribe_word_timestamps already documents for the Veo
+    voiceover flow. If a product scene was already concatenated on,
+    Whisper simply finds no words in that silent/ambient stretch, so no
+    caption segments land there — no special-casing needed."""
+    try:
+        profile = _get_business_profile(user_id)
+        brand_color = profile.get("brand_color")
+
+        video_bytes = base64.b64decode(req.video_base64)
+        audio_bytes = _extract_audio(video_bytes)
+        words = _transcribe_word_timestamps(audio_bytes)
+        caption_segments = _group_words_into_captions(words, hook_duration=0.0, max_segments=MAX_CAPTION_SEGMENTS)
+        captioned = _overlay_captions_on_video(video_bytes, caption_segments, req.aspect_ratio, brand_color)
+        return {"video_base64": base64.b64encode(captioned).decode("ascii")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/tryon/generate", response_model=TryOnStartResponse, tags=["tryon"])
 @limiter.limit("10/minute")
 def start_tryon(
