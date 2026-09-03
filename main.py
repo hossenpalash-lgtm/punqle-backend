@@ -318,6 +318,33 @@ class AvatarVideoStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+# A few curated moods rather than free-text search — matches the same
+# "nice-to-have, not required for V1" scope cut already made for avatar
+# demographic filtering and voice selection.
+_AVATAR_MUSIC_MOODS = {
+    "upbeat": "upbeat corporate background music",
+    "calm": "calm minimal ambient background music",
+    "energetic": "energetic pop background music",
+    "corporate": "professional corporate background music",
+}
+
+
+class AddMusicToAvatarVideoRequest(BaseModel):
+    video_base64: str
+    mood: str
+
+    @field_validator("mood")
+    @classmethod
+    def validate_music_mood(cls, v):
+        if v not in _AVATAR_MUSIC_MOODS:
+            raise ValueError(f"mood must be one of {list(_AVATAR_MUSIC_MOODS)}")
+        return v
+
+
+class AddMusicToAvatarVideoResponse(BaseModel):
+    video_base64: str
+
+
 class VideoStatusRequest(BaseModel):
     operation: dict
     # Whatever the client currently has — the user can edit the AI-suggested
@@ -3303,6 +3330,88 @@ def check_avatar_video_status(
     except requests.RequestException as e:
         logger.error("HeyGen status error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=502, detail="Couldn't check the avatar video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _mix_music_under_video_audio(video_bytes: bytes, music_bytes: bytes, music_volume: float = 0.15) -> bytes:
+    """Mixes a background music track UNDER a video's existing audio
+    (the avatar's dialogue) rather than replacing it — the opposite of
+    _compose_audio_and_captions below, which intentionally replaces the
+    whole track for voiceover (no mixing precedent existed before this).
+    Music is looped if shorter than the video and ducked to
+    music_volume so it never competes with the avatar's speech; output
+    duration matches the video's own (dialogue) track, not the music's."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        music_path = os.path.join(tmp_dir, "music.wav")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+        with open(input_path, "wb") as f:
+            f.write(video_bytes)
+        with open(music_path, "wb") as f:
+            f.write(music_bytes)
+
+        filter_complex = (
+            f"[1:a]volume={music_volume},aloop=loop=-1:size=2e9[music];"
+            "[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+        )
+        cmd = [
+            ffmpeg_exe, "-y", "-i", input_path, "-i", music_path,
+            "-filter_complex", filter_complex,
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+        result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result_proc.returncode != 0:
+            logger.error("ffmpeg music mix failed: %s", result_proc.stderr[-2000:])
+            raise Exception("Couldn't add music to the video.")
+
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+@app.post("/ads/avatar-video-add-music", response_model=AddMusicToAvatarVideoResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def add_music_to_avatar_video(
+    request: Request,
+    req: AddMusicToAvatarVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — mixes a real, licensed background track (HeyGen's own
+    music catalog, searched live, confirmed working) under an
+    already-generated avatar video's existing dialogue audio, ducked to
+    a low volume so it never competes with the avatar's speech. No
+    credit cost: the music search itself is free, and mixing is
+    Punqle's own ffmpeg compute — same as every other free
+    post-generation edit in this app."""
+    try:
+        video_bytes = base64.b64decode(req.video_base64)
+        query = _AVATAR_MUSIC_MOODS[req.mood]
+        r = requests.get(
+            f"{HEYGEN_API_BASE}/v3/audio/sounds",
+            headers=_heygen_headers(),
+            params={"query": query, "limit": 1},
+            timeout=20,
+        )
+        r.raise_for_status()
+        tracks = r.json().get("data", [])
+        if not tracks:
+            raise HTTPException(status_code=502, detail="Couldn't find a matching music track.")
+        music_url = tracks[0]["audio_url"]
+
+        music_resp = requests.get(music_url, timeout=30)
+        music_resp.raise_for_status()
+
+        mixed = _mix_music_under_video_audio(video_bytes, music_resp.content)
+        return {"video_base64": base64.b64encode(mixed).decode("ascii")}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Music fetch error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't fetch music.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
