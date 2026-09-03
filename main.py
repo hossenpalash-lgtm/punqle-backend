@@ -345,6 +345,23 @@ class AddMusicToAvatarVideoResponse(BaseModel):
     video_base64: str
 
 
+class ConcatVideosRequest(BaseModel):
+    first_video_base64: str
+    second_video_base64: str
+    aspect_ratio: str = "9:16"
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_concat_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16"):
+            raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
+
+
+class ConcatVideosResponse(BaseModel):
+    video_base64: str
+
+
 class VideoStatusRequest(BaseModel):
     operation: dict
     # Whatever the client currently has — the user can edit the AI-suggested
@@ -3412,6 +3429,76 @@ def add_music_to_avatar_video(
     except requests.RequestException as e:
         logger.error("Music fetch error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=502, detail="Couldn't fetch music.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _concat_videos(first_bytes: bytes, second_bytes: bytes, aspect_ratio: str) -> bytes:
+    """Concatenates two already-finished videos back to back — e.g. an
+    avatar clip followed by a Veo b-roll product scene, the "multi-scene
+    ad" gap found in competitor research (Creatify's timeline editor,
+    Arcads' one-click B-roll assembly). Both inputs are scaled/padded to
+    the same target resolution first regardless of their actual source
+    dimensions/fps, so a HeyGen clip next to a Veo clip never breaks the
+    concat even if their real specs happen to differ. Simple hard cut,
+    no transition effect or multi-track editing — a first version of
+    this capability, not a timeline editor."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    width, height = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["9:16"])
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        first_path = os.path.join(tmp_dir, "first.mp4")
+        second_path = os.path.join(tmp_dir, "second.mp4")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+        with open(first_path, "wb") as f:
+            f.write(first_bytes)
+        with open(second_path, "wb") as f:
+            f.write(second_bytes)
+
+        filter_complex = (
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25[v0];"
+            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25[v1];"
+            "[0:a]aresample=async=1[a0];"
+            "[1:a]aresample=async=1[a1];"
+            "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]"
+        )
+        cmd = [
+            ffmpeg_exe, "-y", "-i", first_path, "-i", second_path,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-threads", "1",
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+        result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if result_proc.returncode != 0:
+            logger.error("ffmpeg concat failed: %s", result_proc.stderr[-2000:])
+            raise Exception("Couldn't combine the two videos.")
+
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
+@app.post("/ads/concat-videos", response_model=ConcatVideosResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def concat_videos(
+    request: Request,
+    req: ConcatVideosRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — combines two already-finished videos (e.g. an avatar clip
+    + a Veo b-roll product scene) into one, back to back. The Veo scene
+    itself already cost real credits when it was generated through the
+    existing /ads/generate-video + /ads/video-status pair — this step
+    is pure local ffmpeg compositing, no new AI call, so no additional
+    charge here."""
+    try:
+        first_bytes = base64.b64decode(req.first_video_base64)
+        second_bytes = base64.b64decode(req.second_video_base64)
+        combined = _concat_videos(first_bytes, second_bytes, req.aspect_ratio)
+        return {"video_base64": base64.b64encode(combined).decode("ascii")}
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
