@@ -515,6 +515,12 @@ class TikTokStatusResponse(BaseModel):
     display_name: Optional[str] = None
 
 
+class TikTokPublishResponse(BaseModel):
+    posted: bool
+    publish_id: Optional[str] = None
+    error: Optional[str] = None
+
+
 class YouTubePublishResponse(BaseModel):
     posted: bool
     video_id: Optional[str] = None
@@ -5544,6 +5550,135 @@ def disconnect_tiktok(user_id: str = Depends(get_current_user_id)):
     try:
         supabase.table("tiktok_connections").delete().eq("owner_id", user_id).execute()
         return {"disconnected": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# TikTok requires each chunk to be 5-64MB except a lone/final chunk (up to
+# 128MB) — confirmed via their own Media Transfer Guide. Every real video
+# this app has ever produced (short 8-15s Veo/HeyGen clips) sits well
+# under this in one piece, so V1 deliberately only implements the
+# single-chunk path and errors above it rather than adding real chunk-
+# splitting logic for a size this app doesn't produce.
+_TIKTOK_MAX_SINGLE_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+@app.post("/tiktok/publish", response_model=TikTokPublishResponse, tags=["tiktok"])
+@limiter.limit("10/minute")
+def publish_to_tiktok(
+    request: Request,
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    is_own_brand: bool = Form(...),
+    source: str = Form("single"),
+    content_plan_id: Optional[str] = Form(None),
+    content_plan_day: Optional[str] = Form(None),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Publishes an already-generated (already-paid-for) video straight to
+    the business's connected TikTok account — no credit spent here, same
+    "free packaging" principle as /meta/publish and /youtube/publish.
+
+    is_own_brand is required, not defaulted — TikTok's own guidelines
+    mandate the branded-content disclosure be a real user choice, never
+    silently applied (confirmed directly against their Content Sharing
+    Guidelines). Maps to brand_organic_toggle (promoting your own
+    business — true for virtually every Punqle post) vs brand_content_
+    toggle (a paid partnership with a third-party brand, not something
+    this app currently has a flow for).
+
+    is_aigc is always true — every video Punqle produces is AI-generated
+    end to end (Veo or HeyGen), so there's no real case where TikTok's
+    AI-content disclosure requirement wouldn't apply.
+
+    While the app is in TikTok's Sandbox (unaudited), TikTok itself
+    forces every post to SELF_ONLY (private) regardless of the
+    privacy_level sent — confirmed via their own unaudited-app rules —
+    so no privacy picker exists yet; add one once the app clears audit."""
+    try:
+        access_token = _get_valid_tiktok_token(user_id)
+        if not access_token:
+            res = with_retry(lambda: supabase.table("tiktok_connections")
+                .select("open_id")
+                .eq("owner_id", user_id)
+                .execute())
+            res = ensure_supabase_response(res, "get tiktok connection")
+            if not res.data:
+                raise HTTPException(status_code=400, detail="Connect TikTok first.")
+            raise HTTPException(status_code=400, detail="Your TikTok connection expired — please reconnect.")
+
+        video_bytes = file.file.read()
+        if len(video_bytes) > _TIKTOK_MAX_SINGLE_CHUNK_BYTES:
+            raise HTTPException(status_code=400, detail="This video is too large to publish to TikTok right now.")
+
+        init_resp = with_retry(
+            lambda: requests.post(
+                "https://open.tiktokapis.com/v2/post/publish/video/init/",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json; charset=UTF-8",
+                },
+                json={
+                    "post_info": {
+                        "title": caption[:2200],
+                        "privacy_level": "SELF_ONLY",
+                        "disable_duet": False,
+                        "disable_stitch": False,
+                        "disable_comment": False,
+                        "brand_content_toggle": not is_own_brand,
+                        "brand_organic_toggle": is_own_brand,
+                        "is_aigc": True,
+                    },
+                    "source_info": {
+                        "source": "FILE_UPLOAD",
+                        "video_size": len(video_bytes),
+                        "chunk_size": len(video_bytes),
+                        "total_chunk_count": 1,
+                    },
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        outcome: dict = {"posted": False, "publish_id": None, "error": None}
+        if not init_resp.ok:
+            logger.error("TikTok upload init failed: %s", init_resp.text)
+            outcome["error"] = "TikTok rejected the upload request."
+        else:
+            init_data = init_resp.json().get("data", {})
+            publish_id = init_data.get("publish_id")
+            upload_url = init_data.get("upload_url")
+            if not publish_id or not upload_url:
+                outcome["error"] = "TikTok didn't return an upload session."
+            else:
+                put_resp = requests.put(
+                    upload_url,
+                    headers={
+                        "Content-Type": "video/mp4",
+                        "Content-Length": str(len(video_bytes)),
+                        "Content-Range": f"bytes 0-{len(video_bytes) - 1}/{len(video_bytes)}",
+                    },
+                    data=video_bytes,
+                    timeout=60,
+                )
+                if not put_resp.ok:
+                    logger.error("TikTok video upload failed: %s", put_resp.text)
+                    outcome["error"] = "Couldn't upload the video to TikTok."
+                else:
+                    outcome["posted"] = True
+                    outcome["publish_id"] = publish_id
+
+        _save_scheduled_post(
+            user_id, "tiktok", caption, None, datetime.now(timezone.utc),
+            outcome["posted"], outcome["publish_id"], outcome["error"],
+            source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+            description=None, immediate=True,
+        )
+        return outcome
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
