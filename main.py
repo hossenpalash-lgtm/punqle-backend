@@ -506,6 +506,15 @@ class YouTubeStatusResponse(BaseModel):
     channel_title: Optional[str] = None
 
 
+class TikTokConnectUrlResponse(BaseModel):
+    authorize_url: str
+
+
+class TikTokStatusResponse(BaseModel):
+    connected: bool
+    display_name: Optional[str] = None
+
+
 class YouTubePublishResponse(BaseModel):
     posted: bool
     video_id: Optional[str] = None
@@ -835,6 +844,13 @@ YOUTUBE_CATEGORY_ID = "22"  # People & Blogs — generic small-business default;
 # Live-verified end to end (real connect, generate, publish, viewed on
 # YouTube) on 2026-08-25 before flipping this from "unlisted" to "public".
 YOUTUBE_UPLOAD_PRIVACY_STATUS = "public"
+# Optional — only TikTok connect+publish needs these. Sandbox app for now
+# (see migrations/tiktok_connections.sql) — unaudited, so real posts are
+# forced private and capped at 5 users/24h until the app passes TikTok's
+# own review.
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+TIKTOK_SCOPE = "user.info.basic,video.publish,video.upload"
 # Optional — subscriptions/checkout are disabled (503) until these are set.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -2167,6 +2183,76 @@ def _get_valid_youtube_token(user_id: str) -> Optional[str]:
     expires_at = datetime.fromisoformat(conn["token_expires_at"])
     if expires_at <= datetime.now(timezone.utc) + timedelta(seconds=60):
         return _refresh_youtube_token(user_id, conn["refresh_token"])
+    return conn["access_token"]
+
+
+_TIKTOK_STATE_SEP = "."
+_TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+
+
+def _sign_tiktok_state(user_id: str) -> str:
+    """Same purpose/shape as _sign_meta_state/_sign_youtube_state — ties
+    the OAuth state param to a specific Punqle user, since the redirect
+    back from TikTok is a plain browser navigation and can't carry our
+    normal Bearer auth header."""
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{user_id}{_TIKTOK_STATE_SEP}{nonce}"
+    signature = hmac.new(TIKTOK_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}{_TIKTOK_STATE_SEP}{signature}"
+
+
+def _verify_tiktok_state(state: str) -> str:
+    parts = (state or "").split(_TIKTOK_STATE_SEP)
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    user_id, nonce, signature = parts
+    payload = f"{user_id}{_TIKTOK_STATE_SEP}{nonce}"
+    expected = hmac.new(TIKTOK_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    return user_id
+
+
+def _refresh_tiktok_token(user_id: str, refresh_token: str) -> Optional[str]:
+    """Returns a fresh access_token and persists it + the new
+    token_expires_at, or None (deleting the connection row) if the
+    refresh_token itself is dead. TikTok's access_token is short-lived
+    (24h, confirmed via their own oauth docs) — much shorter than Meta's
+    effectively-non-expiring Page tokens, closer to YouTube's own
+    refresh cadence, so this mirrors _refresh_youtube_token's shape."""
+    resp = requests.post(_TIKTOK_TOKEN_URL, data={
+        "client_key": TIKTOK_CLIENT_KEY,
+        "client_secret": TIKTOK_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+    if not resp.ok:
+        supabase.table("tiktok_connections").delete().eq("owner_id", user_id).execute()
+        return None
+    data = resp.json()
+    access_token = data.get("access_token")
+    if not access_token:
+        supabase.table("tiktok_connections").delete().eq("owner_id", user_id).execute()
+        return None
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=data.get("expires_in", 86400))).isoformat()
+    update = {"access_token": access_token, "token_expires_at": expires_at}
+    # A refresh grant may or may not re-issue a new refresh_token — persist
+    # it only when TikTok actually sends one, same "don't overwrite with a
+    # missing key" caution as _refresh_youtube_token.
+    if data.get("refresh_token"):
+        update["refresh_token"] = data["refresh_token"]
+    supabase.table("tiktok_connections").update(update).eq("owner_id", user_id).execute()
+    return access_token
+
+
+def _get_valid_tiktok_token(user_id: str) -> Optional[str]:
+    res = supabase.table("tiktok_connections").select("*").eq("owner_id", user_id).execute()
+    if not res.data:
+        return None
+    conn = res.data[0]
+    expires_at = datetime.fromisoformat(conn["token_expires_at"])
+    if expires_at <= datetime.now(timezone.utc) + timedelta(seconds=60):
+        return _refresh_tiktok_token(user_id, conn["refresh_token"])
     return conn["access_token"]
 
 
@@ -5332,6 +5418,131 @@ def get_youtube_status(user_id: str = Depends(get_current_user_id)):
 def disconnect_youtube(user_id: str = Depends(get_current_user_id)):
     try:
         supabase.table("youtube_connections").delete().eq("owner_id", user_id).execute()
+        return {"disconnected": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/tiktok/connect-url", response_model=TikTokConnectUrlResponse, tags=["tiktok"])
+def get_tiktok_connect_url(user_id: str = Depends(get_current_user_id)):
+    """Returns the TikTok OAuth dialog URL for the frontend to navigate
+    the browser to directly — same shape as /meta/connect-url and
+    /youtube/connect-url. Real posts stay private (SELF_ONLY) and capped
+    at 5 users/24h until this app passes TikTok's own audit — confirmed
+    directly against TikTok's current developer docs, not assumed."""
+    if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="Connecting TikTok isn't available right now.")
+    state = _sign_tiktok_state(user_id)
+    params = {
+        "client_key": TIKTOK_CLIENT_KEY,
+        "response_type": "code",
+        "scope": TIKTOK_SCOPE,
+        "redirect_uri": f"{BACKEND_URL}/tiktok/callback",
+        "state": state,
+    }
+    return {"authorize_url": f"https://www.tiktok.com/v2/auth/authorize/?{urlencode(params)}"}
+
+
+@app.get("/tiktok/callback", tags=["tiktok"])
+def tiktok_oauth_callback(request: Request):
+    """TikTok redirects the business owner's browser here after they
+    approve (or decline) the connection — a plain GET navigation, not an
+    authenticated API call, so this route trusts our own signed state
+    param instead of a Bearer token (same shape as /meta/callback and
+    /youtube/callback)."""
+    try:
+        params = dict(request.query_params)
+        if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
+            return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+        error = params.get("error")
+        code = params.get("code", "")
+        if error or not code:
+            return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+
+        user_id = _verify_tiktok_state(params.get("state", ""))
+        redirect_uri = f"{BACKEND_URL}/tiktok/callback"
+
+        token_resp = with_retry(
+            lambda: requests.post(
+                _TIKTOK_TOKEN_URL,
+                data={
+                    "client_key": TIKTOK_CLIENT_KEY,
+                    "client_secret": TIKTOK_CLIENT_SECRET,
+                    "code": code,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not token_resp.ok:
+            logger.error("TikTok code exchange failed: %s", token_resp.text)
+            return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+        tokens = token_resp.json()
+        access_token = tokens.get("access_token")
+        refresh_token = tokens.get("refresh_token")
+        open_id = tokens.get("open_id")
+        if not access_token or not refresh_token or not open_id:
+            return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=tokens.get("expires_in", 86400))).isoformat()
+
+        info_resp = with_retry(
+            lambda: requests.get(
+                "https://open.tiktokapis.com/v2/user/info/",
+                params={"fields": "display_name"},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        display_name = "TikTok account"
+        if info_resp.ok:
+            display_name = info_resp.json().get("data", {}).get("user", {}).get("display_name") or display_name
+
+        with_retry(lambda: supabase.table("tiktok_connections").upsert({
+            "owner_id": user_id,
+            "open_id": open_id,
+            "display_name": display_name,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_expires_at": expires_at,
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="owner_id").execute())
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=connected")
+    except HTTPException:
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+    except requests.RequestException:
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        return RedirectResponse(f"{FRONTEND_URL}/?tiktok=error")
+
+
+@app.get("/tiktok/status", response_model=TikTokStatusResponse, tags=["tiktok"])
+def get_tiktok_status(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("tiktok_connections")
+            .select("display_name")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get tiktok connection status")
+        if res.data:
+            return {"connected": True, "display_name": res.data[0]["display_name"]}
+        return {"connected": False, "display_name": None}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/tiktok/disconnect", tags=["tiktok"])
+def disconnect_tiktok(user_id: str = Depends(get_current_user_id)):
+    try:
+        supabase.table("tiktok_connections").delete().eq("owner_id", user_id).execute()
         return {"disconnected": True}
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
