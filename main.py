@@ -5288,6 +5288,9 @@ def _save_scheduled_post(
     content_plan_day: Optional[str] = None,
     description: Optional[str] = None,
     immediate: bool = False,
+    goal: Optional[str] = None,
+    angle: Optional[str] = None,
+    style: Optional[str] = None,
 ) -> None:
     """Best-effort, same shape as _save_generated_post — a tracking-row
     failure must never break the actual publish response the user is
@@ -5303,7 +5306,14 @@ def _save_scheduled_post(
     speculative). Age-based prune (not count-based like generated_posts)
     since this table needs to keep every row while it's still relevant
     to "this week's calendar" or recent performance history, not just
-    the N most recent."""
+    the N most recent.
+
+    goal/angle/style are Ad Creation-only (Image Ad's visualDirection /
+    Video Ad's videoStyle map to `style`; both surfaces already have a
+    real goal+angle) — null for Social Content, which has no equivalent
+    concept. Purely informational, carried through so /performance/posts
+    can group real published metrics by which creative choice was used,
+    without inventing any new AI call or paid-ads infrastructure."""
     try:
         status = "failed" if not posted else ("published" if immediate else "scheduled")
         with_retry(lambda: supabase.table("scheduled_posts").insert({
@@ -5319,6 +5329,9 @@ def _save_scheduled_post(
             "source": source,
             "content_plan_id": content_plan_id,
             "content_plan_day": content_plan_day,
+            "goal": goal,
+            "angle": angle,
+            "style": style,
         }).execute())
         cutoff = (datetime.now(timezone.utc) - timedelta(days=SCHEDULED_POSTS_MAX_AGE_DAYS)).isoformat()
         supabase.table("scheduled_posts").delete().eq("owner_id", user_id) \
@@ -5382,6 +5395,9 @@ def publish_to_meta(
     source: str = Form("single"),
     content_plan_id: Optional[str] = Form(None),
     content_plan_day: Optional[str] = Form(None),
+    goal: Optional[str] = Form(None),
+    angle: Optional[str] = Form(None),
+    style: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) image straight
@@ -5438,6 +5454,7 @@ def publish_to_meta(
                     fb.get("posted", False), fb.get("post_id"), fb.get("error"),
                     source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
                     immediate=scheduled_dt is None,
+                    goal=goal, angle=angle, style=style,
                 )
 
         if post_to_instagram:
@@ -5865,6 +5882,9 @@ def publish_to_tiktok(
     source: str = Form("single"),
     content_plan_id: Optional[str] = Form(None),
     content_plan_day: Optional[str] = Form(None),
+    goal: Optional[str] = Form(None),
+    angle: Optional[str] = Form(None),
+    style: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) video straight to
@@ -5966,6 +5986,7 @@ def publish_to_tiktok(
             outcome["posted"], outcome["publish_id"], outcome["error"],
             source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
             description=None, immediate=True,
+            goal=goal, angle=angle, style=style,
         )
         return outcome
     except HTTPException:
@@ -5987,6 +6008,9 @@ def publish_to_youtube(
     source: str = Form("single"),
     content_plan_id: Optional[str] = Form(None),
     content_plan_day: Optional[str] = Form(None),
+    goal: Optional[str] = Form(None),
+    angle: Optional[str] = Form(None),
+    style: Optional[str] = Form(None),
     user_id: str = Depends(get_current_user_id),
 ):
     """Publishes an already-generated (already-paid-for) video straight
@@ -6091,6 +6115,7 @@ def publish_to_youtube(
             outcome["posted"], outcome["video_id"], outcome["error"],
             source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
             description=description, immediate=scheduled_dt is None,
+            goal=goal, angle=angle, style=style,
         )
         return outcome
     except HTTPException:
@@ -6477,6 +6502,9 @@ class PerformancePostOut(BaseModel):
     scheduled_time: str
     metrics: Optional[PostMetricsOut] = None
     metrics_unavailable_reason: Optional[str] = None
+    goal: Optional[str] = None
+    angle: Optional[str] = None
+    style: Optional[str] = None
 
 
 class PerformancePostsResponse(BaseModel):
@@ -6603,6 +6631,7 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                     "shares": snap["shares"], "fetched_at": snap["fetched_at"],
                 } if snap else None,
                 "metrics_unavailable_reason": unavailable_reasons.get(row["id"]),
+                "goal": row.get("goal"), "angle": row.get("angle"), "style": row.get("style"),
             })
         return {"posts": posts}
     except HTTPException:
