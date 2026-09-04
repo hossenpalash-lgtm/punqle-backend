@@ -557,6 +557,16 @@ class TikTokPublishResponse(BaseModel):
     error: Optional[str] = None
 
 
+class TikTokCreatorInfoResponse(BaseModel):
+    nickname: str
+    avatar_url: Optional[str] = None
+    privacy_level_options: list[str]
+    comment_disabled: bool
+    duet_disabled: bool
+    stitch_disabled: bool
+    max_video_post_duration_sec: int
+
+
 class YouTubePublishResponse(BaseModel):
     posted: bool
     video_id: Optional[str] = None
@@ -5872,13 +5882,57 @@ def disconnect_tiktok(user_id: str = Depends(get_current_user_id)):
 _TIKTOK_MAX_SINGLE_CHUNK_BYTES = 64 * 1024 * 1024
 
 
+@app.get("/tiktok/creator-info", response_model=TikTokCreatorInfoResponse, tags=["tiktok"])
+def get_tiktok_creator_info(user_id: str = Depends(get_current_user_id)):
+    """TikTok's Content Sharing Guidelines mandate this be fetched fresh
+    immediately before rendering the publish confirmation screen — the
+    creator's real privacy options and duet/stitch/comment settings must
+    be reflected in the UI, never assumed or hardcoded (confirmed
+    directly against their published UX guidelines: "All clients are
+    required to correctly display the creator account's privacy level
+    options and honor the users' choice"). Never cached — a creator
+    could change these settings in the TikTok app between visits, and
+    TikTok's own rate limit here is a generous 20 requests/minute per
+    token, so there's no real cost to always calling it fresh."""
+    access_token = _get_valid_tiktok_token(user_id)
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Connect TikTok first.")
+    resp = with_retry(
+        lambda: requests.post(
+            "https://open.tiktokapis.com/v2/post/publish/creator_info/query/",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"},
+            timeout=15,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not resp.ok:
+        logger.error("TikTok creator_info query failed: %s", resp.text)
+        raise HTTPException(status_code=502, detail="Couldn't fetch your TikTok posting options.")
+    data = resp.json().get("data", {})
+    return {
+        "nickname": data.get("creator_nickname") or data.get("creator_username") or "your account",
+        "avatar_url": data.get("creator_avatar_url"),
+        "privacy_level_options": data.get("privacy_level_options") or ["SELF_ONLY"],
+        "comment_disabled": bool(data.get("comment_disabled")),
+        "duet_disabled": bool(data.get("duet_disabled")),
+        "stitch_disabled": bool(data.get("stitch_disabled")),
+        "max_video_post_duration_sec": data.get("max_video_post_duration_sec") or 0,
+    }
+
+
 @app.post("/tiktok/publish", response_model=TikTokPublishResponse, tags=["tiktok"])
 @limiter.limit("10/minute")
 def publish_to_tiktok(
     request: Request,
     file: UploadFile = File(...),
     caption: str = Form(""),
-    is_own_brand: bool = Form(...),
+    privacy_level: str = Form(...),
+    allow_comment: bool = Form(...),
+    allow_duet: bool = Form(...),
+    allow_stitch: bool = Form(...),
+    promotes_own_brand: bool = Form(...),
+    has_paid_partnership: bool = Form(False),
     source: str = Form("single"),
     content_plan_id: Optional[str] = Form(None),
     content_plan_day: Optional[str] = Form(None),
@@ -5891,22 +5945,31 @@ def publish_to_tiktok(
     the business's connected TikTok account — no credit spent here, same
     "free packaging" principle as /meta/publish and /youtube/publish.
 
-    is_own_brand is required, not defaulted — TikTok's own guidelines
-    mandate the branded-content disclosure be a real user choice, never
-    silently applied (confirmed directly against their Content Sharing
-    Guidelines). Maps to brand_organic_toggle (promoting your own
-    business — true for virtually every Punqle post) vs brand_content_
-    toggle (a paid partnership with a third-party brand, not something
-    this app currently has a flow for).
+    privacy_level/allow_comment/allow_duet/allow_stitch are all required,
+    real user choices sourced from /tiktok/creator-info's own response —
+    TikTok's Content Sharing Guidelines mandate a confirmation screen
+    that reflects the creator's actual account settings (interactions
+    grayed out where the creator has disabled them account-wide) rather
+    than an app-wide default silently applied to everyone.
+
+    promotes_own_brand/has_paid_partnership replace the earlier single
+    is_own_brand boolean — TikTok's guidelines allow both simultaneously
+    (a post can promote your own business AND be a paid partnership) and
+    require at least one before the post button is enabled at all;
+    validated below rather than trusted from the client, since a direct
+    API call could otherwise skip the disclosure entirely.
 
     is_aigc is always true — every video Punqle produces is AI-generated
     end to end (Veo or HeyGen), so there's no real case where TikTok's
     AI-content disclosure requirement wouldn't apply.
 
     While the app is in TikTok's Sandbox (unaudited), TikTok itself
-    forces every post to SELF_ONLY (private) regardless of the
-    privacy_level sent — confirmed via their own unaudited-app rules —
-    so no privacy picker exists yet; add one once the app clears audit."""
+    forces every post to SELF_ONLY (private) and privacy_level_options
+    only ever returns that one choice — the real picker here has nothing
+    to do until the app clears TikTok's audit, at which point real
+    accounts will see real choices with zero code changes needed."""
+    if not promotes_own_brand and not has_paid_partnership:
+        raise HTTPException(status_code=400, detail="Choose at least one: your own brand, or a paid partnership.")
     try:
         access_token = _get_valid_tiktok_token(user_id)
         if not access_token:
@@ -5933,12 +5996,12 @@ def publish_to_tiktok(
                 json={
                     "post_info": {
                         "title": caption[:2200],
-                        "privacy_level": "SELF_ONLY",
-                        "disable_duet": False,
-                        "disable_stitch": False,
-                        "disable_comment": False,
-                        "brand_content_toggle": not is_own_brand,
-                        "brand_organic_toggle": is_own_brand,
+                        "privacy_level": privacy_level,
+                        "disable_duet": not allow_duet,
+                        "disable_stitch": not allow_stitch,
+                        "disable_comment": not allow_comment,
+                        "brand_content_toggle": has_paid_partnership,
+                        "brand_organic_toggle": promotes_own_brand,
                         "is_aigc": True,
                     },
                     "source_info": {
