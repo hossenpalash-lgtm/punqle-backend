@@ -6560,7 +6560,7 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                     "views": s["views"], "likes": s["likes"], "comments": s["comments"], "shares": None,
                     "raw": s["raw"],
                 }, on_conflict="scheduled_post_id,fetch_bucket").execute())
-            else:
+            elif row["platform"] == "facebook":
                 if not fb_token:
                     unavailable_reasons[row["id"]] = "Connect Facebook to see engagement."
                     continue
@@ -6573,6 +6573,20 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                     "views": None, "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
                     "raw": m["raw"],
                 }, on_conflict="scheduled_post_id,fetch_bucket").execute())
+            else:
+                # TikTok (or any future platform this function hasn't been
+                # taught yet) — this `else` used to silently assume
+                # "not youtube means facebook", written back when those
+                # were the only two platforms that could exist. Once real
+                # TikTok rows showed up, that assumption made this branch
+                # attempt a Facebook Graph API call against a TikTok
+                # publish_id — a real bug, found live via a real
+                # /performance/posts call, not by reading the code cold.
+                # TikTok's real Content Posting API has no public metrics
+                # endpoint for a Sandbox app (posts are private anyway
+                # while unaudited), so this is an honest "not yet", not a
+                # silently-wrong number.
+                unavailable_reasons[row["id"]] = "TikTok performance isn't available yet."
 
         if any(row["id"] not in unavailable_reasons for row in stale_rows):
             latest_snapshot = _latest_snapshots()
