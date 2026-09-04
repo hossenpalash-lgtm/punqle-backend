@@ -33,7 +33,7 @@ import hmac
 import hashlib
 import secrets
 import stripe
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pytrends.request import TrendReq
 from urllib.parse import urlparse, urlencode
 from bs4 import BeautifulSoup
@@ -243,12 +243,25 @@ class VideoOperationOut(BaseModel):
 class GenerateVideoAnglesRequest(BaseModel):
     item_description: str
     goal: str
+    # Only the Avatar path exposes a language choice today — every other
+    # video style burns the script onto Veo's own output as English text
+    # regardless, so a Bangla script there would be pointless. Defaults to
+    # English so every non-avatar caller (unchanged) behaves exactly as
+    # before.
+    language: str = "english"
 
     @field_validator("goal")
     @classmethod
     def validate_video_angles_goal(cls, v):
         if v not in ("sales", "leads", "traffic", "bookings"):
             raise ValueError("Invalid goal")
+        return v
+
+    @field_validator("language")
+    @classmethod
+    def validate_video_angles_language(cls, v):
+        if v not in ("english", "bangla"):
+            raise ValueError("language must be 'english' or 'bangla'")
         return v
 
 
@@ -283,6 +296,12 @@ class GenerateAvatarVideoRequest(BaseModel):
     gender: Optional[str] = None  # the picked avatar's own gender, for voice matching
     tier: str = "standard"
     aspect_ratio: str = "9:16"
+    # Optional — when omitted, falls back to English female/male defaults
+    # (start_avatar_video_generation), same behavior as before this field
+    # existed. Validated against the real, confirmed-live voice catalog
+    # rather than accepting any string, since a wrong voice_id fails at
+    # HeyGen's end with a much less clear error.
+    voice_id: Optional[str] = None
 
     @field_validator("tier")
     @classmethod
@@ -297,6 +316,23 @@ class GenerateAvatarVideoRequest(BaseModel):
         if v not in ("16:9", "9:16"):
             raise ValueError("aspect_ratio must be '16:9' or '9:16'")
         return v
+
+    @field_validator("voice_id")
+    @classmethod
+    def validate_avatar_voice_id(cls, v):
+        if v is not None and v not in _HEYGEN_ALL_VOICE_IDS:
+            raise ValueError("Unknown voice_id.")
+        return v
+
+
+class AvatarVoiceOut(BaseModel):
+    voice_id: str
+    name: str
+
+
+class AvatarVoicesResponse(BaseModel):
+    english: dict[str, list[AvatarVoiceOut]]
+    bangla: dict[str, list[AvatarVoiceOut]]
 
 
 class AvatarVideoOperationOut(BaseModel):
@@ -2762,6 +2798,12 @@ async def generate_ad_image_variant(
 VIDEO_CREDIT_COST = 10  # ~10x an image credit, matching Veo 3.1 Lite's real ~$0.40/8s-720p vs an image's ~$0.04
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
+# VideoOverlay-Bold has zero Bangla glyph coverage (confirmed live —
+# renders as tofu boxes), so Bangla-language avatar captions need a
+# separate font. Noto Sans Bengali is a variable font (weight axis),
+# pinned to Bold via set_variation_by_axes wherever it's loaded — same
+# OFL license as the existing bundled font (see fonts/OFL.txt).
+BANGLA_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "NotoSansBengali-Bold.ttf")
 
 TRYON_CREDIT_COST = 2  # tryon-v1.6 is a flat 1 FASHN credit ≈ $0.075/generation, same cost-to-credit ratio as VIDEO_CREDIT_COST
 FASHN_API_BASE = "https://api.fashn.ai/v1"
@@ -2778,13 +2820,43 @@ HEYGEN_API_BASE = "https://api.heygen.com"
 AVATAR_STANDARD_CREDIT_COST = 4
 AVATAR_PREMIUM_CREDIT_COST = VIDEO_CREDIT_COST
 _HEYGEN_ENGINE_BY_TIER = {"standard": "avatar_iii", "premium": "avatar_v"}
-# Confirmed live against HeyGen's own /v2/voices catalog — English (this
-# app's main language, 2156 real options there) gets one solid default
-# per gender rather than a full voice-picker UI, matching the same
-# "nice-to-have, not required for V1" scope cut already made for avatar
-# demographic filtering.
-_HEYGEN_VOICE_FEMALE_EN = "330290724a1b470fb63153f34d4c0183"  # "Annie - Lifelike"
-_HEYGEN_VOICE_MALE_EN = "6be73833ef9a4eb0aeee399b8fe9d62b"  # "Andrew"
+# Confirmed live against HeyGen's own /v2/voices catalog (2026-09-04) —
+# English has 2089 real options there, so this is a curated subset (3 per
+# gender), not the full catalog. Bangla has exactly 4 real voices total
+# (2 per gender), so those two lists are the complete catalog, not a cut-
+# down one. Every voice_id here was confirmed to actually exist in a live
+# /v2/voices call before being hardcoded, not guessed.
+_HEYGEN_VOICES = {
+    "english": {
+        "female": [
+            {"voice_id": "330290724a1b470fb63153f34d4c0183", "name": "Annie"},
+            {"voice_id": "68dedac41a9f46a6a4271a95c733823c", "name": "June"},
+            {"voice_id": "6e05e310c3f14ed4ba1545578ce82ff6", "name": "Chloe"},
+        ],
+        "male": [
+            {"voice_id": "6be73833ef9a4eb0aeee399b8fe9d62b", "name": "Andrew"},
+            {"voice_id": "10863794b2454eaa8781f377939d6f14", "name": "Gerardo"},
+            {"voice_id": "57c4e98c78394481b62af7f5d5535c4b", "name": "Joel"},
+        ],
+    },
+    "bangla": {
+        "female": [
+            {"voice_id": "001b5828d42b4f8b814ad7dbec3221e4", "name": "Aalia"},
+            {"voice_id": "72dab46d28d8422bb4386f0d1d9cf9ba", "name": "Nabanita"},
+        ],
+        "male": [
+            {"voice_id": "d0ba3a24e9fc49b1ae528a0dca5bf141", "name": "Abhijit"},
+            {"voice_id": "2259b11ddd664c4f84e98f59819f4cc5", "name": "Pradeep"},
+        ],
+    },
+}
+_HEYGEN_ALL_VOICE_IDS = {
+    v["voice_id"] for lang in _HEYGEN_VOICES.values() for genders in lang.values() for v in genders
+}
+_HEYGEN_DEFAULT_VOICE_ID = {
+    "english": {"female": _HEYGEN_VOICES["english"]["female"][0]["voice_id"], "male": _HEYGEN_VOICES["english"]["male"][0]["voice_id"]},
+    "bangla": {"female": _HEYGEN_VOICES["bangla"]["female"][0]["voice_id"], "male": _HEYGEN_VOICES["bangla"]["male"][0]["voice_id"]},
+}
 
 # Real cost here is tiny (~$0.003/clip: tts-1 at $15/1M chars on a ~150
 # char script, whisper-1 at $0.006/min on an ~8s clip) — priced above
@@ -2855,7 +2927,7 @@ Respond with ONLY this JSON format, nothing else:
     return {"headline": hook, "narration": narration}
 
 
-def _generate_video_script_angles(item_description: str, category: str, goal: str, count: int = 4) -> dict:
+def _generate_video_script_angles(item_description: str, category: str, goal: str, count: int = 4, language: str = "english") -> dict:
     """Free — text-only GPT call, same pattern as _generate_ad_captions but
     for full video scripts (on-screen hook + voiceover narration) instead
     of captions. Returns `count` candidates, each forced to a genuinely
@@ -2870,13 +2942,27 @@ def _generate_video_script_angles(item_description: str, category: str, goal: st
     _generate_ad_captions) so Quick Create's Video option can auto-pick a
     genuine best angle instead of always defaulting to index 0 — Quick
     Create is meant to stay a single tap, so it never shows this picker,
-    it just uses the AI's own top choice."""
+    it just uses the AI's own top choice.
+
+    language defaults to English, unchanged from before this param
+    existed. Bangla exists specifically because HeyGen has real Bangla
+    voices (confirmed live) — a Bangla voice speaking an English script
+    would sound wrong, so the avatar flow's language toggle drives this
+    directly rather than guessing the language from the offer text."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     goal_guidance = AD_GOAL_GUIDANCE[goal]
+    language_instruction = (
+        "Write the headline and narration in natural, everyday spoken Bangla (বাংলা), "
+        "using Bangla script — not a stiff, overly formal register, and not Banglish/Romanized. "
+        "Keep \"angle\" and \"explanation\" in English, since those are only shown to the business owner, not spoken aloud."
+        if language == "bangla" else
+        "Write the headline and narration in English."
+    )
     prompt = f"""You are writing on-screen text and voiceover scripts for social media ad videos for a small business.
 
 {category_guidance}
 {goal_guidance}
+{language_instruction}
 
 The video is about: {item_description}
 
@@ -2958,15 +3044,20 @@ def _is_light_color(rgb: tuple) -> bool:
     return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6
 
 
+_CAPTION_STYLES = {"bold", "clean", "highlight", "box", "glow", "minimal"}
+_CAPTION_ACCENT_RGB = (255, 214, 10)  # a fixed warm accent for styles that don't use brand_color
+
+
 def _render_caption_bar_png(
     text: str, video_w: int, video_h: int, brand_color: Optional[str] = None, text_position: str = "bottom",
+    style: str = "bold", font_path: Optional[str] = None,
 ) -> bytes:
     """Renders text + its caption-bar background as a transparent RGBA
     PNG the full size of the video frame, composited on afterward via
     ffmpeg's overlay filter — same role compositeImage.ts's caption bar
-    plays for images. Used for both the on-screen hook and, later, each
-    synced-caption segment in the voiceover flow, since they share the
-    exact same bar/font/positioning look. Text is rendered with Pillow
+    plays for images. Used for the on-screen hook, the voiceover flow's
+    synced captions, and avatar-video captions, since they share the
+    exact same font/positioning math. Text is rendered with Pillow
     rather than ffmpeg's own drawtext filter: the Linux static ffmpeg
     binary imageio-ffmpeg bundles on Render doesn't have drawtext
     compiled in (confirmed live — "No such filter: 'drawtext'" — even
@@ -2974,15 +3065,33 @@ def _render_caption_bar_png(
     testing), so text rendering moved here entirely and only the
     (filter-agnostic) overlay compositing is left to ffmpeg.
 
+    style defaults to "bold" — the exact original look (solid bar,
+    brand-color-or-black fill, white text) — so every existing caller
+    (headline hook, Edit Video's synced captions) is byte-identical to
+    before this param existed. Only the avatar-video captions endpoint
+    passes the other 5 styles. Only one font file is bundled
+    (VideoOverlay-Bold.ttf — no regular/serif/script weights), so
+    variety here comes from color/box/glow/stroke treatment, not font
+    family, unlike a design tool with a real font library.
+
     brand_color (a "#RRGGBB" hex string, same as the image flow's Brand
-    Kit) tints the bar background when set; same fallback (plain black)
-    and alpha as before when it's None, so accounts without a brand
-    color see byte-identical output to before this was added.
+    Kit) tints the "bold"/"box" bar backgrounds when set; a fixed warm
+    accent color is used for "highlight"/"glow" instead, since a bar-
+    tint role doesn't fit a marker-highlight or glow role as naturally.
 
     text_position defaults to "bottom" — every existing caller's exact
     prior placement, unchanged. "top"/"center" are only reachable from
     the Edit Video panel."""
-    font = ImageFont.truetype(VIDEO_FONT_PATH, round(video_w * 0.0344))
+    if style not in _CAPTION_STYLES:
+        style = "bold"
+    font_size = round(video_w * (0.026 if style == "minimal" else 0.0344))
+    resolved_font_path = font_path or VIDEO_FONT_PATH
+    font = ImageFont.truetype(resolved_font_path, font_size)
+    if resolved_font_path == BANGLA_FONT_PATH:
+        # Noto Sans Bengali is a variable font (weight axis) — pin it to
+        # Bold so it visually matches every other caption's weight,
+        # rather than rendering at its Regular default.
+        font.set_variation_by_axes([700, 100])
     canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     text_bbox = draw.textbbox((0, 0), text, font=font)
@@ -2990,20 +3099,99 @@ def _render_caption_bar_png(
     text_h = text_bbox[3] - text_bbox[1]
     pad = round(video_w * 0.01875)
     margin = round(video_h * 0.0694)
-    box_h = text_h + 2 * pad
-    if text_position == "top":
-        box_top = margin
-    elif text_position == "center":
-        box_top = (video_h - box_h) / 2
-    else:
-        box_top = video_h - margin - box_h
-    box_bottom = box_top + box_h
-    box_left = (video_w - text_w) / 2 - pad
-    box_right = (video_w + text_w) / 2 + pad
     bar_rgb = _hex_to_rgb(brand_color) if brand_color else (0, 0, 0)
-    text_rgb = (26, 26, 26) if brand_color and _is_light_color(bar_rgb) else (255, 255, 255)
-    draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(*bar_rgb, 153))
-    draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), text, font=font, fill=(*text_rgb, 255))
+    bar_is_light = brand_color is not None and _is_light_color(bar_rgb)
+
+    if style in ("clean", "minimal"):
+        # No background box at all — just the text, with a stroke outline
+        # so it stays readable over any footage. "minimal" is the same
+        # idea at a smaller size, bottom-left instead of centered, for a
+        # quieter, lower-profile look.
+        box_h = text_h + 2 * pad
+        if text_position == "top":
+            box_top = margin
+        elif text_position == "center":
+            box_top = (video_h - box_h) / 2
+        else:
+            box_top = video_h - margin - box_h
+        if style == "minimal":
+            text_x = margin - text_bbox[0]
+        else:
+            text_x = (video_w - text_w) / 2 - text_bbox[0]
+        text_y = box_top + pad - text_bbox[1]
+        draw.text(
+            (text_x, text_y), text, font=font, fill=(255, 255, 255, 255),
+            stroke_width=max(2, round(font_size * 0.06)), stroke_fill=(0, 0, 0, 220),
+        )
+    elif style == "highlight":
+        # A tight, bright marker-style rectangle hugging just the text
+        # (small pad), dark text on top — reads as a highlighted phrase,
+        # not a full-width bar.
+        tight_pad = round(pad * 0.5)
+        box_h = text_h + 2 * tight_pad
+        if text_position == "top":
+            box_top = margin
+        elif text_position == "center":
+            box_top = (video_h - box_h) / 2
+        else:
+            box_top = video_h - margin - box_h
+        box_bottom = box_top + box_h
+        box_left = (video_w - text_w) / 2 - tight_pad
+        box_right = (video_w + text_w) / 2 + tight_pad
+        accent = _hex_to_rgb(brand_color) if brand_color else _CAPTION_ACCENT_RGB
+        draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(*accent, 235))
+        draw.text((box_left + tight_pad - text_bbox[0], box_top + tight_pad - text_bbox[1]), text, font=font, fill=(20, 20, 20, 255))
+    elif style == "box":
+        # A light, semi-transparent panel with a real visible border —
+        # dark text — an outlined-card look instead of a solid fill.
+        box_h = text_h + 2 * pad
+        if text_position == "top":
+            box_top = margin
+        elif text_position == "center":
+            box_top = (video_h - box_h) / 2
+        else:
+            box_top = video_h - margin - box_h
+        box_bottom = box_top + box_h
+        box_left = (video_w - text_w) / 2 - pad
+        box_right = (video_w + text_w) / 2 + pad
+        border_rgb = bar_rgb if brand_color else (255, 255, 255)
+        draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(255, 255, 255, 235), outline=(*border_rgb, 255), width=max(2, round(video_w * 0.003)))
+        draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), text, font=font, fill=(20, 20, 20, 255))
+    elif style == "glow":
+        # A blurred colored copy of the text sits behind the sharp text,
+        # simulating a soft glow — no background box at all.
+        box_h = text_h + 2 * pad
+        if text_position == "top":
+            box_top = margin
+        elif text_position == "center":
+            box_top = (video_h - box_h) / 2
+        else:
+            box_top = video_h - margin - box_h
+        text_x = (video_w - text_w) / 2 - text_bbox[0]
+        text_y = box_top + pad - text_bbox[1]
+        accent = _hex_to_rgb(brand_color) if brand_color else _CAPTION_ACCENT_RGB
+        glow_layer = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow_layer)
+        glow_draw.text((text_x, text_y), text, font=font, fill=(*accent, 255))
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=max(3, round(font_size * 0.12))))
+        canvas = Image.alpha_composite(canvas, glow_layer)
+        draw = ImageDraw.Draw(canvas)
+        draw.text((text_x, text_y), text, font=font, fill=(255, 255, 255, 255))
+    else:  # "bold" — the original, unchanged look
+        box_h = text_h + 2 * pad
+        if text_position == "top":
+            box_top = margin
+        elif text_position == "center":
+            box_top = (video_h - box_h) / 2
+        else:
+            box_top = video_h - margin - box_h
+        box_bottom = box_top + box_h
+        box_left = (video_w - text_w) / 2 - pad
+        box_right = (video_w + text_w) / 2 + pad
+        text_rgb = (26, 26, 26) if bar_is_light else (255, 255, 255)
+        draw.rectangle([box_left, box_top, box_right, box_bottom], fill=(*bar_rgb, 153))
+        draw.text((box_left + pad - text_bbox[0], box_top + pad - text_bbox[1]), text, font=font, fill=(*text_rgb, 255))
+
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
     return buf.getvalue()
@@ -3126,7 +3314,7 @@ def generate_video_angles(
         if not item_description:
             raise HTTPException(status_code=400, detail="Tell us what the video is about.")
         category = _get_business_category(user_id)
-        return _generate_video_script_angles(item_description, category, req.goal)
+        return _generate_video_script_angles(item_description, category, req.goal, language=req.language)
     except HTTPException:
         raise
     except Exception as e:
@@ -3297,6 +3485,15 @@ def list_avatar_options(user_id: str = Depends(get_current_user_id)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/ads/avatar-voices", response_model=AvatarVoicesResponse, tags=["ads"])
+def list_avatar_voices(user_id: str = Depends(get_current_user_id)):
+    """Free — a small, hardcoded, curated subset of HeyGen's real voice
+    catalog (see _HEYGEN_VOICES), not a live /v2/voices call — the full
+    catalog is 3169 voices, useless as a picker, and the curated set was
+    already confirmed live against the real API rather than guessed."""
+    return _HEYGEN_VOICES
+
+
 @app.post("/ads/generate-avatar-video", response_model=AvatarVideoOperationOut, tags=["ads"])
 @limiter.limit("5/minute")
 def start_avatar_video_generation(
@@ -3327,7 +3524,7 @@ def start_avatar_video_generation(
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
-        voice_id = _HEYGEN_VOICE_MALE_EN if req.gender == "male" else _HEYGEN_VOICE_FEMALE_EN
+        voice_id = req.voice_id or _HEYGEN_DEFAULT_VOICE_ID["english"]["male" if req.gender == "male" else "female"]
 
         def _try_heygen_generate(engine_type: str):
             payload = {
@@ -3612,17 +3809,28 @@ def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
     return response.content
 
 
-def _transcribe_word_timestamps(audio_bytes: bytes) -> list:
+_WHISPER_LANGUAGE_CODE = {"english": "en", "bangla": "bn"}
+
+
+def _transcribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = None) -> list:
     """Whisper on our own just-synthesized TTS audio, not to figure out
     WHAT was said (we already know — we wrote the script) but WHEN each
     word actually lands, since TTS speech pacing/pauses aren't uniform
-    and captions that drift from the real audio look broken."""
+    and captions that drift from the real audio look broken.
+
+    language (an app-level "english"/"bangla" value, not called by that
+    name everywhere it's used) hints Whisper's own ISO-639-1 code — this
+    materially helps avoid language misdetection on short clips, which
+    matters more now that avatar captions can be real Bangla speech, not
+    just English TTS."""
+    language_code = _WHISPER_LANGUAGE_CODE.get(language or "english")
     response = with_retry(
         lambda: client.audio.transcriptions.create(
             model=TRANSCRIBE_MODEL,
             file=("voiceover.mp3", audio_bytes, "audio/mpeg"),
             response_format="verbose_json",
             timestamp_granularities=["word"],
+            language=language_code,
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -3890,12 +4098,32 @@ def edit_video(
 class AddCaptionsToAvatarVideoRequest(BaseModel):
     video_base64: str
     aspect_ratio: str = "9:16"
+    style: str = "bold"
+    # Which font to render captions in — VideoOverlay-Bold has no Bangla
+    # glyph coverage at all (confirmed live, renders as tofu), so Bangla
+    # avatar videos need Noto Sans Bengali instead. Defaults to English,
+    # matching this endpoint's behavior before this field existed.
+    language: str = "english"
 
     @field_validator("aspect_ratio")
     @classmethod
     def validate_captions_aspect_ratio(cls, v):
         if v not in ("16:9", "9:16"):
             raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
+
+    @field_validator("style")
+    @classmethod
+    def validate_captions_style(cls, v):
+        if v not in _CAPTION_STYLES:
+            raise ValueError(f"style must be one of {sorted(_CAPTION_STYLES)}")
+        return v
+
+    @field_validator("language")
+    @classmethod
+    def validate_captions_language(cls, v):
+        if v not in ("english", "bangla"):
+            raise ValueError("language must be 'english' or 'bangla'")
         return v
 
 
@@ -3924,7 +4152,8 @@ def _extract_audio(video_bytes: bytes) -> bytes:
 
 
 def _overlay_captions_on_video(
-    video_bytes: bytes, caption_segments: list, aspect_ratio: str, brand_color: Optional[str],
+    video_bytes: bytes, caption_segments: list, aspect_ratio: str, brand_color: Optional[str], style: str = "bold",
+    language: str = "english",
 ) -> bytes:
     """Burns timed caption bars onto a video WITHOUT touching its audio
     track (-c:a copy) — unlike _compose_audio_and_captions, which
@@ -3941,6 +4170,7 @@ def _overlay_captions_on_video(
         with open(input_path, "wb") as f:
             f.write(video_bytes)
 
+        font_path = BANGLA_FONT_PATH if language == "bangla" else None
         cmd = [ffmpeg_exe, "-y", "-i", input_path]
         chain_parts = []
         stage = "[0:v]"
@@ -3948,7 +4178,7 @@ def _overlay_captions_on_video(
         for i, seg in enumerate(caption_segments):
             seg_path = os.path.join(tmp_dir, f"cap{i}.png")
             with open(seg_path, "wb") as f:
-                f.write(_render_caption_bar_png(seg["text"], video_w, video_h, brand_color, "bottom"))
+                f.write(_render_caption_bar_png(seg["text"], video_w, video_h, brand_color, "bottom", style, font_path))
             cmd += ["-i", seg_path]
             is_last = i == len(caption_segments) - 1
             out_label = "[out]" if is_last else f"[cap{i}out]"
@@ -3992,9 +4222,9 @@ def add_captions_to_avatar_video(
 
         video_bytes = base64.b64decode(req.video_base64)
         audio_bytes = _extract_audio(video_bytes)
-        words = _transcribe_word_timestamps(audio_bytes)
+        words = _transcribe_word_timestamps(audio_bytes, req.language)
         caption_segments = _group_words_into_captions(words, hook_duration=0.0, max_segments=MAX_CAPTION_SEGMENTS)
-        captioned = _overlay_captions_on_video(video_bytes, caption_segments, req.aspect_ratio, brand_color)
+        captioned = _overlay_captions_on_video(video_bytes, caption_segments, req.aspect_ratio, brand_color, req.style, req.language)
         return {"video_base64": base64.b64encode(captioned).decode("ascii")}
     except HTTPException:
         raise
