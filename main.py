@@ -3809,7 +3809,13 @@ def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
     return response.content
 
 
-_WHISPER_LANGUAGE_CODE = {"english": "en", "bangla": "bn"}
+# Real, live-confirmed finding: whisper-1's own `language` param rejects
+# "bn" outright ("Language 'bn' is not supported" — a real 400 from
+# OpenAI, not guessed), even though the underlying Whisper model does
+# transcribe Bengali. So Bangla gets no hint at all (None — omitted from
+# the API call entirely) and relies on Whisper's own auto-detection,
+# rather than a wrong/guessed alternate code.
+_WHISPER_LANGUAGE_CODE = {"english": "en"}
 
 
 def _transcribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = None) -> list:
@@ -3823,18 +3829,51 @@ def _transcribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = No
     materially helps avoid language misdetection on short clips, which
     matters more now that avatar captions can be real Bangla speech, not
     just English TTS."""
+    kwargs = {
+        "model": TRANSCRIBE_MODEL,
+        "file": ("voiceover.mp3", audio_bytes, "audio/mpeg"),
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["word"],
+    }
+    # Only set when whisper-1 actually accepts the code — explicitly
+    # passing language=None isn't the same as omitting the kwarg (the SDK
+    # may serialize a literal null rather than skip it), so this is built
+    # conditionally rather than passed unconditionally.
     language_code = _WHISPER_LANGUAGE_CODE.get(language or "english")
+    if language_code:
+        kwargs["language"] = language_code
     response = with_retry(
-        lambda: client.audio.transcriptions.create(
-            model=TRANSCRIBE_MODEL,
-            file=("voiceover.mp3", audio_bytes, "audio/mpeg"),
-            response_format="verbose_json",
-            timestamp_granularities=["word"],
-            language=language_code,
-        ),
+        lambda: client.audio.transcriptions.create(**kwargs),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
     return [{"word": w.word, "start": w.start, "end": w.end} for w in (response.words or [])]
+
+
+def _align_known_text_to_timings(known_text: str, detected_words: list) -> list:
+    """Replaces whisper-1's own (possibly mis-transcribed) word text with
+    the real, known-correct script, keeping whisper-1's real timing —
+    used for Bangla, where whisper-1 gets timing right but the words
+    wrong (see AddCaptionsToAvatarVideoRequest.narration's docstring for
+    why). If the word counts happen to match, known words are zipped
+    onto the real per-word timings 1:1 (best case — same audio, so this
+    is common). Otherwise, known words are redistributed evenly across
+    the same overall detected speech span (first word's start to last
+    word's end) — a reasonable approximation, not frame-perfect, but
+    every existing caption segment in this codebase already only aims
+    for "roughly synced" 4-word chunks, not per-word karaoke precision."""
+    known_words = known_text.split()
+    if not known_words or not detected_words:
+        return []
+    if len(known_words) == len(detected_words):
+        return [{"word": kw, "start": dw["start"], "end": dw["end"]} for kw, dw in zip(known_words, detected_words)]
+    span_start = detected_words[0]["start"]
+    span_end = detected_words[-1]["end"]
+    span = max(span_end - span_start, 0.1)
+    step = span / len(known_words)
+    return [
+        {"word": kw, "start": span_start + i * step, "end": span_start + (i + 1) * step}
+        for i, kw in enumerate(known_words)
+    ]
 
 
 def _group_words_into_captions(words: list, hook_duration: float, max_segments: int) -> list:
@@ -4104,6 +4143,19 @@ class AddCaptionsToAvatarVideoRequest(BaseModel):
     # avatar videos need Noto Sans Bengali instead. Defaults to English,
     # matching this endpoint's behavior before this field existed.
     language: str = "english"
+    # Optional — the exact script that was actually spoken (the frontend
+    # already has this in state from the angle picker). Real, live-
+    # confirmed finding: whisper-1 flatly rejects a Bangla language hint
+    # ("not supported"), and without one it mis-transcribes real Bangla
+    # speech as phonetic Hindi/Devanagari, not Bangla script at all — a
+    # different OpenAI model (gpt-4o-mini-transcribe) gets the Bangla
+    # text right but doesn't support word-level timestamps at all. So for
+    # Bangla, this known-correct text is used verbatim for what the
+    # captions SAY, with whisper-1's own (mis-transcribed but still
+    # accurately timed) word boundaries used only for WHEN each word
+    # lands — see _align_known_text_to_timings. English is unaffected;
+    # whisper-1 already gets English right on its own.
+    narration: Optional[str] = None
 
     @field_validator("aspect_ratio")
     @classmethod
@@ -4215,7 +4267,14 @@ def add_captions_to_avatar_video(
     reasoning _transcribe_word_timestamps already documents for the Veo
     voiceover flow. If a product scene was already concatenated on,
     Whisper simply finds no words in that silent/ambient stretch, so no
-    caption segments land there — no special-casing needed."""
+    caption segments land there — no special-casing needed.
+
+    Bangla is the one real exception to "don't use the known script" —
+    see AddCaptionsToAvatarVideoRequest.narration's docstring: whisper-1
+    mis-transcribes real Bangla speech as phonetic Hindi/Devanagari
+    without a language hint, and rejects a Bangla hint outright, so the
+    known-correct narration text is used for what the captions SAY,
+    with whisper-1's own timing used only for WHEN."""
     try:
         profile = _get_business_profile(user_id)
         brand_color = profile.get("brand_color")
@@ -4223,6 +4282,8 @@ def add_captions_to_avatar_video(
         video_bytes = base64.b64decode(req.video_base64)
         audio_bytes = _extract_audio(video_bytes)
         words = _transcribe_word_timestamps(audio_bytes, req.language)
+        if req.language == "bangla" and (req.narration or "").strip():
+            words = _align_known_text_to_timings(req.narration.strip(), words)
         caption_segments = _group_words_into_captions(words, hook_duration=0.0, max_segments=MAX_CAPTION_SEGMENTS)
         captioned = _overlay_captions_on_video(video_bytes, caption_segments, req.aspect_ratio, brand_color, req.style, req.language)
         return {"video_base64": base64.b64encode(captioned).decode("ascii")}
