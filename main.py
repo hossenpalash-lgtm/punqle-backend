@@ -565,6 +565,7 @@ class TikTokCreatorInfoResponse(BaseModel):
     duet_disabled: bool
     stitch_disabled: bool
     max_video_post_duration_sec: int
+    is_audited: bool
 
 
 class YouTubePublishResponse(BaseModel):
@@ -903,6 +904,19 @@ YOUTUBE_UPLOAD_PRIVACY_STATUS = "public"
 TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
 TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
 TIKTOK_SCOPE = "user.info.basic,video.publish,video.upload"
+# A real, live-confirmed correction to the comment above: TikTok does NOT
+# silently downgrade an unaudited client's privacy_level to SELF_ONLY —
+# it outright REJECTS the /video/init/ call with a real 403
+# (unaudited_client_can_only_post_to_private_accounts) for any value
+# other than SELF_ONLY, confirmed by replaying the exact request with a
+# real stored token (FOLLOWER_OF_CREATOR -> 403, SELF_ONLY -> 200, same
+# account, same call, only this field changed). creator_info.query's own
+# privacy_level_options reflects the *creator's* account settings only,
+# not the app's own audit status, so it can legitimately list options
+# that will still 403 until the app passes TikTok's audit. Flip this to
+# True once that audit is approved — real user-chosen privacy levels
+# will then pass through unmodified with zero other code changes needed.
+TIKTOK_APP_AUDITED = False
 # Optional — subscriptions/checkout are disabled (503) until these are set.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -5918,6 +5932,7 @@ def get_tiktok_creator_info(user_id: str = Depends(get_current_user_id)):
         "duet_disabled": bool(data.get("duet_disabled")),
         "stitch_disabled": bool(data.get("stitch_disabled")),
         "max_video_post_duration_sec": data.get("max_video_post_duration_sec") or 0,
+        "is_audited": TIKTOK_APP_AUDITED,
     }
 
 
@@ -5963,13 +5978,19 @@ def publish_to_tiktok(
     end to end (Veo or HeyGen), so there's no real case where TikTok's
     AI-content disclosure requirement wouldn't apply.
 
-    While the app is in TikTok's Sandbox (unaudited), TikTok itself
-    forces every post to SELF_ONLY (private) and privacy_level_options
-    only ever returns that one choice — the real picker here has nothing
-    to do until the app clears TikTok's audit, at which point real
-    accounts will see real choices with zero code changes needed."""
+    While the app is in TikTok's Sandbox (unaudited), any privacy_level
+    other than SELF_ONLY gets a real 403 from TikTok's own API — TikTok
+    does NOT silently downgrade it the way an earlier version of this
+    comment assumed (confirmed live: same request, only privacy_level
+    changed, FOLLOWER_OF_CREATOR -> 403, SELF_ONLY -> 200). Clamped to
+    SELF_ONLY server-side below whenever TIKTOK_APP_AUDITED is False,
+    regardless of what the client sent — creator_info.query's own
+    privacy_level_options reflects the creator's account settings only,
+    not the app's audit status, so the frontend picker can legitimately
+    offer options that would still 403 without this guard."""
     if not promotes_own_brand and not has_paid_partnership:
         raise HTTPException(status_code=400, detail="Choose at least one: your own brand, or a paid partnership.")
+    effective_privacy_level = privacy_level if TIKTOK_APP_AUDITED else "SELF_ONLY"
     try:
         access_token = _get_valid_tiktok_token(user_id)
         if not access_token:
@@ -5996,7 +6017,7 @@ def publish_to_tiktok(
                 json={
                     "post_info": {
                         "title": caption[:2200],
-                        "privacy_level": privacy_level,
+                        "privacy_level": effective_privacy_level,
                         "disable_duet": not allow_duet,
                         "disable_stitch": not allow_stitch,
                         "disable_comment": not allow_comment,
