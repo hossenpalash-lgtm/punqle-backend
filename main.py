@@ -5768,7 +5768,16 @@ def get_tiktok_connect_url(user_id: str = Depends(get_current_user_id)):
     the browser to directly — same shape as /meta/connect-url and
     /youtube/connect-url. Real posts stay private (SELF_ONLY) and capped
     at 5 users/24h until this app passes TikTok's own audit — confirmed
-    directly against TikTok's current developer docs, not assumed."""
+    directly against TikTok's current developer docs, not assumed.
+
+    disable_auto_auth=1 forces TikTok to always show its real
+    authorization page, even for a user who already granted this app
+    access before — without it, TikTok silently skips straight back to
+    redirect_uri on a repeat connect (confirmed live: connected_at
+    genuinely updated on a real round-trip, but no visible consent UI,
+    since the return was near-instant). Always explicit is both the
+    more honest choice for the person connecting and what TikTok's own
+    audit reviewers expect to see in a demo recording."""
     if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
         raise HTTPException(status_code=503, detail="Connecting TikTok isn't available right now.")
     state = _sign_tiktok_state(user_id)
@@ -5778,6 +5787,7 @@ def get_tiktok_connect_url(user_id: str = Depends(get_current_user_id)):
         "scope": TIKTOK_SCOPE,
         "redirect_uri": f"{BACKEND_URL}/tiktok/callback",
         "state": state,
+        "disable_auto_auth": "1",
     }
     return {"authorize_url": f"https://www.tiktok.com/v2/auth/authorize/?{urlencode(params)}"}
 
