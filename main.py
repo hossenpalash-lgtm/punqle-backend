@@ -354,6 +354,27 @@ class AvatarVideoStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+class GenerateCinematicUgcRequest(BaseModel):
+    item_description: str
+    style_prompt: str
+    tier: str = "standard"
+    aspect_ratio: str = "9:16"
+
+
+class CinematicUgcStartResponse(BaseModel):
+    prediction_id: str
+
+
+class CinematicUgcStatusRequest(BaseModel):
+    prediction_id: str
+
+
+class CinematicUgcStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 # A few curated moods rather than free-text search — matches the same
 # "nice-to-have, not required for V1" scope cut already made for avatar
 # demographic filtering and voice selection.
@@ -2844,6 +2865,27 @@ HEYGEN_API_BASE = "https://api.heygen.com"
 AVATAR_STANDARD_CREDIT_COST = 4
 AVATAR_PREMIUM_CREDIT_COST = VIDEO_CREDIT_COST
 _HEYGEN_ENGINE_BY_TIER = {"standard": "avatar_iii", "premium": "avatar_v"}
+
+# Cinematic UGC (Seedance 2.5, via Replicate) — a third, parallel video
+# path alongside Veo and HeyGen, for real human-product interaction Veo's
+# prompt-only generation doesn't reliably deliver and HeyGen's avatar
+# motion prompts explicitly don't cover (props/held objects, walking,
+# camera-following-feet type shots — confirmed via HeyGen's own docs
+# earlier this project). Real per-second cost confirmed live against a
+# real billed Replicate invoice 2026-09-06 (a 4s + 6s @480p test billed
+# exactly $1.03 total): ~$0.103/s at 480p, ~$0.231/s at 720p (matches
+# third-party pricing research almost exactly). Standard/Premium mirrors
+# HeyGen's own tier naming and picker UX, split by resolution rather than
+# engine version since Seedance has no separate cheap/expensive engine
+# the way HeyGen's Avatar III/V split does.
+REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+SEEDANCE_MODEL = "bytedance/seedance-2.5"
+CINEMATIC_UGC_DURATION_SEC = 8  # matches every other Punqle video style's clip length
+CINEMATIC_UGC_RESOLUTION_BY_TIER = {"standard": "480p", "premium": "720p"}
+CINEMATIC_UGC_CREDIT_COST = {
+    "standard": 25,  # 8s x ~$0.103/s = ~$0.82 real cost
+    "premium": 46,   # 8s x ~$0.231/s = ~$1.85 real cost
+}
 # Confirmed live against HeyGen's own /v2/voices catalog (2026-09-04) —
 # English has 2089 real options there, so this is a curated subset (3 per
 # gender), not the full catalog. Bangla has exactly 4 real voices total
@@ -3660,6 +3702,147 @@ def check_avatar_video_status(
     except requests.RequestException as e:
         logger.error("HeyGen status error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=502, detail="Couldn't check the avatar video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _replicate_headers() -> dict:
+    if not REPLICATE_API_TOKEN:
+        raise HTTPException(status_code=503, detail="Cinematic UGC isn't available right now.")
+    return {"Authorization": f"Bearer {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
+
+
+@app.post("/ads/generate-cinematic-ugc", response_model=CinematicUgcStartResponse, tags=["ads"])
+@limiter.limit("5/minute")
+def start_cinematic_ugc_generation(
+    request: Request,
+    req: GenerateCinematicUgcRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Starts a Cinematic UGC video job — Seedance 2.5 via Replicate, a
+    third, parallel video path alongside Veo and HeyGen for real human-
+    product interaction (holding/wearing/using a product, walking,
+    camera-following-feet type shots) that neither of the other two
+    reliably covers: Veo has no consistent character across a shot, and
+    HeyGen's own avatar motion prompts explicitly don't reach props or
+    held objects (confirmed via HeyGen's docs earlier this project).
+
+    Same check-then-charge, tier-tracked-server-side shape as
+    start_avatar_video_generation, for the same reason: Replicate's own
+    prediction status never reports which resolution tier was billed,
+    so it's remembered here (cinematic_ugc_jobs, keyed by Replicate's
+    own prediction id) rather than trusted from the client at poll time.
+
+    generate_audio is always False — confirmed live 2026-09-06 that
+    Seedance's own generated background music can get rejected outright
+    for suspected copyright, discovered by a real failed generation that
+    still ran (and billed) for several minutes before failing at the
+    very end. Sound is layered on afterward using Punqle's own existing
+    music/voiceover/caption tools instead, the same approach real UGC-ad
+    competitors (Creatify, Arcads) use — confirmed live, not assumed."""
+    try:
+        tier = req.tier if req.tier in CINEMATIC_UGC_CREDIT_COST else "standard"
+        cost = CINEMATIC_UGC_CREDIT_COST[tier]
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        prompt = f"{req.item_description.strip()}, {req.style_prompt.strip()}".strip(", ")
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Nothing to generate a video from.")
+
+        resolution = CINEMATIC_UGC_RESOLUTION_BY_TIER[tier]
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.replicate.com/v1/models/{SEEDANCE_MODEL}/predictions",
+                headers=_replicate_headers(),
+                json={"input": {
+                    "prompt": prompt,
+                    "duration": CINEMATIC_UGC_DURATION_SEC,
+                    "resolution": resolution,
+                    "aspect_ratio": req.aspect_ratio,
+                    "generate_audio": False,
+                }},
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("Replicate create prediction failed: %s", r.text)
+            raise HTTPException(status_code=502, detail="Couldn't start the cinematic video.")
+        prediction_id = r.json().get("id")
+        if not prediction_id:
+            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+
+        with_retry(lambda: supabase.table("cinematic_ugc_jobs").insert({
+            "prediction_id": prediction_id,
+            "owner_id": user_id,
+            "tier": tier,
+        }).execute())
+
+        return {"prediction_id": prediction_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/cinematic-ugc-status", response_model=CinematicUgcStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_cinematic_ugc_status(
+    request: Request,
+    req: CinematicUgcStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("cinematic_ugc_jobs")
+            .select("*")
+            .eq("prediction_id", req.prediction_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get cinematic ugc job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="Cinematic UGC job not found.")
+        tier = job_res.data[0]["tier"]
+
+        r = requests.get(
+            f"https://api.replicate.com/v1/predictions/{req.prediction_id}",
+            headers=_replicate_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+
+        if status not in ("succeeded", "failed", "canceled"):
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        # This row's only job was tier tracking — clean it up either way,
+        # success or failure, once we have a final answer.
+        with_retry(lambda: supabase.table("cinematic_ugc_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+
+        if status != "succeeded":
+            logger.error("Replicate prediction %s finished as %s: %s", req.prediction_id, status, data.get("error"))
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("output")
+        if not video_url:
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=60)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        new_credits = _spend_ad_credits(user_id, CINEMATIC_UGC_CREDIT_COST[tier])
+
+        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Replicate status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the cinematic video's status.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
