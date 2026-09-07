@@ -1456,6 +1456,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.8,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1534,6 +1535,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1599,6 +1601,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1671,6 +1674,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.8,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1743,6 +1747,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.8,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1791,6 +1796,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.8,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1841,6 +1847,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.9,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -1872,6 +1879,7 @@ Respond with ONLY this JSON format, nothing else, same number of items in the sa
                 {"role": "user", "content": prompt},
             ],
             temperature=0.5,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -2498,6 +2506,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -2545,6 +2554,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.6,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -2982,6 +2992,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -3057,6 +3068,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.8,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -7075,6 +7087,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
