@@ -654,12 +654,34 @@ class ProductUnderstandingOut(BaseModel):
     tone: Optional[str] = None
 
 
+# Expanded 2026-09-08 from the original 13 (a Bangladesh-market trial list)
+# to 18, aimed at Punqle's real US/EU/AU target market — informed by a real
+# competitor's published taxonomy (MakeUGC), not guessed. The
+# fashion_apparel/beauty_skincare split (out of the old single
+# "health_beauty") is the one that actually matters: it's what the Try-On
+# feature's own relevance depends on, not just a relabel.
 BUSINESS_CATEGORIES = {
-    "retail", "restaurant_cafe", "health_beauty", "professional_services",
+    "retail", "ecommerce", "fashion_apparel", "beauty_skincare",
+    "home_living", "pet_care", "baby_parenting", "restaurant_cafe",
+    "food_beverage", "fitness_sports", "professional_services",
     "home_services", "real_estate", "automotive", "education_coaching",
-    "fitness_sports", "events_entertainment", "ecommerce",
-    "technology_software", "other",
+    "events_entertainment", "tech_gaming", "other",
 }
+
+# Old category values that no longer exist as of the 2026-09-08 expansion,
+# mapped to their real replacement — applied transparently on read so an
+# existing saved profile never silently falls back to "other"'s generic
+# guidance. No DB migration needed: the next time that user saves their
+# Brand Kit, SetBusinessProfileRequest's own validator naturally writes a
+# real new-list value instead.
+_LEGACY_CATEGORY_MAP = {
+    "health_beauty": "beauty_skincare",
+    "technology_software": "tech_gaming",
+}
+
+
+def _resolve_category(raw: str) -> str:
+    return _LEGACY_CATEGORY_MAP.get(raw, raw)
 
 
 class BusinessProfileOut(BaseModel):
@@ -1318,7 +1340,7 @@ def _get_business_category(user_id: str) -> str:
         .execute())
     res = ensure_supabase_response(res, "get business profile")
     if res.data:
-        return res.data[0]["category"]
+        return _resolve_category(res.data[0]["category"])
     return "other"
 
 
@@ -1339,7 +1361,7 @@ def _get_business_profile(user_id: str) -> dict:
     if res.data:
         row = res.data[0]
         return {
-            "category": row.get("category") or "other",
+            "category": _resolve_category(row.get("category") or "other"),
             "brand_color": row.get("brand_color"),
             "logo_base64": row.get("logo_base64"),
             "logo_mime_type": row.get("logo_mime_type"),
@@ -1408,17 +1430,22 @@ def set_business_profile(req: SetBusinessProfileRequest, user_id: str = Depends(
 # categories (retail, restaurant_cafe, ecommerce).
 CONTENT_PLAN_CATEGORY_GUIDANCE = {
     "retail": "This is a retail/product shop — emphasize new arrivals, everyday value, and product quality when writing post ideas.",
+    "ecommerce": "This is an online/ecommerce business — emphasize delivery, showing off multiple products, and limited-stock urgency when writing post ideas.",
+    "fashion_apparel": "This is a fashion/apparel business (clothing, accessories, footwear) — emphasize fit, style, and the product actually being worn when writing post ideas.",
+    "beauty_skincare": "This is a beauty/skincare business (cosmetics, skincare, personal care products) — emphasize real results, ingredients, and how the product feels or looks when writing post ideas.",
+    "home_living": "This is a home & living business (decor, furniture, homeware) — emphasize how the product transforms a real space when writing post ideas.",
+    "pet_care": "This is a pet care business (pet products, grooming, pet services) — emphasize the pet's comfort/happiness and the owner's peace of mind when writing post ideas.",
+    "baby_parenting": "This is a baby/parenting business (baby products, childcare) — emphasize safety, comfort, and parent reassurance when writing post ideas.",
     "restaurant_cafe": "This is a restaurant/cafe — emphasize taste, fresh food, and daily specials/offers when writing post ideas.",
-    "health_beauty": "This is a health/beauty business (salon, spa, clinic) — emphasize service quality, expertise, hygiene, and results when writing post ideas.",
+    "food_beverage": "This is a packaged food/beverage business (snacks, drinks, packaged goods) — emphasize taste, ingredients, and everyday appeal when writing post ideas.",
+    "fitness_sports": "This is a fitness/sports business (gym, studio, trainer) — emphasize real results, community, and expert coaching when writing post ideas.",
     "professional_services": "This is a professional services business (legal, accounting, consulting, freelance) — emphasize expertise, credentials, and client trust when writing post ideas.",
     "home_services": "This is a home services business (interior design, renovation, furniture, repair) — emphasize past work/portfolio, craftsmanship, and personalized consultation when writing post ideas.",
     "real_estate": "This is a real estate business — emphasize location, transparent paperwork, and viewing opportunities when writing post ideas.",
     "automotive": "This is an automotive business (vehicle sales or service) — emphasize vehicle condition, trustworthiness, and test-drive/viewing opportunities when writing post ideas.",
     "education_coaching": "This is an education/coaching business — emphasize results, reputation, experienced instructors, and structured curriculum when writing post ideas.",
-    "fitness_sports": "This is a fitness/sports business (gym, studio, trainer) — emphasize real results, community, and expert coaching when writing post ideas.",
     "events_entertainment": "This is an events/entertainment business — emphasize the experience, atmosphere, and booking availability when writing post ideas.",
-    "ecommerce": "This is an online/ecommerce business — emphasize delivery, showing off multiple products, and limited-stock urgency when writing post ideas.",
-    "technology_software": "This is a technology/software business — emphasize reliability, key features/benefits, and support quality when writing post ideas.",
+    "tech_gaming": "This is a technology/gaming business (software, apps, gaming products) — emphasize reliability, key features/benefits, and support quality when writing post ideas.",
     "other": "Write generally effective post ideas for this small business.",
 }
 
