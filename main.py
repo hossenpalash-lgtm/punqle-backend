@@ -430,6 +430,15 @@ class VideoStatusRequest(BaseModel):
     # frame sizes differ) — defaults to "16:9" so older frontend builds
     # that don't send this yet still get a sane result, not an error.
     aspect_ratio: str = "16:9"
+    # Optional — one of Image Ad's 5 visualDirection values
+    # (clean_premium/bold_energetic/warm_lifestyle/minimal_editorial/
+    # vibrant_playful), NOT Video Ad's own unrelated 7-value videoStyle
+    # (product_showcase/lifestyle/.../avatar/cinematic_ugc, which is a
+    # Veo prompt-flavor concept, not a headline-typography one). None for
+    # every current caller — Video Ad's wizard has no UI step that
+    # collects this today, so this field only takes effect once/if a
+    # caller starts sending a real value. See _headline_font_path_for_style.
+    style: Optional[str] = None
 
 
 class VideoStatusResponse(BaseModel):
@@ -2887,6 +2896,26 @@ VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font
 # pinned to Bold via set_variation_by_axes wherever it's loaded — same
 # OFL license as the existing bundled font (see fonts/OFL.txt).
 BANGLA_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "NotoSansBengali-Bold.ttf")
+# Premium editorial headline pairing (2026-09) — a real, licensed (OFL)
+# variable font, same distribution as Noto Sans Bengali above, pinned to
+# its Medium weight via set_variation_by_axes (see _render_caption_bar_png)
+# rather than shipping a second static-weight file. Deliberately only
+# reachable for the two Image Ad visual directions that are already going
+# for a restrained, premium look (warm_lifestyle, minimal_editorial) — see
+# _headline_font_path_for_style — so Bold & Energetic/Vibrant & Playful/
+# Clean & Premium's existing loud VIDEO_FONT_PATH treatment is untouched.
+LORA_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "Lora-Variable.ttf")
+_EDITORIAL_VISUAL_STYLES = {"warm_lifestyle", "minimal_editorial"}
+
+
+def _headline_font_path_for_style(style: Optional[str]) -> Optional[str]:
+    """Maps Image Ad's visualDirection value to the video headline font —
+    None means "use the default VIDEO_FONT_PATH" (every style not in
+    _EDITORIAL_VISUAL_STYLES, and any caller that doesn't pass a style at
+    all). Kept as its own function since it's called both by
+    check_video_status and would be the one place to extend if another
+    caller ever gains an equivalent style concept."""
+    return LORA_FONT_PATH if style in _EDITORIAL_VISUAL_STYLES else None
 
 TRYON_CREDIT_COST = 2  # tryon-v1.6 is a flat 1 FASHN credit ≈ $0.075/generation, same cost-to-credit ratio as VIDEO_CREDIT_COST
 FASHN_API_BASE = "https://api.fashn.ai/v1"
@@ -3198,6 +3227,12 @@ def _render_caption_bar_png(
         # Bold so it visually matches every other caption's weight,
         # rather than rendering at its Regular default.
         font.set_variation_by_axes([700, 100])
+    elif resolved_font_path == LORA_FONT_PATH:
+        # Lora is also a variable font (single Weight axis, 400-700) —
+        # pinned to 500 (Medium) per the editorial brief's "regular or
+        # medium, never heavy bold" rule, deliberately lighter than every
+        # other caption style's Bold default.
+        font.set_variation_by_axes([500])
     canvas = Image.new("RGBA", (video_w, video_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     text_bbox = draw.textbbox((0, 0), text, font=font)
@@ -3317,6 +3352,7 @@ def _burn_text_on_video(
     text_position: str = "bottom",
     logo_position: str = "top-left",
     muted: bool = False,
+    headline_font_path: Optional[str] = None,
 ) -> bytes:
     """Bakes the headline onto the video as a caption bar (real text the
     AI model itself can't reliably render) and, if the business has a
@@ -3333,7 +3369,15 @@ def _burn_text_on_video(
 
     text_position/logo_position/muted all default to every prior
     caller's exact existing behavior (bottom, top-left, audio kept) —
-    only the Edit Video panel ever passes non-default values."""
+    only the Edit Video panel ever passes non-default values.
+
+    headline_font_path is None for every existing caller — the default
+    VIDEO_FONT_PATH (Bold), byte-identical to before this param existed.
+    Only check_video_status resolves a real value (via
+    _headline_font_path_for_style), and only when the caller actually
+    tells it which of Image Ad's 5 visual directions this video's
+    headline corresponds to — see that function's own docstring for why
+    that's not always available yet."""
     if not headline and not logo_base64 and not muted:
         return video_bytes
 
@@ -3374,7 +3418,10 @@ def _burn_text_on_video(
         if headline:
             headline_path = os.path.join(tmp_dir, "headline.png")
             with open(headline_path, "wb") as f:
-                f.write(_render_caption_bar_png(headline, video_w, video_h, brand_color, text_position))
+                f.write(_render_caption_bar_png(
+                    headline, video_w, video_h, brand_color, text_position,
+                    font_path=headline_font_path,
+                ))
             cmd += ["-i", headline_path]
             enable_clause = f":enable='lt(t,{hook_duration_seconds})'" if hook_duration_seconds else ""
             chain_parts.append(f"{stage}[{next_input_idx}:v]overlay=x=0:y=0{enable_clause}[out]")
@@ -3532,6 +3579,7 @@ def check_video_status(
                     video_bytes, headline, req.aspect_ratio,
                     profile.get("logo_base64"), profile.get("logo_mime_type"),
                     brand_color=profile.get("brand_color"),
+                    headline_font_path=_headline_font_path_for_style(req.style),
                 )
             except Exception as e:
                 # The raw video is still a perfectly usable result without
