@@ -2455,6 +2455,7 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
+            response_format={"type": "json_object"},
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
