@@ -1113,11 +1113,32 @@ def _get_ad_credits(user_id: str) -> int:
     return res.data[0]["credits"] if res.data else 0
 
 
-def _spend_ad_credit(user_id: str) -> int:
+def _log_feature_usage(user_id: str, feature: str, credits_spent: int, tier: Optional[str] = None) -> None:
+    """Best-effort, same shape as _save_generated_post — a logging
+    failure must never break the actual generation the user is waiting
+    on. Added for the pre-beta pricing review (2026-09-08): ad_credits
+    only ever holds a current balance, so before this there was no way
+    to see what a user actually spent credits on, in what order, or
+    where they hit a wall — exactly the signal a real pricing decision
+    (and a beta cohort) needs. See migrations/credit_usage_log.sql."""
+    try:
+        with_retry(lambda: supabase.table("credit_usage_log").insert({
+            "owner_id": user_id,
+            "feature": feature,
+            "tier": tier,
+            "credits_spent": credits_spent,
+        }).execute())
+    except Exception as e:
+        logger.error("Failed to log credit usage (%s): %s", feature, str(e), exc_info=True)
+
+
+def _spend_ad_credit(user_id: str, feature: str) -> int:
     """Checks the caller has at least 1 credit, decrements by 1, and
     returns the new balance. Raises 402 if there's nothing left to spend.
-    One shared helper for the three routes that each cost a credit,
-    instead of duplicating the same check/decrement block three times."""
+    One shared helper for the routes that each cost a credit, instead of
+    duplicating the same check/decrement block each time. feature is a
+    short slug identifying the action for _log_feature_usage — required,
+    not optional, so a new call site can't silently skip logging."""
     credits = _get_ad_credits(user_id)
     if credits <= 0:
         raise HTTPException(
@@ -1129,13 +1150,16 @@ def _spend_ad_credit(user_id: str) -> int:
         "credits": new_credits,
         "updated_at": "now()",
     }).eq("owner_id", user_id).execute()
+    _log_feature_usage(user_id, feature, 1)
     return new_credits
 
 
-def _spend_ad_credits(user_id: str, amount: int) -> int:
+def _spend_ad_credits(user_id: str, amount: int, feature: str, tier: Optional[str] = None) -> int:
     """Like _spend_ad_credit but for actions costing more than 1 (video) —
     kept separate rather than generalizing the 1-credit callers onto this,
-    since those are already correct and this is only new for video."""
+    since those are already correct and this is only new for video.
+    feature/tier are for _log_feature_usage — tier is only meaningful for
+    the two features with real sub-tiers (avatar, cinematic_ugc)."""
     credits = _get_ad_credits(user_id)
     if credits < amount:
         raise HTTPException(
@@ -1147,6 +1171,7 @@ def _spend_ad_credits(user_id: str, amount: int) -> int:
         "credits": new_credits,
         "updated_at": "now()",
     }).eq("owner_id", user_id).execute())
+    _log_feature_usage(user_id, feature, amount, tier)
     return new_credits
 
 
@@ -2830,7 +2855,7 @@ async def generate_ad(
         copy = _generate_ad_copy(item_description, category)
         banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio)
 
-        new_credits = _spend_ad_credit(user_id)
+        new_credits = _spend_ad_credit(user_id, "image_generate")
         banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
         _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
@@ -2874,7 +2899,7 @@ async def generate_ad_image_variant(
         category = _get_business_category(user_id)
         banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio)
 
-        new_credits = _spend_ad_credit(user_id)
+        new_credits = _spend_ad_credit(user_id, "image_variant")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -2992,10 +3017,15 @@ _HEYGEN_DEFAULT_VOICE_ID = {
 }
 
 # Real cost here is tiny (~$0.003/clip: tts-1 at $15/1M chars on a ~150
-# char script, whisper-1 at $0.006/min on an ~8s clip) — priced above
-# raw cost like every other credit constant in this file, not a strict
-# passthrough, since this is also the heaviest ffmpeg workload in the app.
-VOICEOVER_CREDIT_COST = 2
+# char script, whisper-1 at $0.006/min on an ~8s clip). Was 2 credits
+# ($0.25) — a ~98.8% margin standing out from every other feature's
+# ~68-75%, and a real pre-beta pricing review (2026-09-08, real vendor
+# cost + live competitor pricing checked for every feature) flagged it
+# as the one outlier worth fixing before beta rather than defending.
+# Bundled free into video generation instead — edit_video's own
+# `cost = VOICEOVER_CREDIT_COST if wants_voiceover else 0` already
+# degrades correctly to a no-op charge at 0, no other code change needed.
+VOICEOVER_CREDIT_COST = 0
 TTS_MODEL = "tts-1"
 TTS_VOICE = "alloy"
 # whisper-1 specifically (not gpt-4o-transcribe/mini) — the SDK's own
@@ -3588,7 +3618,7 @@ def check_video_status(
                 # over a text/logo-overlay step failing.
                 logger.error("Text/logo burn-in failed, returning video without it: %s", str(e), exc_info=True)
 
-        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST)
+        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "video_generate")
         return {
             "done": True,
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
@@ -3782,7 +3812,7 @@ def check_avatar_video_status(
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
         cost = AVATAR_PREMIUM_CREDIT_COST if tier == "premium" else AVATAR_STANDARD_CREDIT_COST
-        new_credits = _spend_ad_credits(user_id, cost)
+        new_credits = _spend_ad_credits(user_id, cost, "avatar_video", tier)
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
     except HTTPException:
@@ -3923,7 +3953,7 @@ def check_cinematic_ugc_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
-        new_credits = _spend_ad_credits(user_id, CINEMATIC_UGC_CREDIT_COST[tier])
+        new_credits = _spend_ad_credits(user_id, CINEMATIC_UGC_CREDIT_COST[tier], "cinematic_ugc", tier)
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
     except HTTPException:
@@ -4416,7 +4446,13 @@ def edit_video(
         )
 
         charged = cost if used_voiceover else 0
-        new_credits = _spend_ad_credits(user_id, charged) if charged else _get_ad_credits(user_id)
+        new_credits = _spend_ad_credits(user_id, charged, "voiceover") if charged else _get_ad_credits(user_id)
+        # Logged separately from the spend path above — charged is 0 in
+        # the normal (free) case, so _spend_ad_credits never runs and
+        # never logs, but "how many people actually use free voiceover"
+        # is still real signal worth having for the next pricing review.
+        if used_voiceover and not charged:
+            _log_feature_usage(user_id, "voiceover", 0)
         return {
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
             "credits_remaining": new_credits,
@@ -4687,7 +4723,7 @@ def check_tryon_status(
             raise HTTPException(status_code=502, detail="Try-On didn't return a result. Please try again.")
 
         image_bytes, _ = _fetch_url_bytes(output[0])
-        new_credits = _spend_ad_credits(user_id, TRYON_CREDIT_COST)
+        new_credits = _spend_ad_credits(user_id, TRYON_CREDIT_COST, "tryon_image")
         return {
             "done": True,
             "image_base64": base64.b64encode(image_bytes).decode("ascii"),
@@ -4784,7 +4820,7 @@ def check_tryon_animation_status(
             raise HTTPException(status_code=502, detail="Didn't get a video back. Please try again.")
         video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
 
-        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST)
+        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "tryon_animate")
         return {
             "done": True,
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
@@ -4819,7 +4855,7 @@ async def remove_background(
         mime_type = file.content_type or "image/jpeg"
         result_bytes = await run_in_threadpool(_remove_background, image_bytes, mime_type)
 
-        new_credits = _spend_ad_credit(user_id)
+        new_credits = _spend_ad_credit(user_id, "remove_background")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
@@ -4854,7 +4890,7 @@ async def enhance_image(
         mime_type = file.content_type or "image/jpeg"
         result_bytes = await run_in_threadpool(_enhance_image, image_bytes, mime_type)
 
-        new_credits = _spend_ad_credit(user_id)
+        new_credits = _spend_ad_credit(user_id, "enhance_image")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
@@ -7327,7 +7363,7 @@ async def generate_content_plan_post(
             "image_base64": banner_b64,
         }
 
-        new_credits = _spend_ad_credit(user_id)
+        new_credits = _spend_ad_credit(user_id, "weekly_plan_day")
         supabase.table("content_plans").update({"posts": posts}).eq("id", plan_id).execute()
         _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
