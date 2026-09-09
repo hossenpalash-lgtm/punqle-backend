@@ -497,6 +497,20 @@ class ImportedProductsListResponse(BaseModel):
     products: list[ImportedProductOut]
 
 
+class ProjectOut(BaseModel):
+    id: str
+    name: str
+    created_at: str
+
+
+class ProjectsListResponse(BaseModel):
+    projects: list[ProjectOut]
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+
+
 class FetchProductImageRequest(BaseModel):
     url: str
 
@@ -5175,6 +5189,43 @@ def clear_products(user_id: str = Depends(get_current_user_id)):
     try:
         supabase.table("imported_products").delete().eq("owner_id", user_id).execute()
         return {"deleted": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Minimal real "Projects" concept for the new home screen (2026-09-10) —
+# name + created_at only, no content-linking yet (see migrations/projects.sql).
+@app.get("/projects", response_model=ProjectsListResponse, tags=["projects"])
+def list_projects(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("projects")
+            .select("id, name, created_at")
+            .eq("owner_id", user_id)
+            .order("created_at", desc=True)
+            .execute())
+        res = ensure_supabase_response(res, "list projects")
+        return {"projects": res.data}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/projects", response_model=ProjectOut, tags=["projects"])
+def create_project(req: CreateProjectRequest, user_id: str = Depends(get_current_user_id)):
+    try:
+        name = req.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Give your project a name.")
+        if len(name) > 100:
+            raise HTTPException(status_code=400, detail="Project name is too long.")
+        res = with_retry(lambda: supabase.table("projects")
+            .insert({"owner_id": user_id, "name": name})
+            .execute())
+        res = ensure_supabase_response(res, "create project")
+        return res.data[0]
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
