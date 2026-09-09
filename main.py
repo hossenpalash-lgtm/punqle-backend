@@ -475,6 +475,12 @@ class TryOnStatusResponse(BaseModel):
 class TryOnAnimateStartRequest(BaseModel):
     image_base64: str  # the Try-On result's own image (checkTryOnStatus's
                         # existing "data:image/png" convention — PNG)
+    # Optional freeform motion description — matches Cinematic UGC's own
+    # scene_prompt pattern (a real gap flagged in the Sub-flow Redesign
+    # work: Try-On's Animate used one fixed, non-editable prompt while
+    # Cinematic UGC already let the user describe the motion). Falls back
+    # to _TRYON_ANIMATE_PROMPT when blank/omitted — old callers unaffected.
+    motion_prompt: Optional[str] = None
 
 
 class TryOnAnimateOperationOut(BaseModel):
@@ -4788,9 +4794,10 @@ def start_tryon_animation(
                 detail=f"Animating needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
             )
         image = genai_types.Image(image_bytes=base64.b64decode(req.image_base64), mime_type="image/png")
+        prompt = req.motion_prompt.strip() if req.motion_prompt and req.motion_prompt.strip() else _TRYON_ANIMATE_PROMPT
         operation = gemini_client.models.generate_videos(
             model=VEO_MODEL,
-            prompt=_TRYON_ANIMATE_PROMPT,
+            prompt=prompt,
             image=image,
             config=genai_types.GenerateVideosConfig(
                 aspect_ratio="9:16",
