@@ -2756,6 +2756,15 @@ def _get_image_actor(actor_id: str) -> Optional[dict]:
     return next((a for a in _IMAGE_AD_ACTORS if a["id"] == actor_id), None)
 
 
+def _get_image_actor_bytes(actor_id: str) -> Optional[bytes]:
+    path = os.path.join(_IMAGE_ACTORS_DIR, f"{actor_id}.jpg")
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 @app.get("/ads/image-actors", response_model=ImageActorsListResponse, tags=["ads"])
 def list_image_actors(user_id: str = Depends(get_current_user_id)):
     """Free — the fixed, bundled actor library (see _IMAGE_AD_ACTORS).
@@ -2820,6 +2829,61 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
     raise Exception("Gemini did not return an image")
 
 
+def _generate_banner_image_with_actor(
+    image_bytes: bytes,
+    mime_type: str,
+    persona_bytes: bytes,
+    actor_description: str,
+    item_description: str,
+    aspect_ratio: str = "square",
+) -> bytes:
+    """Composites a persona (see _IMAGE_AD_ACTORS) onto the user's own
+    uploaded product photo — genuinely new two-image Gemini compositing,
+    validated via a real spike (3/3 real product photos, product shape/
+    color/design held up, persona identity stayed consistent) before this
+    was written. Unlike _generate_banner_image, this can't promise the
+    product is untouched pixel-for-pixel (the whole scene is regenerated
+    around it), only that its shape/color/design/visible text are kept —
+    same honest limitation the spike itself surfaced on small text."""
+    if gemini_client is None:
+        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+
+    shape_instruction = ASPECT_RATIO_PROMPTS.get(aspect_ratio, ASPECT_RATIO_PROMPTS["square"])
+    prompt = (
+        f"The first image shows a person: {actor_description}. The second image shows a product photo. "
+        "Create a new, single photorealistic promotional photo showing this exact person naturally "
+        "holding or using the exact product from the second image, in a realistic small-business "
+        "advertising photo. Keep the product exactly as shown in the second image — do not change "
+        "its shape, color, design, or any text/label on it. Keep the person's face and appearance "
+        "consistent with the first image. Natural lighting, candid feel, not overly posed, "
+        f"contextually fitting for this item/offer: {item_description}. "
+        "Do NOT add any text, letters, numbers, or words anywhere in the image — "
+        "leave clean, uncluttered space (e.g. near the top or bottom) where text "
+        f"will be added afterward by a separate step. {shape_instruction}"
+    )
+    response = with_retry(
+        lambda: gemini_client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[
+                genai_types.Part.from_bytes(data=persona_bytes, mime_type="image/jpeg"),
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                prompt,
+            ],
+            config=genai_types.GenerateContentConfig(
+                image_config=genai_types.ImageConfig(
+                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
+                ),
+            ),
+        ),
+        exceptions=(Exception,),
+        attempts=2,
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise Exception("Gemini did not return an image")
+
+
 def _generate_ai_banner_image(
     item_description: str,
     category: str = "other",
@@ -2833,11 +2897,11 @@ def _generate_ai_banner_image(
 
     actor_description (optional): a persona's appearance text from
     _IMAGE_AD_ACTORS, asking the whole scene (person + product) to be
-    imagined together in one call — this is the ONLY actor path that's
-    safe to ship today, since it reuses this exact already-proven
-    text-to-image call unchanged. Compositing an actor onto a real
-    uploaded product photo is a separate, unvalidated capability — see
-    the "AI Actor library" plan section for why that's gated off."""
+    imagined together in one call — reuses this exact already-proven
+    text-to-image call unchanged. When the user uploads their own photo
+    instead, see _generate_banner_image_with_actor — a separate function
+    doing real two-image compositing, validated via a live spike before
+    it shipped (see that function's own docstring)."""
     if gemini_client is None:
         raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
 
@@ -2892,13 +2956,13 @@ async def _get_banner_image(
     # a real bug: without run_in_threadpool, one slow generation freezes
     # the whole backend for every user until it finishes.)
     if image_bytes:
-        # actor_id is silently ignored when the user uploaded their own
-        # photo — compositing a persona onto a real product photo needs
-        # genuine two-image Gemini compositing, unvalidated in this
-        # codebase (see the "AI Actor library" plan). The frontend hides
-        # the actor picker once a file is uploaded, so this should rarely
-        # even be reached with both set — this is the defensive backstop,
-        # not the primary guard.
+        actor = _get_image_actor(actor_id) if actor_id else None
+        persona_bytes = _get_image_actor_bytes(actor_id) if actor_id else None
+        if actor and persona_bytes:
+            return await run_in_threadpool(
+                _generate_banner_image_with_actor,
+                image_bytes, mime_type or "image/jpeg", persona_bytes, actor["description"], item_description, aspect_ratio,
+            )
         return await run_in_threadpool(_generate_banner_image, image_bytes, mime_type or "image/jpeg", item_description, aspect_ratio)
     actor = _get_image_actor(actor_id) if actor_id else None
     actor_description = actor["description"] if actor else None
