@@ -290,6 +290,18 @@ class AvatarOptionsResponse(BaseModel):
     avatars: list[AvatarOptionOut]
 
 
+class ImageActorOut(BaseModel):
+    id: str
+    name: str
+    gender: str
+    style: str
+    preview_image_base64: str
+
+
+class ImageActorsListResponse(BaseModel):
+    actors: list[ImageActorOut]
+
+
 class GenerateAvatarVideoRequest(BaseModel):
     narration: str
     avatar_id: str
@@ -2687,6 +2699,85 @@ ASPECT_RATIO_GEMINI_VALUES = {
 }
 
 
+# A small, hardcoded, curated library — same "small curated set, not a
+# live vendor catalog" pattern as _HEYGEN_VOICES below. Every persona is
+# fully AI-synthesized by Punqle itself (generated once via this exact
+# gemini-2.5-flash-image model, see scratchpad/generate_actors.py at
+# generation time) — deliberately NOT a real stock actor photo, NOT a
+# HeyGen avatar (HeyGen's likeness license covers generation through
+# HeyGen's own video API only, not reuse in a different image tool), and
+# NOT a scraped/found photo of a real person. This sidesteps the real
+# right-of-publicity risk of depicting an identifiable real person in ad
+# content without their consent for this specific use — the same caution
+# this app already applies to Try-On (only the user's own consented
+# photo) and HeyGen avatars (HeyGen's own pre-cleared stock catalog).
+# Adult/Young Adult only, deliberately no "Kid" persona — a fictional
+# AI-generated child in ad content is extra sensitive, not worth it for
+# V1. `description` is fed directly into the Gemini prompt; `preview`
+# is only for the picker UI.
+_IMAGE_AD_ACTORS = [
+    {
+        "id": "maya", "name": "Maya", "gender": "female", "style": "casual",
+        "description": "a warm, friendly woman in her early 30s with long wavy brown hair, light olive skin, wearing a soft cream knit sweater, natural everyday makeup",
+    },
+    {
+        "id": "liam", "name": "Liam", "gender": "male", "style": "casual",
+        "description": "a friendly young man in his mid-20s with short dark brown hair, light stubble, tan skin, wearing a relaxed denim jacket over a white t-shirt",
+    },
+    {
+        "id": "sofia", "name": "Sofia", "gender": "female", "style": "business",
+        "description": "a confident professional woman in her late 30s with sleek straight black hair, fair skin, wearing a tailored charcoal blazer over a white blouse",
+    },
+    {
+        "id": "noah", "name": "Noah", "gender": "male", "style": "business",
+        "description": "a polished professional man in his 40s with short greying dark hair, a neatly trimmed beard, medium skin tone, wearing a navy blue blazer over a light shirt",
+    },
+    {
+        "id": "ava", "name": "Ava", "gender": "female", "style": "outdoor",
+        "description": "an energetic athletic woman in her mid-20s with a blonde ponytail, fair freckled skin, wearing a fitted grey athletic top, healthy outdoorsy glow",
+    },
+    {
+        "id": "ethan", "name": "Ethan", "gender": "male", "style": "outdoor",
+        "description": "a rugged outdoorsy man in his early 30s with short wavy brown hair, a light beard, tan weathered skin, wearing a rolled-sleeve flannel shirt",
+    },
+    {
+        "id": "zara", "name": "Zara", "gender": "female", "style": "elegant",
+        "description": "an elegant woman in her late 20s with voluminous curly dark hair, deep brown skin, wearing a simple elegant neutral-toned top, soft glam makeup",
+    },
+    {
+        "id": "marcus", "name": "Marcus", "gender": "male", "style": "casual",
+        "description": "a stylish young man in his early 20s with short curly black hair, dark skin, wearing a relaxed graphic t-shirt, friendly approachable smile",
+    },
+]
+_IMAGE_ACTORS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "actors")
+
+
+def _get_image_actor(actor_id: str) -> Optional[dict]:
+    return next((a for a in _IMAGE_AD_ACTORS if a["id"] == actor_id), None)
+
+
+@app.get("/ads/image-actors", response_model=ImageActorsListResponse, tags=["ads"])
+def list_image_actors(user_id: str = Depends(get_current_user_id)):
+    """Free — the fixed, bundled actor library (see _IMAGE_AD_ACTORS).
+    Preview images are small bundled JPEGs read from disk and returned as
+    base64, same "no object storage bucket" convention as every other
+    asset in this app (fonts/, etc.) — this is a small fixed set (8
+    images), not something that needs a CDN."""
+    actors = []
+    for a in _IMAGE_AD_ACTORS:
+        path = os.path.join(_IMAGE_ACTORS_DIR, f"{a['id']}.jpg")
+        try:
+            with open(path, "rb") as f:
+                preview_b64 = base64.b64encode(f.read()).decode("ascii")
+        except FileNotFoundError:
+            continue
+        actors.append({
+            "id": a["id"], "name": a["name"], "gender": a["gender"],
+            "style": a["style"], "preview_image_base64": preview_b64,
+        })
+    return {"actors": actors}
+
+
 def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str, aspect_ratio: str = "square") -> bytes:
     """Edits the user's own photo (background only) via Gemini —
     deliberately does NOT ask the model to add any text to the image. Text
@@ -2729,21 +2820,39 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
     raise Exception("Gemini did not return an image")
 
 
-def _generate_ai_banner_image(item_description: str, category: str = "other", aspect_ratio: str = "square") -> bytes:
+def _generate_ai_banner_image(
+    item_description: str,
+    category: str = "other",
+    aspect_ratio: str = "square",
+    actor_description: Optional[str] = None,
+) -> bytes:
     """Generates a banner image from scratch (no real photo) for users
     without one to upload. The pictured product is AI-imagined rather than
     the business's actual item, so this only ever runs when the frontend
-    explicitly sends no file — never a silent fallback for a failed upload."""
+    explicitly sends no file — never a silent fallback for a failed upload.
+
+    actor_description (optional): a persona's appearance text from
+    _IMAGE_AD_ACTORS, asking the whole scene (person + product) to be
+    imagined together in one call — this is the ONLY actor path that's
+    safe to ship today, since it reuses this exact already-proven
+    text-to-image call unchanged. Compositing an actor onto a real
+    uploaded product photo is a separate, unvalidated capability — see
+    the "AI Actor library" plan section for why that's gated off."""
     if gemini_client is None:
         raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
 
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     shape_instruction = ASPECT_RATIO_PROMPTS.get(aspect_ratio, ASPECT_RATIO_PROMPTS["square"])
+    actor_instruction = (
+        f"Feature {actor_description}, naturally holding or using the product, looking genuine and candid, not posed like a model. "
+        if actor_description else ""
+    )
     prompt = (
         "Generate a clean, professional, photorealistic promotional banner image "
         "for a Facebook ad for a small business. "
         f"Context: {category_guidance} "
         f"The image should visually represent this product/offer: {item_description}. "
+        f"{actor_instruction}"
         "Make it well-lit, visually appealing, and contextually appropriate. "
         "Do NOT add any text, letters, numbers, or words anywhere in the image — "
         "leave clean, uncluttered space (e.g. near the top or bottom) where text "
@@ -2774,6 +2883,7 @@ async def _get_banner_image(
     item_description: str,
     category: str,
     aspect_ratio: str = "square",
+    actor_id: Optional[str] = None,
 ) -> bytes:
     # Gemini image generation is a blocking call and can take well over a
     # minute (especially generating from scratch, no reference photo) — run
@@ -2782,8 +2892,17 @@ async def _get_banner_image(
     # a real bug: without run_in_threadpool, one slow generation freezes
     # the whole backend for every user until it finishes.)
     if image_bytes:
+        # actor_id is silently ignored when the user uploaded their own
+        # photo — compositing a persona onto a real product photo needs
+        # genuine two-image Gemini compositing, unvalidated in this
+        # codebase (see the "AI Actor library" plan). The frontend hides
+        # the actor picker once a file is uploaded, so this should rarely
+        # even be reached with both set — this is the defensive backstop,
+        # not the primary guard.
         return await run_in_threadpool(_generate_banner_image, image_bytes, mime_type or "image/jpeg", item_description, aspect_ratio)
-    return await run_in_threadpool(_generate_ai_banner_image, item_description, category, aspect_ratio)
+    actor = _get_image_actor(actor_id) if actor_id else None
+    actor_description = actor["description"] if actor else None
+    return await run_in_threadpool(_generate_ai_banner_image, item_description, category, aspect_ratio, actor_description)
 
 
 def _remove_background(image_bytes: bytes, mime_type: str) -> bytes:
@@ -2855,6 +2974,7 @@ async def generate_ad(
     request: Request,
     item_description: str,
     aspect_ratio: str = "square",
+    actor_id: Optional[str] = None,
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
@@ -2873,7 +2993,7 @@ async def generate_ad(
         category = _get_business_category(user_id)
 
         copy = _generate_ad_copy(item_description, category)
-        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio)
+        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id)
 
         new_credits = _spend_ad_credit(user_id, "image_generate")
         banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
@@ -2897,6 +3017,7 @@ async def generate_ad_image_variant(
     request: Request,
     item_description: str,
     aspect_ratio: str = "square",
+    actor_id: Optional[str] = None,
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
@@ -2917,7 +3038,7 @@ async def generate_ad_image_variant(
         image_bytes = await file.read() if file is not None else None
         mime_type = file.content_type if file is not None else None
         category = _get_business_category(user_id)
-        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio)
+        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id)
 
         new_credits = _spend_ad_credit(user_id, "image_variant")
 
