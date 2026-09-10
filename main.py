@@ -387,6 +387,26 @@ class CinematicUgcStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+class GenerateAiActorVideoRequest(BaseModel):
+    actor_id: str
+    narration: str
+    language: str = "english"
+
+
+class AiActorVideoStartResponse(BaseModel):
+    prediction_id: str
+
+
+class AiActorVideoStatusRequest(BaseModel):
+    prediction_id: str
+
+
+class AiActorVideoStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 # A few curated moods rather than free-text search — matches the same
 # "nice-to-have, not required for V1" scope cut already made for avatar
 # demographic filtering and voice selection.
@@ -3183,6 +3203,20 @@ CINEMATIC_UGC_CREDIT_COST = {
     "standard": 25,  # 8s x ~$0.103/s = ~$0.82 real cost
     "premium": 46,   # 8s x ~$0.231/s = ~$1.85 real cost
 }
+
+# AI Actor talking video (OmniHuman, via Replicate) — a fourth video
+# path: like Avatar (HeyGen), a presenter reads your script, but using
+# Punqle's own _IMAGE_AD_ACTORS instead of HeyGen's stock catalog.
+# Real-spike-tested 2026-09-10 (one persona photo + real TTS audio ->
+# a genuinely natural, lip-synced result, reviewed frame-by-frame).
+# OmniHuman only takes a still image + audio (confirmed via its own
+# input schema) — no motion/action prompt, so this can't add
+# environmental scenes (e.g. "driving a car") the way Arcads' own
+# pre-made actor catalog apparently can; that's a separate, harder,
+# not-yet-proven capability, deliberately out of scope here.
+AI_ACTOR_MODEL = "bytedance/omni-human"
+AI_ACTOR_VIDEO_CREDIT_COST = 30  # 8s x $0.14/s = $1.12 real cost, same credit-per-dollar ratio as Cinematic UGC above
+AI_ACTOR_VOICE_BY_GENDER = {"female": "nova", "male": "onyx"}
 # Confirmed live against HeyGen's own /v2/voices catalog (2026-09-04) —
 # English has 2089 real options there, so this is a curated subset (3 per
 # gender), not the full catalog. Bangla has exactly 4 real voices total
@@ -4166,6 +4200,133 @@ def check_cinematic_ugc_status(
     except requests.RequestException as e:
         logger.error("Replicate status error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=502, detail="Couldn't check the cinematic video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-ai-actor-video", response_model=AiActorVideoStartResponse, tags=["ads"])
+@limiter.limit("5/minute")
+def start_ai_actor_video_generation(
+    request: Request,
+    req: GenerateAiActorVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Starts an OmniHuman talking-actor video job — same check-then-
+    charge, job-tracked-server-side shape as Cinematic UGC
+    (start_cinematic_ugc_generation above), for the same reason:
+    Replicate's status response doesn't carry a price, so success is
+    what triggers the charge, tracked via ai_actor_video_jobs keyed by
+    Replicate's own prediction id.
+
+    Synthesizes the narration via OpenAI TTS (reusing
+    _synthesize_voiceover, already used elsewhere for Veo voiceover)
+    rather than calling OmniHuman with silence + no audio — OmniHuman
+    requires real audio input, it doesn't generate speech itself."""
+    try:
+        narration = (req.narration or "").strip()
+        if not narration:
+            raise HTTPException(status_code=400, detail="Nothing for the actor to say.")
+
+        actor = _get_image_actor(req.actor_id)
+        persona_bytes = _get_image_actor_bytes(req.actor_id) if actor else None
+        if not actor or not persona_bytes:
+            raise HTTPException(status_code=400, detail="Unknown actor.")
+
+        cost = AI_ACTOR_VIDEO_CREDIT_COST
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        voice = AI_ACTOR_VOICE_BY_GENDER.get(actor["gender"], TTS_VOICE)
+        audio_bytes = _synthesize_voiceover(narration, voice)
+
+        image_b64 = base64.b64encode(persona_bytes).decode("ascii")
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.replicate.com/v1/models/{AI_ACTOR_MODEL}/predictions",
+                headers=_replicate_headers(),
+                json={"input": {
+                    "image": f"data:image/jpeg;base64,{image_b64}",
+                    "audio": f"data:audio/mp3;base64,{audio_b64}",
+                }},
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("Replicate create prediction failed: %s", r.text)
+            raise HTTPException(status_code=502, detail="Couldn't start the actor video.")
+        prediction_id = r.json().get("id")
+        if not prediction_id:
+            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+
+        with_retry(lambda: supabase.table("ai_actor_video_jobs").insert({
+            "prediction_id": prediction_id,
+            "owner_id": user_id,
+        }).execute())
+
+        return {"prediction_id": prediction_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/ai-actor-video-status", response_model=AiActorVideoStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_ai_actor_video_status(
+    request: Request,
+    req: AiActorVideoStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("ai_actor_video_jobs")
+            .select("*")
+            .eq("prediction_id", req.prediction_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get ai actor video job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="AI actor video job not found.")
+
+        r = requests.get(
+            f"https://api.replicate.com/v1/predictions/{req.prediction_id}",
+            headers=_replicate_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+
+        if status not in ("succeeded", "failed", "canceled"):
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        with_retry(lambda: supabase.table("ai_actor_video_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+
+        if status != "succeeded":
+            logger.error("Replicate prediction %s finished as %s: %s", req.prediction_id, status, data.get("error"))
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("output")
+        if not video_url:
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=60)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        new_credits = _spend_ad_credits(user_id, AI_ACTOR_VIDEO_CREDIT_COST, "ai_actor_video")
+
+        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Replicate status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the actor video's status.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
