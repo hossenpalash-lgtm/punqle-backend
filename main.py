@@ -9,7 +9,7 @@ from google.genai import types as genai_types
 from supabase import create_client
 from postgrest.exceptions import APIError
 from dotenv import load_dotenv
-from typing import Optional, Callable, TypeVar
+from typing import Optional, Callable, TypeVar, Literal
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -18,6 +18,7 @@ import os
 import json
 import re
 import time
+import random
 import logging
 import base64
 import requests
@@ -402,6 +403,31 @@ class AiActorVideoStatusRequest(BaseModel):
 
 
 class AiActorVideoStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
+# Punqle Actors v2 -- pre-baked Veo base clip (per actor) redubbed with a
+# fresh per-user narration track via Sync Labs, replacing the OmniHuman
+# pipeline above once verified live. voice_engine is a real user-facing
+# choice (not an internal-only default) -- see ACTOR_VOICE_ENGINES.
+class GenerateActorVideoV2Request(BaseModel):
+    actor_id: str
+    narration: str
+    voice_engine: str = "openai_natural"
+    situation_id: Optional[str] = None  # omitted by the frontend today; picked at random among the actor's clips when unset
+
+
+class ActorVideoV2StartResponse(BaseModel):
+    prediction_id: str
+
+
+class ActorVideoV2StatusRequest(BaseModel):
+    prediction_id: str
+
+
+class ActorVideoV2StatusResponse(BaseModel):
     done: bool
     video_base64: Optional[str] = None
     credits_remaining: Optional[int] = None
@@ -2768,6 +2794,42 @@ _IMAGE_AD_ACTORS = [
         "id": "marcus", "name": "Marcus", "gender": "male", "style": "casual",
         "description": "a stylish young man in his early 20s with short curly black hair, dark skin, wearing a relaxed graphic t-shirt, friendly approachable smile",
     },
+    # Second batch (2026-09-11) — added to reach 8 female + 8 male for
+    # Punqle Actors v2's 16-situation library (see the "B" architecture
+    # plan), real diversity beyond the first 8's range. Same fully-
+    # synthetic, no-real-person rationale as the original batch.
+    {
+        "id": "priya", "name": "Priya", "gender": "female", "style": "casual",
+        "description": "a bright, energetic woman in her mid-20s with a dark high ponytail, warm brown skin, wearing a fitted coral athletic top, natural dewy glow",
+    },
+    {
+        "id": "elena", "name": "Elena", "gender": "female", "style": "business",
+        "description": "a poised professional woman in her early 30s with shoulder-length wavy auburn hair, warm tan skin, wearing a fitted emerald green blouse, subtle gold jewelry",
+    },
+    {
+        "id": "hannah", "name": "Hannah", "gender": "female", "style": "casual",
+        "description": "a cheerful woman in her late 20s with a sleek black bob haircut, fair skin, wearing an oversized soft grey hoodie, fresh natural makeup",
+    },
+    {
+        "id": "grace", "name": "Grace", "gender": "female", "style": "elegant",
+        "description": "a warm, graceful woman in her mid-40s with shoulder-length silver-streaked brown hair, light tan skin, wearing a relaxed linen button-up shirt, kind confident smile",
+    },
+    {
+        "id": "diego", "name": "Diego", "gender": "male", "style": "outdoor",
+        "description": "an athletic man in his mid-30s with short black wavy hair, a light beard, warm brown skin, wearing a fitted navy performance polo, easygoing confident smile",
+    },
+    {
+        "id": "kwame", "name": "Kwame", "gender": "male", "style": "business",
+        "description": "a sharp professional man in his late 20s with a short fade haircut, deep brown skin, wearing a fitted grey suit jacket over a black t-shirt, confident modern style",
+    },
+    {
+        "id": "ravi", "name": "Ravi", "gender": "male", "style": "casual",
+        "description": "a friendly man in his early 30s with short black hair and thin-framed glasses, medium brown skin, wearing a plain heather-grey crewneck sweatshirt, approachable smile",
+    },
+    {
+        "id": "james", "name": "James", "gender": "male", "style": "elegant",
+        "description": "a warm, distinguished man in his mid-50s with short greying hair and a trimmed grey beard, fair skin, wearing a casual open-collar denim shirt, friendly confident expression",
+    },
 ]
 _IMAGE_ACTORS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "actors")
 
@@ -3217,6 +3279,52 @@ CINEMATIC_UGC_CREDIT_COST = {
 AI_ACTOR_MODEL = "bytedance/omni-human"
 AI_ACTOR_VIDEO_CREDIT_COST = 30  # 8s x $0.14/s = $1.12 real cost, same credit-per-dollar ratio as Cinematic UGC above
 AI_ACTOR_VOICE_BY_GENDER = {"female": "nova", "male": "onyx"}
+
+# Punqle Actors v2 -- a pre-baked Veo 3.1 base clip (see
+# scripts/populate_actor_video_clips.py, actor_video_clips table)
+# redubbed with a fresh per-user narration track via Sync Labs
+# (sync/lipsync-2-pro, also on Replicate), replacing the OmniHuman
+# pipeline above once verified live. Real-spike-tested 2026-09-10/11:
+# Veo 3.1 caps single-call duration at 4-8s (a real 400 -- "Please
+# provide a value between 4 and 8, inclusive" -- confirmed live), so the
+# base clip is fixed at 8s; Sync Labs' own sync_mode "loop" stretches it
+# to match whatever narration length a given ad actually needs (real
+# tests ran clean from ~5s to ~23s of narration on an 8s base clip).
+SYNC_MODEL = "sync/lipsync-2-pro"
+ACTOR_VIDEO_V2_CREDIT_COST = AI_ACTOR_VIDEO_CREDIT_COST  # same real-cost range (~$1.00-1.30/video), reuse the existing price rather than invent a new number
+
+# Three voice engines, kept as a real user-facing dropdown rather than
+# picking one winner -- the founder's own call after a live, controlled
+# A/B/C listening test (same base clip, same script, only the engine
+# swapped) found the cost difference negligible (all three land within
+# ~$0.03-0.04 of each other per video, since Sync Labs' own cost
+# dominates regardless of which engine feeds it) and after seeing a real
+# competitor's own simple model-picker dropdown UI. "openai_natural"
+# (gpt-4o-mini-tts + instructions) won that listening test and is also
+# the cheapest of the three -- that's why it's the frontend's default,
+# not because it's hardcoded as the only option here.
+ACTOR_VOICE_ENGINES = {"openai_natural", "openai_standard", "elevenlabs"}
+OPENAI_NATURAL_TTS_MODEL = "gpt-4o-mini-tts"
+OPENAI_NATURAL_TTS_INSTRUCTIONS = (
+    "Voice: warm, natural, conversational, like talking to a close friend. "
+    "Pacing: unhurried, with genuine natural pauses at commas and sentence "
+    "breaks -- don't rush. Let real emotion build across the read rather "
+    "than staying flat. Natural breathing, not robotic."
+)
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+ELEVENLABS_MODEL = "eleven_v3"
+# One real voice per gender, pulled live from ElevenLabs' own /v2/voices
+# catalog 2026-09-10 -- not a large curated set like HeyGen's, just one
+# solid, confirmed-working pick per gender for this single feature.
+ELEVENLABS_VOICE_BY_GENDER = {
+    "female": "hpp4J3VqNfWAUOO0d1Us",  # Bella - Professional, Bright, Warm
+    "male": "TX3LPaxmHKxFdv7VOQHJ",    # Liam - Energetic, Social Media Creator
+}
+# Arcads' own real Audio Settings defaults, confirmed via the founder's
+# own screenshot of their panel -- not guessed. `speed` is added
+# separately per-call since ElevenLabs' voice_settings object doesn't
+# include it in this shape.
+ELEVENLABS_VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75, "style": 0.5}
 # Confirmed live against HeyGen's own /v2/voices catalog (2026-09-04) —
 # English has 2089 real options there, so this is a curated subset (3 per
 # gender), not the full catalog. Bangla has exactly 4 real voices total
@@ -4332,6 +4440,132 @@ def check_ai_actor_video_status(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ads/generate-actor-video-v2", response_model=ActorVideoV2StartResponse, tags=["ads"])
+@limiter.limit("5/minute")
+def start_actor_video_v2(
+    request: Request,
+    req: GenerateActorVideoV2Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Punqle Actors v2 -- a pre-baked Veo base clip (generated once per
+    actor offline, see scripts/populate_actor_video_clips.py) redubbed
+    with a fresh per-user narration track via Sync Labs. Same check-then-
+    charge, job-tracked-server-side shape as Cinematic UGC/the OmniHuman
+    endpoint above, for the same reason: Replicate's status response
+    carries no price, so success alone triggers the charge, tracked via
+    actor_video_v2_jobs keyed by Replicate's own prediction id."""
+    try:
+        narration = (req.narration or "").strip()
+        if not narration:
+            raise HTTPException(status_code=400, detail="Nothing for the actor to say.")
+
+        actor = _get_image_actor(req.actor_id)
+        if not actor:
+            raise HTTPException(status_code=400, detail="Unknown actor.")
+
+        voice_engine = req.voice_engine if req.voice_engine in ACTOR_VOICE_ENGINES else "openai_natural"
+
+        clip = _get_actor_video_clip(req.actor_id, req.situation_id)
+        if not clip:
+            raise HTTPException(status_code=503, detail="This actor isn't ready yet -- try another one.")
+
+        cost = ACTOR_VIDEO_V2_CREDIT_COST
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        audio_bytes = _synthesize_actor_voiceover(narration, actor["gender"], voice_engine)
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.replicate.com/v1/models/{SYNC_MODEL}/predictions",
+                headers=_replicate_headers(),
+                json={"input": {
+                    "video": f"data:video/mp4;base64,{clip['video_base64']}",
+                    "audio": f"data:audio/mp3;base64,{audio_b64}",
+                    "sync_mode": "loop",
+                }},
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("Replicate create prediction failed: %s", r.text)
+            raise HTTPException(status_code=502, detail="Couldn't start the actor video.")
+        prediction_id = r.json().get("id")
+        if not prediction_id:
+            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+
+        with_retry(lambda: supabase.table("actor_video_v2_jobs").insert({
+            "prediction_id": prediction_id,
+            "owner_id": user_id,
+        }).execute())
+
+        return {"prediction_id": prediction_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/actor-video-v2-status", response_model=ActorVideoV2StatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_actor_video_v2_status(
+    request: Request,
+    req: ActorVideoV2StatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("actor_video_v2_jobs")
+            .select("*")
+            .eq("prediction_id", req.prediction_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get actor video v2 job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="Actor video job not found.")
+
+        r = requests.get(
+            f"https://api.replicate.com/v1/predictions/{req.prediction_id}",
+            headers=_replicate_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+
+        if status not in ("succeeded", "failed", "canceled"):
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        with_retry(lambda: supabase.table("actor_video_v2_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+
+        if status != "succeeded":
+            logger.error("Replicate prediction %s finished as %s: %s", req.prediction_id, status, data.get("error"))
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("output")
+        if not video_url:
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=60)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        new_credits = _spend_ad_credits(user_id, ACTOR_VIDEO_V2_CREDIT_COST, "actor_video_v2")
+
+        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Replicate status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the actor video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def _mix_music_under_video_audio(video_bytes: bytes, music_bytes: bytes, music_volume: float = 0.15) -> bytes:
     """Mixes a background music track UNDER a video's existing audio
     (the avatar's dialogue) rather than replacing it — the opposite of
@@ -4498,6 +4732,78 @@ def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
     return response.content
+
+
+def _synthesize_actor_voiceover(narration: str, gender: str, voice_engine: str) -> bytes:
+    """One narration track for Punqle Actors v2, from whichever of the
+    three real, live-tested engines the caller picked (ACTOR_VOICE_ENGINES).
+    All three hand back plain audio bytes to the same Sync Labs redub step
+    afterward -- this is the only place the engines actually differ.
+
+    Real, live-confirmed finding: ElevenLabs' Stability/Similarity/Style
+    sliders have no equivalent on OpenAI's models -- sending them to
+    OpenAI's speech endpoint is silently ignored (200 OK, no effect), so
+    they're never applied outside the "elevenlabs" branch below."""
+    text = narration[:MAX_NARRATION_CHARS]
+
+    if voice_engine == "elevenlabs":
+        if not ELEVENLABS_API_KEY:
+            raise HTTPException(status_code=503, detail="That voice isn't available right now -- try a different one.")
+        voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "text": text,
+                    "model_id": ELEVENLABS_MODEL,
+                    "voice_settings": {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0},
+                },
+                timeout=30,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("ElevenLabs TTS failed: %s", r.text)
+            raise HTTPException(status_code=502, detail="Couldn't generate that voice. Try a different one.")
+        return r.content
+
+    voice = AI_ACTOR_VOICE_BY_GENDER.get(gender, TTS_VOICE)
+
+    if voice_engine == "openai_natural":
+        response = with_retry(
+            lambda: client.audio.speech.create(
+                model=OPENAI_NATURAL_TTS_MODEL,
+                voice=voice if voice in _TTS_VOICES else TTS_VOICE,
+                input=text,
+                instructions=OPENAI_NATURAL_TTS_INSTRUCTIONS,
+                speed=1.0,
+                response_format="mp3",
+            ),
+            exceptions=RETRYABLE_OPENAI_ERRORS,
+        )
+        return response.content
+
+    # "openai_standard" (or any unrecognized value) -- the existing,
+    # already-proven plain path, unchanged from the OmniHuman-era feature.
+    return _synthesize_voiceover(text, voice)
+
+
+def _get_actor_video_clip(actor_id: str, situation_id: Optional[str] = None) -> Optional[dict]:
+    """One pre-baked base clip row for the given actor. situation_id is
+    never sent by the frontend today (no situation picker exists) -- a
+    random one among that actor's available clips is picked instead, so
+    repeat generations of the same actor aren't always visually identical
+    across different businesses."""
+    query = supabase.table("actor_video_clips").select("*").eq("actor_id", actor_id)
+    if situation_id:
+        query = query.eq("situation_id", situation_id)
+    res = with_retry(lambda: query.execute())
+    res = ensure_supabase_response(res, "get actor video clip")
+    if not res.data:
+        return None
+    return random.choice(res.data)
 
 
 # Real, live-confirmed finding: whisper-1's own `language` param rejects
