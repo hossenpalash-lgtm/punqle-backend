@@ -3292,6 +3292,13 @@ AI_ACTOR_VOICE_BY_GENDER = {"female": "nova", "male": "onyx"}
 # tests ran clean from ~5s to ~23s of narration on an 8s base clip).
 SYNC_MODEL = "sync/lipsync-2-pro"
 ACTOR_VIDEO_V2_CREDIT_COST = AI_ACTOR_VIDEO_CREDIT_COST  # same real-cost range (~$1.00-1.30/video), reuse the existing price rather than invent a new number
+# Sync Labs' own `temperature` controls how expressive vs. subtle the
+# generated mouth movement is (0-1, their default 0.5). Real, controlled
+# side-by-side (same base clip, same narration audio, only temperature
+# changed) -- founder's verdict: 0.3 (subtler, tighter) looked more
+# accurate/natural than the 0.5 default and than 0.8. Not the model's own
+# default -- a real, tested choice for this specific talking-actor use case.
+SYNC_TEMPERATURE = 0.3
 
 # Three voice engines, kept as a real user-facing dropdown rather than
 # picking one winner -- the founder's own call after a live, controlled
@@ -4485,6 +4492,7 @@ def start_actor_video_v2(
                     "video": f"data:video/mp4;base64,{clip['video_base64']}",
                     "audio": f"data:audio/mp3;base64,{audio_b64}",
                     "sync_mode": "loop",
+                    "temperature": SYNC_TEMPERATURE,
                 }},
                 timeout=20,
             ),
