@@ -430,6 +430,18 @@ class AiActorVideoStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+# Real, optional per-field overrides for ElevenLabs' own voice_settings
+# -- ignored entirely for the two OpenAI engines, which have no
+# equivalent (confirmed live: OpenAI's speech endpoint silently ignores
+# these fields if sent). Defaults (None) fall back to
+# ELEVENLABS_VOICE_SETTINGS, matching every caller before this existed.
+class ElevenLabsVoiceSettings(BaseModel):
+    stability: Optional[float] = None
+    similarity_boost: Optional[float] = None
+    style: Optional[float] = None
+    speed: Optional[float] = None
+
+
 # Punqle Actors v2 -- pre-baked Veo base clip (per actor) redubbed with a
 # fresh per-user narration track via Sync Labs, replacing the OmniHuman
 # pipeline above once verified live. voice_engine is a real user-facing
@@ -439,6 +451,7 @@ class GenerateActorVideoV2Request(BaseModel):
     narration: str
     voice_engine: str = "openai_natural"
     situation_id: Optional[str] = None  # omitted by the frontend today; picked at random among the actor's clips when unset
+    elevenlabs_settings: Optional[ElevenLabsVoiceSettings] = None
 
 
 class ActorVideoV2StartResponse(BaseModel):
@@ -4512,7 +4525,7 @@ def start_actor_video_v2(
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
-        audio_bytes = _synthesize_actor_voiceover(narration, actor["gender"], voice_engine)
+        audio_bytes = _synthesize_actor_voiceover(narration, actor["gender"], voice_engine, req.elevenlabs_settings)
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
         r = with_retry(
@@ -4773,7 +4786,12 @@ def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
     return response.content
 
 
-def _synthesize_actor_voiceover(narration: str, gender: str, voice_engine: str) -> bytes:
+def _synthesize_actor_voiceover(
+    narration: str,
+    gender: str,
+    voice_engine: str,
+    elevenlabs_settings: Optional["ElevenLabsVoiceSettings"] = None,
+) -> bytes:
     """One narration track for Punqle Actors v2, from whichever of the
     three real, live-tested engines the caller picked (ACTOR_VOICE_ENGINES).
     All three hand back plain audio bytes to the same Sync Labs redub step
@@ -4782,13 +4800,18 @@ def _synthesize_actor_voiceover(narration: str, gender: str, voice_engine: str) 
     Real, live-confirmed finding: ElevenLabs' Stability/Similarity/Style
     sliders have no equivalent on OpenAI's models -- sending them to
     OpenAI's speech endpoint is silently ignored (200 OK, no effect), so
-    they're never applied outside the "elevenlabs" branch below."""
+    they're never applied outside the "elevenlabs" branch below.
+    elevenlabs_settings (a real, user-facing "Audio Settings" panel,
+    added 2026-09-11) overrides ELEVENLABS_VOICE_SETTINGS per-field when
+    provided -- None (the default) reproduces today's exact behavior."""
     text = narration[:MAX_NARRATION_CHARS]
 
     if voice_engine == "elevenlabs":
         if not ELEVENLABS_API_KEY:
             raise HTTPException(status_code=503, detail="That voice isn't available right now -- try a different one.")
         voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
+        overrides = elevenlabs_settings.model_dump(exclude_none=True) if elevenlabs_settings else {}
+        voice_settings = {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0, **overrides}
         r = with_retry(
             lambda: requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -4796,7 +4819,7 @@ def _synthesize_actor_voiceover(narration: str, gender: str, voice_engine: str) 
                 json={
                     "text": text,
                     "model_id": ELEVENLABS_MODEL,
-                    "voice_settings": {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0},
+                    "voice_settings": voice_settings,
                 },
                 timeout=30,
             ),
