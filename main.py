@@ -325,6 +325,20 @@ class ImageActorsListResponse(BaseModel):
     actors: list[ImageActorOut]
 
 
+# Punqle Actors v2's real situation library -- each of the 16 actors has
+# exactly one distinct pre-baked situation (see
+# scripts/populate_actor_video_clips.py), surfaced here so the frontend
+# can show it (e.g. "Maya — Coffee Shop") and know which actors are
+# actually generation-ready versus still pending population.
+class ActorSituationOut(BaseModel):
+    actor_id: str
+    situation_id: str
+
+
+class ActorSituationsListResponse(BaseModel):
+    situations: list[ActorSituationOut]
+
+
 class GenerateAvatarVideoRequest(BaseModel):
     narration: str
     avatar_id: str
@@ -2902,6 +2916,18 @@ def list_image_actors(user_id: str = Depends(get_current_user_id)):
             "style": a["style"], "preview_image_base64": preview_b64,
         })
     return {"actors": actors}
+
+
+@app.get("/ads/actor-situations", response_model=ActorSituationsListResponse, tags=["ads"])
+def list_actor_situations(user_id: str = Depends(get_current_user_id)):
+    """Free -- which actors are actually generation-ready right now (have
+    a real pre-baked clip in actor_video_clips) and what situation each
+    one is in. Deliberately excludes video_base64 (the picker only needs
+    the label + readiness, not the clip itself) to keep this payload
+    small regardless of library size."""
+    res = with_retry(lambda: supabase.table("actor_video_clips").select("actor_id, situation_id").execute())
+    res = ensure_supabase_response(res, "list actor situations")
+    return {"situations": res.data or []}
 
 
 def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str, aspect_ratio: str = "square") -> bytes:
