@@ -65,7 +65,7 @@ _ACTOR_SITUATIONS = {
     ),
     "liam": (
         "a friendly young man in his mid-20s with short dark brown hair, light stubble, tan skin, wearing a relaxed denim jacket over a white t-shirt",
-        "car", "sitting in the driver's seat of a car, parked, natural daylight through the windows, one hand on the wheel",
+        "car", "sitting in the driver's seat of a car, parked, natural daylight through the windows, the steering wheel clearly visible in frame low in shot, one hand resting on top of the wheel and gesturing naturally with the other while talking, genuinely looking like he is about to drive, not just sitting in the back seat",
     ),
     "sofia": (
         "a confident professional woman in her late 30s with sleek straight black hair, fair skin, wearing a tailored charcoal blazer over a white blouse",
