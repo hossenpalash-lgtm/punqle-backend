@@ -6,6 +6,7 @@ from pydantic import BaseModel, field_validator
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
 from google import genai
 from google.genai import types as genai_types
+from google.genai import errors as genai_errors
 from supabase import create_client
 from postgrest.exceptions import APIError
 from dotenv import load_dotenv
@@ -132,6 +133,27 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONRespons
 
 
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
+
+
+def _gemini_client_error_handler(request: Request, exc: genai_errors.ClientError) -> JSONResponse:
+    # Global safety net for any future Gemini call site that doesn't
+    # catch this itself -- see _gemini_error_detail() below for the real
+    # fix, which is needed at each existing route's own try/except
+    # (FastAPI's global handlers never see an exception a route's own
+    # `except Exception` already caught and re-raised as an HTTPException).
+    status = exc.code or 502
+    detail = _gemini_error_detail(status)
+    logger.error("Gemini ClientError (status %s): %s", status, str(exc), exc_info=True)
+    return JSONResponse({"detail": detail}, status_code=503)
+
+
+def _gemini_error_detail(status: int) -> str:
+    if status == 429:
+        return "AI generation is temporarily at capacity — please try again in a few minutes."
+    return "Something went wrong generating that. Please try again."
+
+
+app.add_exception_handler(genai_errors.ClientError, _gemini_client_error_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 # -----------------------
@@ -3923,6 +3945,12 @@ def start_video_generation(
         return {"operation": operation.model_dump(mode="json"), "headline": script["headline"], "narration": script["narration"]}
     except HTTPException:
         raise
+    except genai_errors.ClientError as e:
+        # Real, live-caught bug (2026-09-11): this bare-except used to
+        # leak Gemini's raw error text (including a real 429
+        # RESOURCE_EXHAUSTED quota message) straight into the response.
+        logger.error("Gemini ClientError (status %s): %s", e.code, str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=_gemini_error_detail(e.code or 502))
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -3980,6 +4008,9 @@ def check_video_status(
         }
     except HTTPException:
         raise
+    except genai_errors.ClientError as e:
+        logger.error("Gemini ClientError (status %s): %s", e.code, str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=_gemini_error_detail(e.code or 502))
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5468,6 +5499,9 @@ def start_tryon_animation(
         return {"operation": operation.model_dump(mode="json")}
     except HTTPException:
         raise
+    except genai_errors.ClientError as e:
+        logger.error("Gemini ClientError (status %s): %s", e.code, str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=_gemini_error_detail(e.code or 502))
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5509,6 +5543,9 @@ def check_tryon_animation_status(
         }
     except HTTPException:
         raise
+    except genai_errors.ClientError as e:
+        logger.error("Gemini ClientError (status %s): %s", e.code, str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=_gemini_error_detail(e.code or 502))
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
