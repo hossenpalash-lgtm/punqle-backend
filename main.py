@@ -2930,6 +2930,27 @@ def list_actor_situations(user_id: str = Depends(get_current_user_id)):
     return {"situations": res.data or []}
 
 
+@app.get("/ads/actor-preview-video", tags=["ads"])
+def get_actor_preview_video(actor_id: str, user_id: str = Depends(get_current_user_id)):
+    """Free -- raw MP4 bytes (not base64/JSON) for one actor's pre-baked
+    clip, so the frontend can use it directly as a <video> source via a
+    fetch-to-blob-URL (same "load only on hover" principle as the HeyGen
+    avatar picker's preview_video_url, adapted for a clip that isn't
+    already at a public CDN URL of its own -- serving raw bytes here
+    avoids ~33% base64 bloat on top of returning all 16 clips' JSON
+    upfront, which /ads/actor-situations deliberately doesn't do)."""
+    res = with_retry(lambda: supabase.table("actor_video_clips")
+        .select("video_base64")
+        .eq("actor_id", actor_id)
+        .limit(1)
+        .execute())
+    res = ensure_supabase_response(res, "get actor preview video")
+    if not res.data:
+        raise HTTPException(status_code=404, detail="No preview available for that actor yet.")
+    video_bytes = base64.b64decode(res.data[0]["video_base64"])
+    return Response(content=video_bytes, media_type="video/mp4")
+
+
 def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str, aspect_ratio: str = "square") -> bytes:
     """Edits the user's own photo (background only) via Gemini —
     deliberately does NOT ask the model to add any text to the image. Text
