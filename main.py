@@ -463,7 +463,7 @@ class ElevenLabsVoiceSettings(BaseModel):
 class GenerateActorVideoV2Request(BaseModel):
     actor_id: str
     narration: str
-    voice_engine: str = "openai_natural"
+    voice_engine: str = "openai_standard"
     situation_id: Optional[str] = None  # omitted by the frontend today; picked at random among the actor's clips when unset
     elevenlabs_settings: Optional[ElevenLabsVoiceSettings] = None
 
@@ -3389,9 +3389,11 @@ SYNC_TEMPERATURE = 0.3
 # ~$0.03-0.04 of each other per video, since Sync Labs' own cost
 # dominates regardless of which engine feeds it) and after seeing a real
 # competitor's own simple model-picker dropdown UI. "openai_natural"
-# (gpt-4o-mini-tts + instructions) won that listening test and is also
-# the cheapest of the three -- that's why it's the frontend's default,
-# not because it's hardcoded as the only option here.
+# (gpt-4o-mini-tts + instructions) won that first listening test, but a
+# later, separate comparison against a saved reference clip (2026-09-11)
+# found "openai_standard" (plain tts-1-hd)'s brisker pace more natural
+# than Natural's "unhurried" instructed pacing -- Standard is now the
+# frontend's default. Both stay real, selectable options either way.
 ACTOR_VOICE_ENGINES = {"openai_natural", "openai_standard", "elevenlabs"}
 OPENAI_NATURAL_TTS_MODEL = "gpt-4o-mini-tts"
 OPENAI_NATURAL_TTS_INSTRUCTIONS = (
@@ -4561,7 +4563,7 @@ def start_actor_video_v2(
         if not actor:
             raise HTTPException(status_code=400, detail="Unknown actor.")
 
-        voice_engine = req.voice_engine if req.voice_engine in ACTOR_VOICE_ENGINES else "openai_natural"
+        voice_engine = req.voice_engine if req.voice_engine in ACTOR_VOICE_ENGINES else "openai_standard"
 
         clip = _get_actor_video_clip(req.actor_id, req.situation_id)
         if not clip:
