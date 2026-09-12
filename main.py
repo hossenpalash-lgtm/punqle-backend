@@ -19,6 +19,7 @@ import os
 import json
 import re
 import time
+import math
 import random
 import logging
 import base64
@@ -419,6 +420,48 @@ class CinematicUgcStatusRequest(BaseModel):
 
 
 class CinematicUgcStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
+IMAGE_TO_VIDEO_MODELS = {"veo_3_1", "kling_3_pro", "seedance_2_5"}
+
+
+class GenerateImageToVideoRequest(BaseModel):
+    image_base64: str
+    image_mime_type: str = "image/png"
+    prompt: str
+    model: str = "kling_3_pro"
+    duration_seconds: int = 5
+    aspect_ratio: str = "9:16"
+
+    @field_validator("model")
+    @classmethod
+    def validate_image_to_video_model(cls, v):
+        if v not in IMAGE_TO_VIDEO_MODELS:
+            raise ValueError(f"model must be one of: {', '.join(sorted(IMAGE_TO_VIDEO_MODELS))}")
+        return v
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_image_to_video_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16", "1:1"):
+            raise ValueError("aspect_ratio must be '16:9', '9:16', or '1:1'")
+        return v
+
+
+class ImageToVideoStartResponse(BaseModel):
+    job_id: str
+    operation: Optional[dict] = None
+
+
+class ImageToVideoStatusRequest(BaseModel):
+    job_id: str
+    operation: Optional[dict] = None
+
+
+class ImageToVideoStatusResponse(BaseModel):
     done: bool
     video_base64: Optional[str] = None
     credits_remaining: Optional[int] = None
@@ -3458,6 +3501,31 @@ CINEMATIC_UGC_CREDIT_COST = {
     "premium": 46,   # 8s x ~$0.231/s = ~$1.85 real cost
 }
 
+# Image -> video tool: turn an already-generated image into a short clip,
+# the home page's own "Video" action on a generated image -- matches a
+# real competitor's own simple "prompt + reference image + pick a model
+# + pick a length -> generate" flow, reviewed frame-by-frame from a real
+# tutorial video 2026-09-13. Scoped to the 3 models Punqle can actually
+# call today: Veo 3.1 (already integrated, Gemini's own 4-8s hard cap,
+# confirmed live) and Kling 3.0 Pro / Seedance 2.5 (both via Replicate).
+# Sora 2/Sora 2 Pro deliberately excluded -- OpenAI's own Videos API for
+# these models is shutting down 2026-09-24, too close to build against
+# now. Kling 2.6 Pro/Seedance 1.5/Grok Video also excluded -- the ask
+# was for a simple picker, not every option Arcads happens to show.
+KLING_MODEL = "kwaivgi/kling-v3-video"
+IMAGE_TO_VIDEO_MIN_DURATION = {"veo_3_1": 4, "kling_3_pro": 3, "seedance_2_5": 3}
+IMAGE_TO_VIDEO_MAX_DURATION = {"veo_3_1": 8, "kling_3_pro": 15, "seedance_2_5": 15}
+IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
+    "veo_3_1": 1.25,      # matches the existing VIDEO_CREDIT_COST=10 for Veo's fixed 8s
+    "seedance_2_5": 6,    # matches Cinematic UGC's real, billed 720p rate (~$0.231/s x 25 credits/$)
+    "kling_3_pro": 8,     # PROVISIONAL -- no real billed Replicate invoice checked yet for
+                           # Kling 3.0 Pro specifically (its own pricing page shows no $ figure).
+                           # Set deliberately above Seedance's known real rate since "pro" mode
+                           # targets 1080p. Correct this once a real generation's actual billed
+                           # cost is checked, same as Cinematic UGC's own rate was corrected
+                           # after its first real invoice.
+}
+
 # AI Actor talking video (OmniHuman, via Replicate) — a fourth video
 # path: like Avatar (HeyGen), a presenter reads your script, but using
 # Punqle's own _IMAGE_AD_ACTORS instead of HeyGen's stock catalog.
@@ -4518,6 +4586,219 @@ def check_cinematic_ugc_status(
     except requests.RequestException as e:
         logger.error("Replicate status error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=502, detail="Couldn't check the cinematic video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-image-video", response_model=ImageToVideoStartResponse, tags=["ads"])
+@limiter.limit("5/minute")
+def start_image_to_video(
+    request: Request,
+    req: GenerateImageToVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Turns an already-generated image into a short video -- the home
+    page's own "Video" action on a generated image (prompt + reference
+    image auto-attached + pick a model + pick a length + generate),
+    matching a real competitor's own simplest tool exactly.
+
+    Dispatches to one of 3 real vendor paths depending on req.model:
+    Veo (Gemini's own stateless operation handle) or Kling 3.0 Pro /
+    Seedance 2.5 (both Replicate, prediction-id-tracked). Duration is
+    clamped server-side to each model's own real range before any cost
+    is computed or any vendor is called, and the clamped model+duration
+    are written into image_to_video_jobs (keyed by our own job id, not
+    Replicate's) so the poll endpoint never has to trust either value
+    back from the client -- same reasoning as cinematic_ugc_jobs's own
+    tier tracking."""
+    try:
+        model = req.model
+        duration = max(
+            IMAGE_TO_VIDEO_MIN_DURATION[model],
+            min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
+        )
+        cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model])
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        prompt = req.prompt.strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Describe the motion you want.")
+        if not req.image_base64:
+            raise HTTPException(status_code=400, detail="Missing the image to animate.")
+
+        if model == "veo_3_1":
+            if gemini_client is None:
+                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+            image = genai_types.Image(
+                image_bytes=base64.b64decode(req.image_base64),
+                mime_type=req.image_mime_type,
+            )
+            # Real, live-caught error (2026-09-13): Veo only accepts
+            # "16:9"/"9:16" -- confirmed via a real 400 INVALID_ARGUMENT
+            # when "1:1" was sent (the home page's own generated images
+            # are square). Kling/Seedance don't have this restriction
+            # (Kling ignores aspect_ratio entirely once a start_image is
+            # given), so this clamp is Veo-specific, not applied above.
+            veo_aspect_ratio = req.aspect_ratio if req.aspect_ratio in ("16:9", "9:16") else "9:16"
+            operation = gemini_client.models.generate_videos(
+                model=VEO_MODEL,
+                prompt=prompt,
+                image=image,
+                config=genai_types.GenerateVideosConfig(
+                    aspect_ratio=veo_aspect_ratio,
+                    resolution="720p",
+                    duration_seconds=str(duration),
+                ),
+            )
+            job_res = with_retry(lambda: supabase.table("image_to_video_jobs").insert({
+                "owner_id": user_id,
+                "model": model,
+                "duration_seconds": duration,
+            }).execute())
+            job_id = ensure_supabase_response(job_res, "create image-to-video job").data[0]["id"]
+            return {"job_id": job_id, "operation": operation.model_dump(mode="json")}
+
+        replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
+        image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
+        if model == "kling_3_pro":
+            input_body = {
+                "prompt": prompt,
+                "start_image": image_uri,
+                "duration": duration,
+                "mode": "pro",
+                "generate_audio": False,
+            }
+        else:
+            input_body = {
+                "prompt": prompt,
+                "image": image_uri,
+                "duration": duration,
+                "resolution": "720p",
+                "aspect_ratio": req.aspect_ratio,
+                "generate_audio": False,
+            }
+
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.replicate.com/v1/models/{replicate_model_id}/predictions",
+                headers=_replicate_headers(),
+                json={"input": input_body},
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("Replicate create prediction failed (%s): %s", model, r.text)
+            raise HTTPException(status_code=502, detail="Couldn't start the video.")
+        prediction_id = r.json().get("id")
+        if not prediction_id:
+            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+
+        job_res = with_retry(lambda: supabase.table("image_to_video_jobs").insert({
+            "owner_id": user_id,
+            "model": model,
+            "duration_seconds": duration,
+            "prediction_id": prediction_id,
+        }).execute())
+        job_id = ensure_supabase_response(job_res, "create image-to-video job").data[0]["id"]
+
+        return {"job_id": job_id, "operation": None}
+    except HTTPException:
+        raise
+    except genai_errors.ClientError as e:
+        logger.error("Gemini ClientError (status %s): %s", e.code, str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=_gemini_error_detail(e.code or 502))
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/image-video-status", response_model=ImageToVideoStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_image_to_video_status(
+    request: Request,
+    req: ImageToVideoStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("image_to_video_jobs")
+            .select("*")
+            .eq("id", req.job_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get image-to-video job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="Video job not found.")
+        job = job_res.data[0]
+        model = job["model"]
+        duration = job["duration_seconds"]
+
+        if model == "veo_3_1":
+            if gemini_client is None:
+                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+            if not req.operation:
+                raise HTTPException(status_code=400, detail="Missing operation handle.")
+            operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
+            operation = gemini_client.operations.get(operation)
+            if not operation.done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            if operation.error:
+                with_retry(lambda: supabase.table("image_to_video_jobs").delete().eq("id", req.job_id).execute())
+                raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
+            result = operation.result or operation.response
+            if not result or not result.generated_videos:
+                with_retry(lambda: supabase.table("image_to_video_jobs").delete().eq("id", req.job_id).execute())
+                raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
+            video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
+            with_retry(lambda: supabase.table("image_to_video_jobs").delete().eq("id", req.job_id).execute())
+            cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND["veo_3_1"])
+            new_credits = _spend_ad_credits(user_id, cost, "image_to_video", "veo_3_1")
+            return {
+                "done": True,
+                "video_base64": base64.b64encode(video_bytes).decode("ascii"),
+                "credits_remaining": new_credits,
+            }
+
+        prediction_id = job["prediction_id"]
+        r = requests.get(
+            f"https://api.replicate.com/v1/predictions/{prediction_id}",
+            headers=_replicate_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+        if status not in ("succeeded", "failed", "canceled"):
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        with_retry(lambda: supabase.table("image_to_video_jobs").delete().eq("id", req.job_id).execute())
+
+        if status != "succeeded":
+            logger.error("Replicate prediction %s (%s) finished as %s: %s", prediction_id, model, status, data.get("error"))
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("output")
+        if isinstance(video_url, list):
+            video_url = video_url[0] if video_url else None
+        if not video_url:
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=60)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model])
+        new_credits = _spend_ad_credits(user_id, cost, "image_to_video", model)
+
+        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Replicate status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the video's status.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
