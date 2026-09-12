@@ -2793,6 +2793,36 @@ ASPECT_RATIO_GEMINI_VALUES = {
     "story": "9:16",
 }
 
+# Multi-model image picker for the text-to-image (no-photo-uploaded) path —
+# matches a real competitor's own lightweight model-dropdown pattern (same
+# "small, low-friction choice" precedent already used for the actor voice-
+# engine picker). Scoped to _generate_ai_banner_image only for now, not the
+# photo-edit/compositing paths — those are Gemini-specific edit operations
+# ("keep the product exactly as-is") that a from-scratch generator like GPT
+# Image isn't built for. Real per-model tradeoff: gpt-image-1's smallest
+# offered sizes are 1024x1024/1024x1536/1536x1024 -- no exact 4:5 or 9:16,
+# so "feed"/"story" both map to the closest portrait size (1024x1536, ~2:3)
+# rather than Gemini's exact 4:5/9:16 -- an honest, minor approximation.
+#
+# "nano_banana_pro"/"nano_banana_2" real model IDs confirmed live 2026-09-12
+# (gemini-3-pro-image and gemini-3.1-flash-image both succeed with the
+# existing GEMINI_API_KEY) -- these are newer than gemini-2.5-flash-image,
+# which is what every OTHER image call in this file still uses. Deliberately
+# NOT swapping those other call sites' model string as part of this change --
+# that's a real, separate decision (quality/cost/behavior could differ
+# app-wide) worth its own explicit go-ahead, not a silent side effect of
+# adding a picker.
+IMAGE_GEN_MODELS = {"nano_banana_pro", "nano_banana_2", "gpt_image"}
+GEMINI_IMAGE_MODEL_BY_CHOICE = {
+    "nano_banana_pro": "gemini-3-pro-image",
+    "nano_banana_2": "gemini-3.1-flash-image",
+}
+GPT_IMAGE_SIZE_BY_ASPECT_RATIO = {
+    "square": "1024x1024",
+    "feed": "1024x1536",
+    "story": "1024x1536",
+}
+
 
 # A small, hardcoded, curated library — same "small curated set, not a
 # live vendor catalog" pattern as _HEYGEN_VOICES below. Every persona is
@@ -3053,6 +3083,7 @@ def _generate_ai_banner_image(
     category: str = "other",
     aspect_ratio: str = "square",
     actor_description: Optional[str] = None,
+    model: str = "nano_banana_pro",
 ) -> bytes:
     """Generates a banner image from scratch (no real photo) for users
     without one to upload. The pictured product is AI-imagined rather than
@@ -3065,9 +3096,14 @@ def _generate_ai_banner_image(
     text-to-image call unchanged. When the user uploads their own photo
     instead, see _generate_banner_image_with_actor — a separate function
     doing real two-image compositing, validated via a live spike before
-    it shipped (see that function's own docstring)."""
-    if gemini_client is None:
-        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+    it shipped (see that function's own docstring).
+
+    model: one of IMAGE_GEN_MODELS. Only this from-scratch path offers a
+    choice — the photo-edit/compositing functions above are Gemini-specific
+    edit operations a from-scratch generator like GPT Image isn't built
+    for, so they stay on Nano Banana Pro regardless of this setting."""
+    if model not in IMAGE_GEN_MODELS:
+        model = "nano_banana_pro"
 
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     shape_instruction = ASPECT_RATIO_PROMPTS.get(aspect_ratio, ASPECT_RATIO_PROMPTS["square"])
@@ -3086,9 +3122,31 @@ def _generate_ai_banner_image(
         "leave clean, uncluttered space (e.g. near the top or bottom) where text "
         f"will be added afterward by a separate step. {shape_instruction}"
     )
+
+    if model == "gpt_image":
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=503, detail="That image model isn't available right now — try a different one.")
+        # The shared `client`'s 30s timeout is tuned for quick TTS/text
+        # calls (confirmed live 2026-09-12: image generation routinely
+        # takes longer and was timing out at 30s) -- override per-call
+        # rather than raising the shared client's timeout for everything.
+        response = with_retry(
+            lambda: client.with_options(timeout=90.0).images.generate(
+                model="gpt-image-1",
+                prompt=prompt,
+                size=GPT_IMAGE_SIZE_BY_ASPECT_RATIO.get(aspect_ratio, "1024x1024"),
+                n=1,
+            ),
+            exceptions=RETRYABLE_OPENAI_ERRORS,
+        )
+        return base64.b64decode(response.data[0].b64_json)
+
+    if gemini_client is None:
+        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+    gemini_model = GEMINI_IMAGE_MODEL_BY_CHOICE.get(model, GEMINI_IMAGE_MODEL_BY_CHOICE["nano_banana_pro"])
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=gemini_model,
             contents=[prompt],
             config=genai_types.GenerateContentConfig(
                 image_config=genai_types.ImageConfig(
@@ -3112,6 +3170,7 @@ async def _get_banner_image(
     category: str,
     aspect_ratio: str = "square",
     actor_id: Optional[str] = None,
+    model: str = "nano_banana_pro",
 ) -> bytes:
     # Gemini image generation is a blocking call and can take well over a
     # minute (especially generating from scratch, no reference photo) — run
@@ -3130,7 +3189,7 @@ async def _get_banner_image(
         return await run_in_threadpool(_generate_banner_image, image_bytes, mime_type or "image/jpeg", item_description, aspect_ratio)
     actor = _get_image_actor(actor_id) if actor_id else None
     actor_description = actor["description"] if actor else None
-    return await run_in_threadpool(_generate_ai_banner_image, item_description, category, aspect_ratio, actor_description)
+    return await run_in_threadpool(_generate_ai_banner_image, item_description, category, aspect_ratio, actor_description, model)
 
 
 def _remove_background(image_bytes: bytes, mime_type: str) -> bytes:
@@ -3203,12 +3262,15 @@ async def generate_ad(
     item_description: str,
     aspect_ratio: str = "square",
     actor_id: Optional[str] = None,
+    model: str = "nano_banana_pro",
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
     try:
         if aspect_ratio not in ASPECT_RATIO_PROMPTS:
             aspect_ratio = "square"
+        if model not in IMAGE_GEN_MODELS:
+            model = "nano_banana_pro"
         credits = _get_ad_credits(user_id)
         if credits <= 0:
             raise HTTPException(
@@ -3221,7 +3283,7 @@ async def generate_ad(
         category = _get_business_category(user_id)
 
         copy = _generate_ad_copy(item_description, category)
-        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id)
+        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id, model)
 
         new_credits = _spend_ad_credit(user_id, "image_generate")
         banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
@@ -3246,6 +3308,7 @@ async def generate_ad_image_variant(
     item_description: str,
     aspect_ratio: str = "square",
     actor_id: Optional[str] = None,
+    model: str = "nano_banana_pro",
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
@@ -3256,6 +3319,8 @@ async def generate_ad_image_variant(
     try:
         if aspect_ratio not in ASPECT_RATIO_PROMPTS:
             aspect_ratio = "square"
+        if model not in IMAGE_GEN_MODELS:
+            model = "nano_banana_pro"
         credits = _get_ad_credits(user_id)
         if credits <= 0:
             raise HTTPException(
@@ -3266,9 +3331,54 @@ async def generate_ad_image_variant(
         image_bytes = await file.read() if file is not None else None
         mime_type = file.content_type if file is not None else None
         category = _get_business_category(user_id)
-        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id)
+        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id, model)
 
         new_credits = _spend_ad_credit(user_id, "image_variant")
+
+        return {
+            "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-image", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def generate_image_direct(
+    request: Request,
+    prompt: str,
+    aspect_ratio: str = "square",
+    model: str = "nano_banana_pro",
+    user_id: str = Depends(get_current_user_id),
+):
+    """A standalone, no-frills text-to-image generator — the home page's
+    prompt box + Settings (model picker), matching a real competitor's own
+    simple "type a prompt, pick a model, generate" tool exactly (no ad
+    copy, no goal/platform/actor framing — those stay Ad Creation's job).
+    Reuses _generate_ai_banner_image unchanged; the caller's free-form
+    prompt is passed straight through as item_description."""
+    try:
+        if not prompt.strip():
+            raise HTTPException(status_code=400, detail="Describe what you want to create.")
+        if aspect_ratio not in ASPECT_RATIO_PROMPTS:
+            aspect_ratio = "square"
+        if model not in IMAGE_GEN_MODELS:
+            model = "nano_banana_pro"
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+
+        banner_bytes = await run_in_threadpool(
+            _generate_ai_banner_image, prompt.strip(), "other", aspect_ratio, None, model,
+        )
+        new_credits = _spend_ad_credit(user_id, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
