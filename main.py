@@ -467,6 +467,54 @@ class ImageToVideoStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+class GenerateTalkingVideoRequest(BaseModel):
+    image_base64: str
+    image_mime_type: str = "image/png"
+    narration: str
+    voice_gender: str = "female"
+    model: str = "kling_3_pro"
+    duration_seconds: int = 5
+    aspect_ratio: str = "9:16"
+
+    @field_validator("model")
+    @classmethod
+    def validate_talking_video_model(cls, v):
+        if v not in IMAGE_TO_VIDEO_MODELS:
+            raise ValueError(f"model must be one of: {', '.join(sorted(IMAGE_TO_VIDEO_MODELS))}")
+        return v
+
+    @field_validator("voice_gender")
+    @classmethod
+    def validate_talking_video_voice_gender(cls, v):
+        if v not in ("female", "male"):
+            raise ValueError("voice_gender must be 'female' or 'male'")
+        return v
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_talking_video_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16", "1:1"):
+            raise ValueError("aspect_ratio must be '16:9', '9:16', or '1:1'")
+        return v
+
+
+class TalkingVideoStartResponse(BaseModel):
+    job_id: str
+    operation: Optional[dict] = None
+
+
+class TalkingVideoStatusRequest(BaseModel):
+    job_id: str
+    operation: Optional[dict] = None
+
+
+class TalkingVideoStatusResponse(BaseModel):
+    done: bool
+    stage: str = "animating"
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 class GenerateAiActorVideoRequest(BaseModel):
     actor_id: str
     narration: str
@@ -3626,6 +3674,18 @@ IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
                            # after its first real invoice.
 }
 
+# Talking video -- the Video action's optional "Add spoken narration"
+# path: animate the image (same models/cost as above, generate_audio
+# still False) then Sync Labs-redub real TTS narration onto it, reusing
+# the exact pre-bake+redub mechanics already proven in Punqle Actors v2
+# (SYNC_MODEL/SYNC_TEMPERATURE below). Flat surcharge on top of the
+# per-second motion cost -- Sync Labs' own real cost for a clip this
+# short (~5-8s) is modest and doesn't scale as steeply as the motion
+# generation itself, so a flat number is simpler than a second per-
+# second rate; correct once a real invoice is checked, same as the
+# other PROVISIONAL rates above.
+TALKING_VIDEO_REDUB_SURCHARGE = 10
+
 # AI Actor talking video (OmniHuman, via Replicate) — a fourth video
 # path: like Avatar (HeyGen), a presenter reads your script, but using
 # Punqle's own _IMAGE_AD_ACTORS instead of HeyGen's stock catalog.
@@ -4894,6 +4954,276 @@ def check_image_to_video_status(
         new_credits = _spend_ad_credits(user_id, cost, "image_to_video", model)
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Replicate status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-talking-video", response_model=TalkingVideoStartResponse, tags=["ads"])
+@limiter.limit("5/minute")
+def start_talking_video(
+    request: Request,
+    req: GenerateTalkingVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """The Video action's "Add spoken narration" path -- animates the
+    image exactly like start_image_to_video (same 3 models, same
+    generate_audio=False), then lip-sync redubs real narration onto it
+    via Sync Labs, reusing the exact pre-bake+redub mechanics already
+    proven in Punqle Actors v2 (see start_actor_video_v2 above). Two
+    separate async Replicate/Gemini jobs chained behind one client-
+    facing job id -- talking_video_jobs tracks which stage a job is in
+    so the poll endpoint knows whether it's still waiting on the silent
+    motion clip or the redub. Charged once, only after the final
+    redubbed video is in hand (motion-cost + TALKING_VIDEO_REDUB_SURCHARGE),
+    never on partial success."""
+    try:
+        model = req.model
+        duration = max(
+            IMAGE_TO_VIDEO_MIN_DURATION[model],
+            min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
+        )
+        cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        narration = req.narration.strip()
+        if not narration:
+            raise HTTPException(status_code=400, detail="Write what they should say.")
+        if not req.image_base64:
+            raise HTTPException(status_code=400, detail="Missing the image to animate.")
+
+        if model == "veo_3_1":
+            if gemini_client is None:
+                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+            image = genai_types.Image(
+                image_bytes=base64.b64decode(req.image_base64),
+                mime_type=req.image_mime_type,
+            )
+            veo_aspect_ratio = req.aspect_ratio if req.aspect_ratio in ("16:9", "9:16") else "9:16"
+            operation = gemini_client.models.generate_videos(
+                model=VEO_MODEL,
+                prompt="A person naturally talking to the camera, subtle head and hand movement, no on-screen text.",
+                image=image,
+                config=genai_types.GenerateVideosConfig(
+                    aspect_ratio=veo_aspect_ratio,
+                    resolution="720p",
+                    duration_seconds=str(duration),
+                ),
+            )
+            job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
+                "owner_id": user_id,
+                "model": model,
+                "duration_seconds": duration,
+                "narration": narration,
+                "voice_gender": req.voice_gender,
+                "stage": "animating",
+            }).execute())
+            job_id = ensure_supabase_response(job_res, "create talking video job").data[0]["id"]
+            return {"job_id": job_id, "operation": operation.model_dump(mode="json")}
+
+        replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
+        image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
+        motion_prompt = "A person naturally talking to the camera, subtle head and hand movement, no on-screen text."
+        if model == "kling_3_pro":
+            input_body = {
+                "prompt": motion_prompt,
+                "start_image": image_uri,
+                "duration": duration,
+                "mode": "pro",
+                "generate_audio": False,
+            }
+        else:
+            input_body = {
+                "prompt": motion_prompt,
+                "image": image_uri,
+                "duration": duration,
+                "resolution": "720p",
+                "aspect_ratio": req.aspect_ratio,
+                "generate_audio": False,
+            }
+
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.replicate.com/v1/models/{replicate_model_id}/predictions",
+                headers=_replicate_headers(),
+                json={"input": input_body},
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("Replicate create prediction failed (%s): %s", model, r.text)
+            raise HTTPException(status_code=502, detail="Couldn't start the video.")
+        prediction_id = r.json().get("id")
+        if not prediction_id:
+            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+
+        job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
+            "owner_id": user_id,
+            "model": model,
+            "duration_seconds": duration,
+            "narration": narration,
+            "voice_gender": req.voice_gender,
+            "stage": "animating",
+            "prediction_id": prediction_id,
+        }).execute())
+        job_id = ensure_supabase_response(job_res, "create talking video job").data[0]["id"]
+
+        return {"job_id": job_id, "operation": None}
+    except HTTPException:
+        raise
+    except genai_errors.ClientError as e:
+        logger.error("Gemini ClientError (status %s): %s", e.code, str(e), exc_info=True)
+        raise HTTPException(status_code=503, detail=_gemini_error_detail(e.code or 502))
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _start_sync_redub(video_bytes: bytes, audio_bytes: bytes) -> str:
+    """Shared with start_actor_video_v2's own inline version of this
+    call -- kept as its own helper here since the talking-video chain
+    calls it from inside a poll endpoint, not a start endpoint."""
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+    video_b64 = base64.b64encode(video_bytes).decode("ascii")
+    r = with_retry(
+        lambda: requests.post(
+            f"https://api.replicate.com/v1/models/{SYNC_MODEL}/predictions",
+            headers=_replicate_headers(),
+            json={"input": {
+                "video": f"data:video/mp4;base64,{video_b64}",
+                "audio": f"data:audio/mp3;base64,{audio_b64}",
+                "sync_mode": "loop",
+                "temperature": SYNC_TEMPERATURE,
+            }},
+            timeout=20,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not r.ok:
+        logger.error("Replicate create prediction failed (sync redub): %s", r.text)
+        raise HTTPException(status_code=502, detail="Couldn't add the voice to that video.")
+    prediction_id = r.json().get("id")
+    if not prediction_id:
+        raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+    return prediction_id
+
+
+@app.post("/ads/talking-video-status", response_model=TalkingVideoStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_talking_video_status(
+    request: Request,
+    req: TalkingVideoStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("talking_video_jobs")
+            .select("*")
+            .eq("id", req.job_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get talking video job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="Video job not found.")
+        job = job_res.data[0]
+        model = job["model"]
+        duration = job["duration_seconds"]
+        stage = job["stage"]
+
+        if stage == "animating":
+            if model == "veo_3_1":
+                if gemini_client is None:
+                    raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+                if not req.operation:
+                    raise HTTPException(status_code=400, detail="Missing operation handle.")
+                operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
+                operation = gemini_client.operations.get(operation)
+                if not operation.done:
+                    return {"done": False, "stage": "animating", "video_base64": None, "credits_remaining": None}
+                if operation.error:
+                    with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
+                    raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
+                result = operation.result or operation.response
+                if not result or not result.generated_videos:
+                    with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
+                    raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
+                video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
+            else:
+                prediction_id = job["prediction_id"]
+                r = requests.get(
+                    f"https://api.replicate.com/v1/predictions/{prediction_id}",
+                    headers=_replicate_headers(),
+                    timeout=20,
+                )
+                r.raise_for_status()
+                data = r.json()
+                status = data.get("status")
+                if status not in ("succeeded", "failed", "canceled"):
+                    return {"done": False, "stage": "animating", "video_base64": None, "credits_remaining": None}
+                if status != "succeeded":
+                    with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
+                    logger.error("Replicate prediction %s (%s) finished as %s: %s", prediction_id, model, status, data.get("error"))
+                    return {"done": True, "stage": "animating", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+                video_url = data.get("output")
+                if isinstance(video_url, list):
+                    video_url = video_url[0] if video_url else None
+                if not video_url:
+                    with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
+                    return {"done": True, "stage": "animating", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+                video_resp = requests.get(video_url, timeout=60)
+                video_resp.raise_for_status()
+                video_bytes = video_resp.content
+
+            # Motion clip is ready -- synthesize narration and kick off
+            # the redub, moving this job into its second stage.
+            voice = AI_ACTOR_VOICE_BY_GENDER.get(job["voice_gender"], TTS_VOICE)
+            audio_bytes = _synthesize_voiceover(job["narration"], voice)
+            sync_prediction_id = _start_sync_redub(video_bytes, audio_bytes)
+            with_retry(lambda: supabase.table("talking_video_jobs").update({
+                "stage": "redubbing",
+                "prediction_id": sync_prediction_id,
+            }).eq("id", req.job_id).execute())
+            return {"done": False, "stage": "redubbing", "video_base64": None, "credits_remaining": None}
+
+        # stage == "redubbing"
+        prediction_id = job["prediction_id"]
+        r = requests.get(
+            f"https://api.replicate.com/v1/predictions/{prediction_id}",
+            headers=_replicate_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+        if status not in ("succeeded", "failed", "canceled"):
+            return {"done": False, "stage": "redubbing", "video_base64": None, "credits_remaining": None}
+
+        with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
+
+        if status != "succeeded":
+            logger.error("Replicate prediction %s (sync redub) finished as %s: %s", prediction_id, status, data.get("error"))
+            return {"done": True, "stage": "redubbing", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("output")
+        if not video_url:
+            return {"done": True, "stage": "redubbing", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=60)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
+        new_credits = _spend_ad_credits(user_id, cost, "talking_video", model)
+
+        return {"done": True, "stage": "redubbing", "video_base64": video_base64, "credits_remaining": new_credits}
     except HTTPException:
         raise
     except requests.RequestException as e:
