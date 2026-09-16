@@ -7098,6 +7098,16 @@ def meta_oauth_callback(request: Request):
             logger.error("Meta DEBUG: long_resp.ok but no access_token in body: %s", long_resp.text)
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
 
+        try:
+            perms_resp = requests.get(
+                f"{META_GRAPH_URL}/me/permissions",
+                params={"access_token": user_token},
+                timeout=15,
+            )
+            logger.error("Meta DEBUG: /me/permissions = %s", perms_resp.text)
+        except Exception as perms_err:
+            logger.error("Meta DEBUG: /me/permissions call itself failed: %s", perms_err)
+
         pages_resp = with_retry(
             lambda: requests.get(
                 f"{META_GRAPH_URL}/me/accounts",
