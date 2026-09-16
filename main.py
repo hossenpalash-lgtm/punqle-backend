@@ -7036,13 +7036,19 @@ def meta_oauth_callback(request: Request):
     try:
         params = dict(request.query_params)
         if not META_APP_ID or not META_APP_SECRET:
+            logger.error("Meta DEBUG: missing META_APP_ID/META_APP_SECRET env vars")
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
         error = params.get("error")
         code = params.get("code", "")
         if error or not code:
+            logger.error("Meta DEBUG: error=%r code_present=%s params=%r", error, bool(code), params)
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
 
-        user_id = _verify_meta_state(params.get("state", ""))
+        try:
+            user_id = _verify_meta_state(params.get("state", ""))
+        except HTTPException as e:
+            logger.error("Meta DEBUG: state verification failed, raw state=%r detail=%s", params.get("state", ""), e.detail)
+            raise
         redirect_uri = f"{BACKEND_URL}/meta/callback"
 
         token_resp = with_retry(
@@ -7139,9 +7145,11 @@ def meta_oauth_callback(request: Request):
             "created_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="owner_id").execute())
         return RedirectResponse(f"{FRONTEND_URL}/?meta=pick-page")
-    except HTTPException:
+    except HTTPException as e:
+        logger.error("Meta DEBUG: HTTPException at top level: %s", e.detail)
         return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.error("Meta DEBUG: RequestException: %s", str(e))
         return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
