@@ -7022,7 +7022,14 @@ def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
         # pages_manage_posts is rejected without it, regardless of whether
         # the app has a separate feature that independently reads engagement
         # data.
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish",
+        #
+        # TEMPORARY, 2026-09-16: instagram_basic/instagram_content_publish
+        # dropped from this scope to isolate a live incident — /me/accounts
+        # was returning zero pages on every connect attempt regardless of
+        # Business Portfolio setup, App ownership, etc. Testing whether the
+        # still-unreviewed Instagram permissions are what's breaking the
+        # whole grant. Put them back once the real cause is confirmed.
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts",
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
