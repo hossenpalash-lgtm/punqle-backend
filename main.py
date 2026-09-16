@@ -7023,13 +7023,14 @@ def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
         # the app has a separate feature that independently reads engagement
         # data.
         #
-        # TEMPORARY, 2026-09-16: instagram_basic/instagram_content_publish
-        # dropped from this scope to isolate a live incident — /me/accounts
-        # was returning zero pages on every connect attempt regardless of
-        # Business Portfolio setup, App ownership, etc. Testing whether the
-        # still-unreviewed Instagram permissions are what's breaking the
-        # whole grant. Put them back once the real cause is confirmed.
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts",
+        # Real cause confirmed 2026-09-16, not Instagram-related after all:
+        # /me/accounts returned zero pages for a Page owned by a Business
+        # Portfolio the connecting user only had Business-Portfolio-level
+        # "Full access" on, never classic per-Page "People with Facebook
+        # access" — the personal-token endpoint /me/accounts only lists
+        # pages with the latter. A plain, non-Business-Manager-owned Page
+        # worked immediately with this exact same scope.
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish",
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
