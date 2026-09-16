@@ -7028,9 +7028,15 @@ def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
         # Portfolio the connecting user only had Business-Portfolio-level
         # "Full access" on, never classic per-Page "People with Facebook
         # access" — the personal-token endpoint /me/accounts only lists
-        # pages with the latter. A plain, non-Business-Manager-owned Page
-        # worked immediately with this exact same scope.
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish",
+        # pages with the latter, and self-granting classic access from
+        # Meta's own UI turned out to be blocked entirely for the account
+        # that already holds Business-Portfolio access. business_management
+        # is the documented fix (confirmed via other developers hitting
+        # this exact symptom): it unlocks /{business_id}/owned_pages, which
+        # DOES see Business-Portfolio-governed pages regardless of classic
+        # per-Page access. Works immediately for app admins/testers even
+        # before this permission clears its own App Review.
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management",
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
@@ -7142,7 +7148,35 @@ def meta_oauth_callback(request: Request):
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
         raw_pages = pages_resp.json().get("data", [])
         if not raw_pages:
-            logger.error("Meta DEBUG: /me/accounts returned zero pages, full body: %s", pages_resp.text)
+            logger.error("Meta DEBUG: /me/accounts returned zero pages, full body: %s — trying Business Manager fallback", pages_resp.text)
+            # /me/accounts only lists pages the user has classic per-Page
+            # access to. A page governed by a Business Portfolio the user
+            # only has Business-Portfolio-level access on (no classic
+            # access) won't show up there at all, even though the user can
+            # fully manage it via Meta Business Suite. business_management
+            # unlocks the Business Manager API, which sees these pages
+            # regardless of classic access — walk every business the user
+            # belongs to and collect their owned pages.
+            try:
+                biz_resp = requests.get(
+                    f"{META_GRAPH_URL}/me/businesses",
+                    params={"fields": "id,name", "access_token": user_token},
+                    timeout=15,
+                )
+                logger.error("Meta DEBUG: /me/businesses = %s", biz_resp.text)
+                if biz_resp.ok:
+                    for biz in biz_resp.json().get("data", []):
+                        owned_resp = requests.get(
+                            f"{META_GRAPH_URL}/{biz['id']}/owned_pages",
+                            params={"fields": "id,name,access_token", "access_token": user_token},
+                            timeout=15,
+                        )
+                        logger.error("Meta DEBUG: %s/owned_pages = %s", biz["id"], owned_resp.text)
+                        if owned_resp.ok:
+                            raw_pages.extend(owned_resp.json().get("data", []))
+            except requests.RequestException as biz_err:
+                logger.error("Meta DEBUG: Business Manager fallback raised: %s", biz_err)
+        if not raw_pages:
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error&reason=no_pages")
 
         pages = []
