@@ -7070,6 +7070,7 @@ def meta_oauth_callback(request: Request):
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
         short_lived_token = token_resp.json().get("access_token")
         if not short_lived_token:
+            logger.error("Meta DEBUG: token_resp.ok but no access_token in body: %s", token_resp.text)
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
 
         # Exchange for a long-lived user token (~60 days) — Page tokens
@@ -7094,6 +7095,7 @@ def meta_oauth_callback(request: Request):
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
         user_token = long_resp.json().get("access_token")
         if not user_token:
+            logger.error("Meta DEBUG: long_resp.ok but no access_token in body: %s", long_resp.text)
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
 
         pages_resp = with_retry(
@@ -7113,6 +7115,7 @@ def meta_oauth_callback(request: Request):
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
         raw_pages = pages_resp.json().get("data", [])
         if not raw_pages:
+            logger.error("Meta DEBUG: /me/accounts returned zero pages, full body: %s", pages_resp.text)
             return RedirectResponse(f"{FRONTEND_URL}/?meta=error&reason=no_pages")
 
         pages = []
