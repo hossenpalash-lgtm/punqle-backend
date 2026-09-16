@@ -7108,11 +7108,20 @@ def meta_oauth_callback(request: Request):
         except Exception as perms_err:
             logger.error("Meta DEBUG: /me/permissions call itself failed: %s", perms_err)
 
+        # Fetched without the nested instagram_business_account field on
+        # purpose — a live-debugged incident (2026-09-16) found that field
+        # can silently zero out this whole call's "data" array on a fresh
+        # connection, even with pages_show_list confirmed "granted" via
+        # /me/permissions, most likely because instagram_basic/
+        # instagram_content_publish were only added to a draft App Review
+        # (never actually submitted) at the time. Fetching the Page list on
+        # its own is the core, must-work path; the Instagram lookup below
+        # is now a separate best-effort enrichment that can never block it.
         pages_resp = with_retry(
             lambda: requests.get(
                 f"{META_GRAPH_URL}/me/accounts",
                 params={
-                    "fields": "id,name,access_token,instagram_business_account{id,username}",
+                    "fields": "id,name,access_token",
                     "access_token": user_token,
                 },
                 timeout=15,
@@ -7130,13 +7139,32 @@ def meta_oauth_callback(request: Request):
 
         pages = []
         for p in raw_pages:
-            ig = p.get("instagram_business_account")
+            ig_user_id = None
+            ig_username = None
+            try:
+                ig_resp = requests.get(
+                    f"{META_GRAPH_URL}/{p['id']}",
+                    params={
+                        "fields": "instagram_business_account{id,username}",
+                        "access_token": p.get("access_token", ""),
+                    },
+                    timeout=15,
+                )
+                if ig_resp.ok:
+                    ig = ig_resp.json().get("instagram_business_account")
+                    if ig:
+                        ig_user_id = ig.get("id")
+                        ig_username = ig.get("username")
+                else:
+                    logger.error("Meta DEBUG: per-page instagram_business_account lookup failed for page %s: %s", p["id"], ig_resp.text)
+            except requests.RequestException as ig_err:
+                logger.error("Meta DEBUG: per-page instagram_business_account lookup raised for page %s: %s", p["id"], ig_err)
             pages.append({
                 "page_id": p["id"],
                 "page_name": p.get("name", ""),
                 "page_access_token": p.get("access_token", ""),
-                "ig_user_id": ig.get("id") if ig else None,
-                "ig_username": ig.get("username") if ig else None,
+                "ig_user_id": ig_user_id,
+                "ig_username": ig_username,
             })
 
         if len(pages) == 1:
