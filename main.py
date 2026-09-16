@@ -1186,7 +1186,7 @@ TIKTOK_SCOPE = "user.info.basic,video.publish,video.upload"
 # that will still 403 until the app passes TikTok's audit. Flip this to
 # True once that audit is approved — real user-chosen privacy levels
 # will then pass through unmodified with zero other code changes needed.
-TIKTOK_APP_AUDITED = False
+TIKTOK_APP_AUDITED = True
 # Optional — subscriptions/checkout are disabled (503) until these are set.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
