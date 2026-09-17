@@ -3811,6 +3811,22 @@ IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
                            # after its first real invoice.
 }
 
+
+def _round_to_even_veo_duration(duration: int) -> int:
+    """Real, live-confirmed 2026-09-18: veo-3.1-lite-generate-preview's
+    real duration_seconds constraint is NOT "any integer 4-8" as its own
+    error message claims -- direct testing against the real API found
+    4/6/8 succeed and 5/7 are rejected with the exact same misleading
+    "out of bound... between 4 and 8" message. Only even values work.
+    Every existing call site that hardcoded "8" happened to dodge this;
+    the two call sites that compute a duration from user input (image-
+    to-video, talking-video) didn't, and could silently 400 on any odd
+    clamped value. Rounds to the nearest even number, re-clamped to
+    Veo's own real 4-8 range."""
+    even = round(duration / 2) * 2
+    return max(4, min(8, even))
+
+
 # Talking video -- the Video action's optional "Add spoken narration"
 # path: animate the image (same models/cost as above, generate_audio
 # still False) then Sync Labs-redub real TTS narration onto it, reusing
@@ -4937,6 +4953,8 @@ def start_image_to_video(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
         )
+        if model == "veo_3_1":
+            duration = _round_to_even_veo_duration(duration)
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model])
         credits = _get_ad_credits(user_id)
         if credits < cost:
@@ -5147,6 +5165,8 @@ def start_talking_video(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
         )
+        if model == "veo_3_1":
+            duration = _round_to_even_veo_duration(duration)
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
         credits = _get_ad_credits(user_id)
         if credits < cost:
