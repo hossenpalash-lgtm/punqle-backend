@@ -550,6 +550,10 @@ class CustomActorsListResponse(BaseModel):
     actors: list[CustomActorOut]
 
 
+class RenameCustomActorRequest(BaseModel):
+    name: str
+
+
 class AiActorVideoStartResponse(BaseModel):
     prediction_id: str
 
@@ -3113,6 +3117,38 @@ def list_my_custom_actors(user_id: str = Depends(get_current_user_id)):
             .execute())
         res = ensure_supabase_response(res, "list custom actors")
         return {"actors": res.data}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/custom-actors/{actor_id}/rename", response_model=CustomActorOut, tags=["ads"])
+def rename_custom_actor(actor_id: str, req: RenameCustomActorRequest, user_id: str = Depends(get_current_user_id)):
+    try:
+        name = req.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Give your actor a name.")
+        if len(name) > 60:
+            raise HTTPException(status_code=400, detail="That name is too long.")
+        res = with_retry(lambda: supabase.table("custom_actors").update({"name": name})
+            .eq("id", actor_id).eq("owner_id", user_id).execute())
+        res = ensure_supabase_response(res, "rename custom actor")
+        if not res.data:
+            raise HTTPException(status_code=404, detail="That custom actor wasn't found.")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/ads/custom-actors/{actor_id}", tags=["ads"])
+def delete_custom_actor(actor_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        with_retry(lambda: supabase.table("custom_actors").delete()
+            .eq("id", actor_id).eq("owner_id", user_id).execute())
+        return {"deleted": True}
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
