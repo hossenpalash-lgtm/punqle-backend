@@ -4629,6 +4629,28 @@ def _replicate_headers() -> dict:
     return {"Authorization": f"Bearer {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
 
 
+def _replicate_error_detail(resp: requests.Response, fallback: str) -> str:
+    """Replicate's own error body (RFC 7807 shape: title/detail/status)
+    is usually genuinely useful -- e.g. a real "Insufficient credit"
+    billing message -- but every caller below used to discard it
+    entirely and show a generic fallback instead. That's exactly what
+    hid a real Replicate billing issue behind "Couldn't start the
+    video." during this project's own live testing (2026-09-17), with
+    no way to tell a billing problem from a real bug short of reading
+    server logs. Surfaces the real reason for billing-shaped errors;
+    anything else still falls back to the generic message, so this
+    never leaks raw vendor internals for every possible failure."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return fallback
+    title = (body.get("title") or "").strip()
+    detail = (body.get("detail") or "").strip()
+    if resp.status_code == 402 or "credit" in title.lower():
+        return f"The video service is out of credit right now — {detail or 'please try again shortly.'}"
+    return fallback
+
+
 @app.post("/ads/generate-cinematic-ugc", response_model=CinematicUgcStartResponse, tags=["ads"])
 @limiter.limit("5/minute")
 def start_cinematic_ugc_generation(
@@ -4687,7 +4709,7 @@ def start_cinematic_ugc_generation(
         )
         if not r.ok:
             logger.error("Replicate create prediction failed: %s", r.text)
-            raise HTTPException(status_code=502, detail="Couldn't start the cinematic video.")
+            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the cinematic video."))
         prediction_id = r.json().get("id")
         if not prediction_id:
             raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
@@ -4866,7 +4888,7 @@ def start_image_to_video(
         )
         if not r.ok:
             logger.error("Replicate create prediction failed (%s): %s", model, r.text)
-            raise HTTPException(status_code=502, detail="Couldn't start the video.")
+            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the video."))
         prediction_id = r.json().get("id")
         if not prediction_id:
             raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
@@ -5074,7 +5096,7 @@ def start_talking_video(
         )
         if not r.ok:
             logger.error("Replicate create prediction failed (%s): %s", model, r.text)
-            raise HTTPException(status_code=502, detail="Couldn't start the video.")
+            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the video."))
         prediction_id = r.json().get("id")
         if not prediction_id:
             raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
@@ -5124,7 +5146,7 @@ def _start_sync_redub(video_bytes: bytes, audio_bytes: bytes) -> str:
     )
     if not r.ok:
         logger.error("Replicate create prediction failed (sync redub): %s", r.text)
-        raise HTTPException(status_code=502, detail="Couldn't add the voice to that video.")
+        raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't add the voice to that video."))
     prediction_id = r.json().get("id")
     if not prediction_id:
         raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
@@ -5301,7 +5323,7 @@ def start_ai_actor_video_generation(
         )
         if not r.ok:
             logger.error("Replicate create prediction failed: %s", r.text)
-            raise HTTPException(status_code=502, detail="Couldn't start the actor video.")
+            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the actor video."))
         prediction_id = r.json().get("id")
         if not prediction_id:
             raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
@@ -5488,7 +5510,7 @@ def start_actor_video_v2(
         )
         if not r.ok:
             logger.error("Replicate create prediction failed: %s", r.text)
-            raise HTTPException(status_code=502, detail="Couldn't start the actor video.")
+            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the actor video."))
         prediction_id = r.json().get("id")
         if not prediction_id:
             raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
