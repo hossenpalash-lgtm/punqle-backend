@@ -516,9 +516,38 @@ class TalkingVideoStatusResponse(BaseModel):
 
 
 class GenerateAiActorVideoRequest(BaseModel):
-    actor_id: str
+    # Exactly one of these two must be set -- actor_id for the built-in
+    # _IMAGE_AD_ACTORS catalog, custom_actor_id for a user's own saved
+    # custom_actors row. Both feed the same OmniHuman call below.
+    actor_id: Optional[str] = None
+    custom_actor_id: Optional[str] = None
     narration: str
     language: str = "english"
+
+
+# A custom actor is just a saved photo + name + gender (for voice
+# selection) -- no trained avatar object on any vendor's side, unlike
+# HeyGen's Photo Avatar. OmniHuman takes a photo directly on every
+# call, so there's nothing to "train" here; saving only avoids asking
+# the user to re-upload/re-generate the same photo every time.
+class CreateCustomActorRequest(BaseModel):
+    name: str
+    gender: str  # "female" | "male" -- picks the OmniHuman narration voice
+    photo_base64: str
+    photo_mime_type: str = "image/png"  # generateImageDirect always returns PNG; an uploaded photo's real type is passed through instead
+
+
+class CustomActorOut(BaseModel):
+    id: str
+    name: str
+    gender: str
+    photo_base64: str
+    photo_mime_type: str
+    created_at: str
+
+
+class CustomActorsListResponse(BaseModel):
+    actors: list[CustomActorOut]
 
 
 class AiActorVideoStartResponse(BaseModel):
@@ -3030,6 +3059,65 @@ def _get_image_actor_bytes(actor_id: str) -> Optional[bytes]:
         return None
 
 
+# "Create Your Own Actor" -- deliberately not HeyGen. A real spike
+# against HeyGen's Photo Avatar API this session confirmed the request
+# shape works, but it needs a paid HeyGen subscription to actually
+# create one, and its rendering engine was already judged flatter/more
+# robotic than this app's own Veo-based actors. This reuses two things
+# already live and already funded instead: Nano Banana Pro
+# (generateImageDirect, already free-standing in Image mode) for the
+# photo, and OmniHuman (already wired below for the built-in actor
+# catalog) for the talking video -- zero new vendor integration.
+@app.post("/ads/create-custom-actor", response_model=CustomActorOut, tags=["ads"])
+def create_custom_actor(req: CreateCustomActorRequest, user_id: str = Depends(get_current_user_id)):
+    try:
+        name = req.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Give your actor a name.")
+        if len(name) > 60:
+            raise HTTPException(status_code=400, detail="That name is too long.")
+        if req.gender not in ("female", "male"):
+            raise HTTPException(status_code=400, detail="Pick a voice — female or male.")
+        photo_b64 = (req.photo_base64 or "").strip()
+        if not photo_b64:
+            raise HTTPException(status_code=400, detail="Missing the actor's photo.")
+        try:
+            base64.b64decode(photo_b64, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="That photo didn't come through right — try again.")
+
+        mime_type = (req.photo_mime_type or "image/png").strip() or "image/png"
+        res = with_retry(lambda: supabase.table("custom_actors").insert({
+            "owner_id": user_id,
+            "name": name,
+            "gender": req.gender,
+            "photo_base64": photo_b64,
+            "photo_mime_type": mime_type,
+        }).execute())
+        res = ensure_supabase_response(res, "create custom actor")
+        return res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ads/my-custom-actors", response_model=CustomActorsListResponse, tags=["ads"])
+def list_my_custom_actors(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("custom_actors")
+            .select("id, name, gender, photo_base64, photo_mime_type, created_at")
+            .eq("owner_id", user_id)
+            .order("created_at", desc=True)
+            .execute())
+        res = ensure_supabase_response(res, "list custom actors")
+        return {"actors": res.data}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/ads/image-actors", response_model=ImageActorsListResponse, tags=["ads"])
 def list_image_actors(user_id: str = Depends(get_current_user_id)):
     """Free — the fixed, bundled actor library (see _IMAGE_AD_ACTORS).
@@ -5292,20 +5380,37 @@ def start_ai_actor_video_generation(
         if not narration:
             raise HTTPException(status_code=400, detail="Nothing for the actor to say.")
 
-        actor = _get_image_actor(req.actor_id)
-        persona_bytes = _get_image_actor_bytes(req.actor_id) if actor else None
-        if not actor or not persona_bytes:
-            raise HTTPException(status_code=400, detail="Unknown actor.")
+        if req.custom_actor_id:
+            custom_res = with_retry(lambda: supabase.table("custom_actors")
+                .select("gender, photo_base64, photo_mime_type")
+                .eq("id", req.custom_actor_id)
+                .eq("owner_id", user_id)
+                .execute())
+            custom_res = ensure_supabase_response(custom_res, "get custom actor")
+            if not custom_res.data:
+                raise HTTPException(status_code=404, detail="That custom actor wasn't found.")
+            actor_gender = custom_res.data[0]["gender"]
+            image_b64 = custom_res.data[0]["photo_base64"]
+            image_mime_type = custom_res.data[0].get("photo_mime_type") or "image/png"
+        elif req.actor_id:
+            actor = _get_image_actor(req.actor_id)
+            persona_bytes = _get_image_actor_bytes(req.actor_id) if actor else None
+            if not actor or not persona_bytes:
+                raise HTTPException(status_code=400, detail="Unknown actor.")
+            actor_gender = actor["gender"]
+            image_b64 = base64.b64encode(persona_bytes).decode("ascii")
+            image_mime_type = "image/jpeg"
+        else:
+            raise HTTPException(status_code=400, detail="No actor selected.")
 
         cost = AI_ACTOR_VIDEO_CREDIT_COST
         credits = _get_ad_credits(user_id)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
-        voice = AI_ACTOR_VOICE_BY_GENDER.get(actor["gender"], TTS_VOICE)
+        voice = AI_ACTOR_VOICE_BY_GENDER.get(actor_gender, TTS_VOICE)
         audio_bytes = _synthesize_voiceover(narration, voice)
 
-        image_b64 = base64.b64encode(persona_bytes).decode("ascii")
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
         r = with_retry(
@@ -5313,7 +5418,7 @@ def start_ai_actor_video_generation(
                 f"https://api.replicate.com/v1/models/{AI_ACTOR_MODEL}/predictions",
                 headers=_replicate_headers(),
                 json={"input": {
-                    "image": f"data:image/jpeg;base64,{image_b64}",
+                    "image": f"data:{image_mime_type};base64,{image_b64}",
                     "audio": f"data:audio/mp3;base64,{audio_b64}",
                 }},
                 timeout=20,
