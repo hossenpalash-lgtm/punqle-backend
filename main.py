@@ -559,6 +559,19 @@ class GenerateActorVideoV2Request(BaseModel):
     elevenlabs_settings: Optional[ElevenLabsVoiceSettings] = None
 
 
+# ElevenLabs-only -- its v3 model reads inline bracket tags (e.g.
+# [excited]) as delivery direction; OpenAI's engines have no equivalent
+# and would just speak the brackets literally. The home page's Talking
+# Actors mode offers this as an automatic opt-in (see _add_emotion_tags)
+# instead of AdVideoForm.tsx's manual per-word insertEmotionTag buttons.
+class AddEmotionTagsRequest(BaseModel):
+    narration: str
+
+
+class AddEmotionTagsResponse(BaseModel):
+    narration: str
+
+
 class ActorVideoV2StartResponse(BaseModel):
     prediction_id: str
 
@@ -5359,6 +5372,66 @@ def check_ai_actor_video_status(
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Same real tag vocabulary as AdVideoForm.tsx's manual insertEmotionTag
+# buttons (warmly/excited/curious/thoughtful/mischievously/whispering) --
+# kept identical so tags read consistently across the app regardless of
+# which screen inserted them.
+_EMOTION_TAGS = ["warmly", "excited", "curious", "thoughtful", "mischievously", "whispering"]
+
+
+def _add_emotion_tags(narration: str) -> str:
+    """Auto-inserts 2-3 ElevenLabs v3 bracket emotion tags (e.g.
+    [excited]) into narration text at points that match its own actual
+    tone -- an AI read of the script instead of requiring the user to
+    manually click each tag in. Bracket tags pass straight through
+    _synthesize_actor_voiceover's elevenlabs branch untouched."""
+    tags_list = ", ".join(_EMOTION_TAGS)
+    prompt = f"""You add natural emotional delivery cues to a short spoken-ad script for ElevenLabs text-to-speech.
+
+Insert exactly 2-3 emotion tags from this list, and no others: {tags_list}
+
+Rules:
+- Format each tag exactly as [tag] in lowercase, e.g. [excited]
+- Place each tag right before the word or phrase it should color, matching the narration's own actual tone at that point -- don't force an emotion that doesn't fit
+- Do not change, add, or remove any other words from the narration
+- Do not add a tag at the very start if the opening line doesn't call for one
+
+Narration: {narration}
+
+Respond with ONLY this JSON format, nothing else:
+{{"narration": "the narration text with tags inserted"}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You add natural emotional delivery cues to spoken ad scripts."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.6,
+            response_format={"type": "json_object"},
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    return parsed.get("narration") or narration
+
+
+@app.post("/ads/add-emotion-tags", response_model=AddEmotionTagsResponse, tags=["ads"])
+def add_emotion_tags(req: AddEmotionTagsRequest, user_id: str = Depends(get_current_user_id)):
+    """Free -- one cheap gpt-4o-mini text pass, no image/video/voice
+    generation involved. ElevenLabs-only; the frontend only calls this
+    when that voice engine is picked."""
+    narration = (req.narration or "").strip()
+    if not narration:
+        raise HTTPException(status_code=400, detail="Narration text is required.")
+    tagged = _add_emotion_tags(narration)
+    return AddEmotionTagsResponse(narration=tagged)
 
 
 @app.post("/ads/generate-actor-video-v2", response_model=ActorVideoV2StartResponse, tags=["ads"])
