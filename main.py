@@ -3358,6 +3358,61 @@ def _combine_actor_and_product_image(
     raise Exception("Gemini did not return an image")
 
 
+def _combine_actor_and_app_screenshot_image(
+    actor_bytes: bytes,
+    actor_mime_type: str,
+    screenshot_bytes: bytes,
+    screenshot_mime_type: str,
+    aspect_ratio: str = "square",
+) -> bytes:
+    """The home page's "Show Your App" action -- deliberately NOT a thin
+    wrapper around _combine_actor_and_product_image above, even though
+    both do the same two-image Gemini compositing. That function's prompt
+    tells Gemini to render the second image AS the literal held object
+    ("keep the product exactly as shown... do not change its shape") --
+    correct for a real physical product, but wrong here: a screenshot
+    handed to that prompt renders as a flat card floating in the actor's
+    hand, not a phone. This prompt instead asks for a realistic phone
+    whose SCREEN displays the screenshot, matching Arcads' own real
+    "Show Your App" feature (confirmed via frame-by-frame video review):
+    upload a screenshot, your actor holds a phone showing it naturally."""
+    if gemini_client is None:
+        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+
+    shape_instruction = ASPECT_RATIO_PROMPTS.get(aspect_ratio, ASPECT_RATIO_PROMPTS["square"])
+    full_prompt = (
+        "The first image shows a person. The second image is a screenshot from a mobile app. "
+        "Create a new, single photorealistic photo showing this exact person naturally holding "
+        "a realistic modern smartphone at chest or eye height, angled slightly toward the camera, "
+        "smiling naturally. The phone's screen must display exactly the content of the second "
+        "image, unaltered -- do not change any text, layout, colors, or UI elements from the "
+        "screenshot. Render a realistic phone bezel, subtle screen glare/reflection, and correct "
+        "perspective so the screen reads as genuinely displayed on a device, not pasted on top. "
+        f"Keep the person's face and appearance consistent with the first image. {shape_instruction}"
+    )
+    response = with_retry(
+        lambda: gemini_client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[
+                genai_types.Part.from_bytes(data=actor_bytes, mime_type=actor_mime_type),
+                genai_types.Part.from_bytes(data=screenshot_bytes, mime_type=screenshot_mime_type),
+                full_prompt,
+            ],
+            config=genai_types.GenerateContentConfig(
+                image_config=genai_types.ImageConfig(
+                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
+                ),
+            ),
+        ),
+        exceptions=(Exception,),
+        attempts=2,
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise Exception("Gemini did not return an image")
+
+
 def _generate_ai_banner_image(
     item_description: str,
     category: str = "other",
@@ -3705,6 +3760,50 @@ async def combine_actor_and_product(
             actor_bytes, actor_file.content_type or "image/jpeg",
             product_bytes, product_file.content_type or "image/jpeg",
             prompt.strip(), aspect_ratio,
+        )
+        new_credits = _spend_ad_credit(user_id, "image_generate")
+
+        return {
+            "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-show-app", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def generate_show_app_shot(
+    request: Request,
+    aspect_ratio: str = "square",
+    actor_file: UploadFile = File(...),
+    screenshot_file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """The home page's "Show Your App" pill -- attach an app screenshot to
+    an already-generated (or uploaded) actor image; combines both into one
+    new photorealistic image via _combine_actor_and_app_screenshot_image,
+    which the actor is shown naturally holding on a phone screen."""
+    try:
+        if aspect_ratio not in ASPECT_RATIO_PROMPTS:
+            aspect_ratio = "square"
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+
+        actor_bytes = await actor_file.read()
+        screenshot_bytes = await screenshot_file.read()
+        banner_bytes = await run_in_threadpool(
+            _combine_actor_and_app_screenshot_image,
+            actor_bytes, actor_file.content_type or "image/jpeg",
+            screenshot_bytes, screenshot_file.content_type or "image/jpeg",
+            aspect_ratio,
         )
         new_credits = _spend_ad_credit(user_id, "image_generate")
 
