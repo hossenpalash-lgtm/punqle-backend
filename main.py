@@ -3719,6 +3719,57 @@ async def combine_actor_and_product(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/ads/generate-unboxing", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def generate_unboxing_shot(
+    request: Request,
+    scene: str,
+    aspect_ratio: str = "square",
+    product_file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """The home page's "Unboxing" pill -- takes the user's own real product
+    photo and restyles only the background/surface to match a described
+    scene (e.g. "on a marble kitchen counter, soft morning light"),
+    keeping the actual product pixel-preserved. Reuses
+    _generate_banner_image unchanged -- same "edit the background, never
+    the product" contract Image Ad's own upload path already relies on.
+    Deliberately text-description-only, no curated surface-photo library:
+    Nano Banana Pro already renders convincing marble/wood/fabric/etc.
+    textures from a plain description, so there's nothing a reference
+    photo would add here that a real *location* photo added for the
+    actor-video library (where grounding a specific real place mattered).
+    """
+    try:
+        if not scene.strip():
+            raise HTTPException(status_code=400, detail="Describe the surface or setting for your product.")
+        if aspect_ratio not in ASPECT_RATIO_PROMPTS:
+            aspect_ratio = "square"
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+
+        product_bytes = await product_file.read()
+        banner_bytes = await run_in_threadpool(
+            _generate_banner_image,
+            product_bytes, product_file.content_type or "image/jpeg", scene.strip(), aspect_ratio,
+        )
+        new_credits = _spend_ad_credit(user_id, "image_generate")
+
+        return {
+            "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 VIDEO_CREDIT_COST = 10  # ~10x an image credit, matching Veo 3.1 Lite's real ~$0.40/8s-720p vs an image's ~$0.04
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
