@@ -624,6 +624,12 @@ class AddEmotionTagsResponse(BaseModel):
     narration: str
 
 
+class RefineActorPhotoRequest(BaseModel):
+    image_base64: str
+    mime_type: str = "image/png"
+    instruction: str
+
+
 class ActorVideoV2StartResponse(BaseModel):
     prediction_id: str
 
@@ -3645,6 +3651,44 @@ def _upscale_image_replicate(image_bytes: bytes, mime_type: str) -> bytes:
     image_resp = requests.get(image_url, timeout=30)
     image_resp.raise_for_status()
     return image_resp.content
+
+
+def _refine_actor_photo(image_bytes: bytes, mime_type: str, instruction: str) -> bytes:
+    """"Create your own actor"'s iterative refine step (Talking Actors
+    mode, "Generate with AI" path only) -- takes the currently-shown,
+    already-AI-generated candidate photo plus the user's own free-text
+    edit instruction ("put a mug in her hand", "put her in a kitchen")
+    and asks Gemini to apply it, matching Arcads' own real "now she's
+    holding the jar" iterative-refinement flow. Deliberately open-ended,
+    unlike _generate_banner_image's "preserve exactly" contract -- this
+    is only ever run on a synthetic photo Punqle itself generated, never
+    a real uploaded photo of an actual person (the "Upload a photo"
+    source never offers this button), so there's no real person's
+    likeness to protect here."""
+    if gemini_client is None:
+        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+
+    prompt = (
+        f"Edit this photo of a person: {instruction.strip()}. Keep the person's "
+        "face and identity clearly recognizable as the same person, unless the "
+        "instruction explicitly asks to change their appearance. Keep the result "
+        "photorealistic, matching the original photo's lighting, style, and quality."
+    )
+    response = with_retry(
+        lambda: gemini_client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                prompt,
+            ],
+        ),
+        exceptions=(Exception,),
+        attempts=2,
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise Exception("Gemini did not return an image")
 
 
 @app.post("/ads/generate", response_model=AdGenerateResponse, tags=["ads"])
@@ -7141,6 +7185,40 @@ async def upscale_image(
         result_bytes = await run_in_threadpool(_upscale_image_replicate, image_bytes, mime_type)
 
         new_credits = _spend_ad_credit(user_id, "upscale_image")
+
+        return {
+            "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/refine-actor-photo", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def refine_actor_photo(
+    request: Request,
+    req: RefineActorPhotoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """"Create your own actor"'s iterative refine step -- see
+    _refine_actor_photo. Same flat 1-credit pricing as every other
+    single-call image edit in this app."""
+    try:
+        if not req.instruction.strip():
+            raise HTTPException(status_code=400, detail="Describe what you want to change.")
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+        image_bytes = base64.b64decode(req.image_base64)
+        result_bytes = await run_in_threadpool(_refine_actor_photo, image_bytes, req.mime_type, req.instruction)
+        new_credits = _spend_ad_credit(user_id, "refine_actor_photo")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
