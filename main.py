@@ -425,6 +425,25 @@ class CinematicUgcStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
+class UpscaleVideoStartRequest(BaseModel):
+    video_base64: str
+    tier: str = "standard"
+
+
+class UpscaleVideoStartResponse(BaseModel):
+    prediction_id: str
+
+
+class UpscaleVideoStatusRequest(BaseModel):
+    prediction_id: str
+
+
+class UpscaleVideoStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 IMAGE_TO_VIDEO_MODELS = {"veo_3_1", "kling_3_pro", "seedance_2_5"}
 
 
@@ -3590,6 +3609,44 @@ def _enhance_image(image_bytes: bytes, mime_type: str) -> bytes:
     raise Exception("Gemini did not return an image")
 
 
+def _upscale_image_replicate(image_bytes: bytes, mime_type: str) -> bytes:
+    """The home page's "Upscale" pill (image side) -- unlike every other
+    image tool above, this isn't a Gemini edit at all: Real-ESRGAN (via
+    Replicate, nightmareai/real-esrgan, ~99M real runs, a genuinely
+    cheap/fast community-favorite model per real pricing research,
+    2026-09-19) does real super-resolution upscaling, something Gemini's
+    image model isn't built for. Uses Replicate's `Prefer: wait` header
+    for a synchronous response -- real-esrgan runs in seconds, unlike
+    the video side (Topaz), which needs the async job/poll pattern."""
+    r = with_retry(
+        lambda: requests.post(
+            f"https://api.replicate.com/v1/models/{REAL_ESRGAN_MODEL}/predictions",
+            headers={**_replicate_headers(), "Prefer": "wait=55"},
+            json={"input": {
+                "image": f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}",
+                "scale": 4,
+                "face_enhance": False,
+            }},
+            timeout=60,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not r.ok:
+        logger.error("Replicate create prediction failed: %s", r.text)
+        raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't upscale that image."))
+    data = r.json()
+    if data.get("status") != "succeeded":
+        logger.error("Real-ESRGAN prediction did not complete synchronously: %s", data)
+        raise HTTPException(status_code=502, detail="Upscaling took too long — please try again.")
+    image_url = data.get("output")
+    if not image_url:
+        raise Exception("Replicate did not return an image")
+    image_resp = requests.get(image_url, timeout=30)
+    image_resp.raise_for_status()
+    return image_resp.content
+
+
 @app.post("/ads/generate", response_model=AdGenerateResponse, tags=["ads"])
 @limiter.limit("10/minute")
 async def generate_ad(
@@ -3934,6 +3991,31 @@ CINEMATIC_UGC_RESOLUTION_BY_TIER = {"standard": "480p", "premium": "720p"}
 CINEMATIC_UGC_CREDIT_COST = {
     "standard": 25,  # 8s x ~$0.103/s = ~$0.82 real cost
     "premium": 46,   # 8s x ~$0.231/s = ~$1.85 real cost
+}
+
+# Upscale (image + video) -- the home page's "Upscale" pill, matching
+# Arcads' own real feature (confirmed via frame-by-frame video review,
+# 2026-09-18). Image side is a fast, cheap, synchronous call (Real-ESRGAN
+# is a long-running community favorite on Replicate, ~99M runs, real cost
+# a fraction of a cent per image per third-party pricing research) --
+# flat 1 credit via _spend_ad_credit, same as every other Gemini image
+# edit in this app. Video side is genuinely slow and non-trivial cost --
+# Topaz Labs' own official Replicate model, confirmed live via a real
+# prediction log (2026-09-19): billed in "units" at $0.08/unit (Topaz's
+# November 2025 rate, found via direct research, not assumed), units
+# scale with output pixel count (resolution x fps x duration) -- a
+# real 4K/60fps run in Replicate's own example logged 33 units (~$2.64).
+# Standard/Premium mirrors Avatar's own tier-naming and 4/10-credit split
+# exactly (same real-cost range for an 8s clip at 1080p vs 4K, by the
+# same reasoning already used there) -- treated as provisional until
+# confirmed against one real, first production run's actual bill, same
+# as every other new vendor integration's pricing in this project.
+REAL_ESRGAN_MODEL = "nightmareai/real-esrgan"
+TOPAZ_VIDEO_UPSCALE_MODEL = "topazlabs/video-upscale"
+VIDEO_UPSCALE_RESOLUTION_BY_TIER = {"standard": "1080p", "premium": "4k"}
+VIDEO_UPSCALE_CREDIT_COST = {
+    "standard": 4,   # ~1080p, 8s -- provisional, see comment above
+    "premium": 10,   # ~4K, 8s -- provisional, see comment above
 }
 
 # Image -> video tool: turn an already-generated image into a short clip,
@@ -5071,6 +5153,120 @@ def check_cinematic_ugc_status(
     except requests.RequestException as e:
         logger.error("Replicate status error: %s", str(e), exc_info=True)
         raise HTTPException(status_code=502, detail="Couldn't check the cinematic video's status.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/upscale-video-start", response_model=UpscaleVideoStartResponse, tags=["ads"])
+@limiter.limit("5/minute")
+def start_video_upscale(
+    request: Request,
+    req: UpscaleVideoStartRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Starts a video Upscale job -- Topaz Labs' own official model via
+    Replicate, matching Arcads' own real "Upscale" feature (confirmed via
+    frame-by-frame video review). Same check-then-charge, tier-tracked-
+    server-side shape as start_cinematic_ugc_generation, for the same
+    reason: Replicate's own prediction status never reports which
+    resolution tier was billed, so it's remembered here
+    (upscale_video_jobs) rather than trusted from the client at poll
+    time. This is genuinely slow (a real test run took ~7 minutes) --
+    async job + poll is required, a synchronous call would exceed any
+    reasonable request timeout."""
+    try:
+        tier = req.tier if req.tier in VIDEO_UPSCALE_CREDIT_COST else "standard"
+        cost = VIDEO_UPSCALE_CREDIT_COST[tier]
+        credits = _get_ad_credits(user_id)
+        if credits < cost:
+            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+
+        r = with_retry(
+            lambda: requests.post(
+                f"https://api.replicate.com/v1/models/{TOPAZ_VIDEO_UPSCALE_MODEL}/predictions",
+                headers=_replicate_headers(),
+                json={"input": {
+                    "video": f"data:video/mp4;base64,{req.video_base64}",
+                    "target_resolution": VIDEO_UPSCALE_RESOLUTION_BY_TIER[tier],
+                }},
+                timeout=20,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not r.ok:
+            logger.error("Replicate create prediction failed: %s", r.text)
+            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the upscale."))
+        prediction_id = r.json().get("id")
+        if not prediction_id:
+            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+
+        with_retry(lambda: supabase.table("upscale_video_jobs").insert({
+            "prediction_id": prediction_id,
+            "owner_id": user_id,
+            "tier": tier,
+        }).execute())
+
+        return {"prediction_id": prediction_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/upscale-video-status", response_model=UpscaleVideoStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_video_upscale_status(
+    request: Request,
+    req: UpscaleVideoStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        job_res = with_retry(lambda: supabase.table("upscale_video_jobs")
+            .select("*")
+            .eq("prediction_id", req.prediction_id)
+            .eq("owner_id", user_id)
+            .execute())
+        job_res = ensure_supabase_response(job_res, "get upscale video job")
+        if not job_res.data:
+            raise HTTPException(status_code=404, detail="Upscale job not found.")
+        tier = job_res.data[0]["tier"]
+
+        r = requests.get(
+            f"https://api.replicate.com/v1/predictions/{req.prediction_id}",
+            headers=_replicate_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        status = data.get("status")
+
+        if status not in ("succeeded", "failed", "canceled"):
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        with_retry(lambda: supabase.table("upscale_video_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+
+        if status != "succeeded":
+            logger.error("Replicate prediction %s finished as %s: %s", req.prediction_id, status, data.get("error"))
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+
+        video_url = data.get("output")
+        if not video_url:
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        video_resp = requests.get(video_url, timeout=120)
+        video_resp.raise_for_status()
+        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+
+        new_credits = _spend_ad_credits(user_id, VIDEO_UPSCALE_CREDIT_COST[tier], "video_upscale", tier)
+
+        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except requests.RequestException as e:
+        logger.error("Replicate status error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Couldn't check the upscale's status.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -6908,6 +7104,43 @@ async def enhance_image(
         result_bytes = await run_in_threadpool(_enhance_image, image_bytes, mime_type)
 
         new_credits = _spend_ad_credit(user_id, "enhance_image")
+
+        return {
+            "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/upscale-image", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def upscale_image(
+    request: Request,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """The home page's "Upscale" pill (image side) -- real 4x super-
+    resolution via Real-ESRGAN, not a Gemini edit (see
+    _upscale_image_replicate). Same flat 1-credit pricing as every other
+    image tool here -- the real Replicate cost is a fraction of a cent,
+    well inside that price."""
+    try:
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+
+        image_bytes = await file.read()
+        mime_type = file.content_type or "image/jpeg"
+        result_bytes = await run_in_threadpool(_upscale_image_replicate, image_bytes, mime_type)
+
+        new_credits = _spend_ad_credit(user_id, "upscale_image")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
