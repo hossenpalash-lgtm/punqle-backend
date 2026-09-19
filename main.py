@@ -1195,16 +1195,68 @@ class CompetitorAnalysisRequest(BaseModel):
     url: str
 
 
-class CompetitorDifferentiationIdea(BaseModel):
-    angle: str
-    idea: str
-    evidence: str
+# Rewritten 2026-09-19 -- see _generate_competitor_analysis's own docstring
+# for why (the old static-fetch approach silently misidentified the
+# competitor on Facebook/Instagram URLs). Metrics are always Optional[str]
+# ("Not publicly available" when unverified) -- never fabricated.
+class CompetitorSnapshot(BaseModel):
+    category: str = ""
+    what_they_sell: str = ""
+    target_customer: str = ""
+    positioning: str = ""
+    recent_developments: str = ""
+
+
+class CompetitorMetrics(BaseModel):
+    facebook_followers: Optional[str] = None
+    facebook_likes: Optional[str] = None
+    instagram_followers: Optional[str] = None
+    visible_post_engagement: Optional[str] = None
+
+
+class CompetitorPublicPresence(BaseModel):
+    website: Optional[str] = None
+    facebook: Optional[str] = None
+    instagram: Optional[str] = None
+    metrics: CompetitorMetrics = CompetitorMetrics()
+
+
+class CompetitorObservation(BaseModel):
+    observation: str
+    evidence: str = ""
+    source_url: Optional[str] = None
+
+
+class CompetitorCustomerSignal(BaseModel):
+    signal: str
+    evidence: str = ""
+    source_url: Optional[str] = None
+
+
+class CompetitorOpportunity(BaseModel):
+    title: str
+    opportunity: str
+    action: str = ""
+    evidence: str = ""
+    source_url: Optional[str] = None
+
+
+class CompetitorSource(BaseModel):
+    title: str = ""
+    url: str
+    source_type: str = "other"
 
 
 class CompetitorAnalysisResponse(BaseModel):
     competitor_name: str
+    source_url: str
     summary: str
-    differentiation_ideas: list[CompetitorDifferentiationIdea]
+    snapshot: CompetitorSnapshot
+    public_presence: CompetitorPublicPresence
+    what_theyre_doing: list[CompetitorObservation]
+    customer_signals: list[CompetitorCustomerSignal]
+    opportunities: list[CompetitorOpportunity]
+    sources: list[CompetitorSource]
 
 
 # -----------------------
@@ -2868,66 +2920,138 @@ Respond with ONLY this JSON format, nothing else:
     return [str(i).strip() for i in ideas if str(i).strip()][:8]
 
 
-def _generate_competitor_analysis(title: str, body_text: str, category: str) -> dict:
+def _generate_competitor_analysis(url: str, category: str) -> dict:
+    """Rewritten 2026-09-19 — replaces the old "fetch one static page,
+    then summarize" approach. That approach was fundamentally broken for
+    Facebook/Instagram URLs, not just weak: their real content is
+    JS-rendered and login-gated, so a plain HTTP fetch only ever saw
+    Facebook's/Instagram's OWN generic page — confirmed live with a real
+    test (facebook.com/allbirds returned competitor_name: "Facebook",
+    analyzing the platform instead of the actual competitor).
+
+    Uses OpenAI's Responses API with the real `web_search` tool instead
+    of a single pre-fetched page, so the model verifies the actual brand
+    behind the URL and pulls from multiple real, current sources (their
+    own site, public reviews, news) rather than being limited to what one
+    static fetch can see. No pre-fetch step at all now — the URL goes
+    straight into the prompt and web_search does the discovery.
+
+    Real API constraint, confirmed live before writing this: OpenAI's
+    web_search tool CANNOT be combined with strict JSON mode ("Web Search
+    cannot be used with JSON mode", a real 400) — unlike every other
+    JSON-returning OpenAI call in this file, this one can't use
+    response_format={"type": "json_object"}. Asks for JSON in the prompt
+    instead and parses defensively (same markdown-fence-stripping
+    fallback already used elsewhere in this file for exactly this
+    reason), since a malformed response is a real possibility here in a
+    way it normally isn't.
+
+    Social metrics (follower/like counts) are deliberately optional and
+    null-by-default in the prompt — web_search has no privileged access
+    to Meta's real analytics, only whatever a public source happens to
+    mention. Never fabricated; "not publicly available" in the frontend
+    when null."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
-    # Real, current search-interest grounding (same helper/data source as
-    # suggest-hashtags) — not competitor-specific data (no ad-library or
-    # social-metrics access exists), just an honest signal for whether
-    # something in this space is genuinely trending right now, so an
-    # angle can reference it when true instead of only ever guessing.
-    trending_terms = _fetch_trending_related_terms(title or body_text[:100])
+    trending_terms = _fetch_trending_related_terms(url)
     trending_context = (
         f"\nReal, currently trending related searches (from Google Trends, last 7 days) in this space — "
-        f"reference one only if it genuinely fits an angle, don't force it: {', '.join(trending_terms)}\n"
+        f"reference one only if it genuinely fits an opportunity, don't force it: {', '.join(trending_terms)}\n"
         if trending_terms else ""
     )
     prompt = f"""You are a marketing strategist helping a small business understand a competitor.
 
 {category_guidance}
 {trending_context}
-Here is publicly visible information about a competitor:
-Name/Title: {title or "(unknown)"}
-Content: {body_text}
+The competitor's URL is: {url}
 
-Based ONLY on the information above — don't invent facts, prices, or claims you can't see there — write:
-1. A short 2-3 sentence summary of what this competitor seems to focus on or offer.
-2. Exactly 3 distinct strategic angles this business could use to stand out, each grounded only in something actually missing or underused based on the competitor info above (and the real trending data, only where genuinely relevant — never claim it applies if it doesn't). Give each a short angle label (e.g. "Emotional Story", "Direct Offer", "Educational Angle", "Trend-Aware Angle" — pick whatever genuinely fits, don't force these exact ones), one specific actionable sentence, and one short "evidence" sentence naming the exact thing you saw (or didn't see) in the competitor content above — or, only for a trend-based angle, the specific trending search term — that this idea is based on. The evidence must point to something concrete and checkable, never a vague justification.
+This may be their own website, or a Facebook/Instagram page. If it's a social page you can't read directly (login wall, JavaScript-rendered feed), do NOT analyze Facebook or Instagram itself as if it were the competitor — instead, identify the real brand/business behind that URL (from the URL slug, any visible preview text, or by searching for it) and search the web for that brand's own website, public reviews, news, and other public sources instead.
 
-Respond with ONLY this JSON format, nothing else:
-{{"summary": "...", "differentiation_ideas": [{{"angle": "...", "idea": "...", "evidence": "..."}}]}}
+Search the real web for current, real information about this competitor and produce:
+1. Their real brand/company name (never "Facebook" or "Instagram" — that would mean you analyzed the platform, not the competitor).
+2. A short 2-3 sentence summary of what they focus on or offer.
+3. A snapshot: category, what they sell, their target customer, their positioning, and any genuinely relevant recent development (only include recent_developments if you actually found something real and dated — leave it empty otherwise, don't invent one).
+4. Their public presence: their website URL, Facebook page URL, Instagram URL (whichever you can find/confirm) — and, ONLY if you find real, specific numbers from an actual public source (never estimate or guess), their Facebook followers, Facebook likes, Instagram followers, and typical visible post engagement. Leave any metric you can't verify as null — do not invent a number.
+5. 2-3 real observations about what they're actually doing (content themes, messaging, offers), each with a one-sentence piece of evidence and the source URL it came from.
+6. 2-3 real customer signals from actual public reviews/discussions (Trustpilot, Reddit, etc. — only if you find real ones), each with evidence and the source URL.
+7. Exactly 3 distinct strategic opportunities a small competing business could use to stand out, each grounded in something you actually found (a gap, a complaint, an underused angle) — not generic advice like "post more" or "improve engagement." Each needs: a short title, the opportunity itself, one concrete action the user could take (a specific piece of content to create), the evidence it's based on, and the source URL.
+8. A list of every real source URL you used, with a short title and what kind of source it is (official/news/review/social/other).
+
+Respond with ONLY this JSON format, nothing else, no markdown code fences:
+{{
+  "competitor_name": "...",
+  "source_url": "...",
+  "summary": "...",
+  "snapshot": {{"category": "...", "what_they_sell": "...", "target_customer": "...", "positioning": "...", "recent_developments": "..."}},
+  "public_presence": {{"website": "...", "facebook": "...", "instagram": "...", "metrics": {{"facebook_followers": null, "facebook_likes": null, "instagram_followers": null, "visible_post_engagement": null}}}},
+  "what_theyre_doing": [{{"observation": "...", "evidence": "...", "source_url": "..."}}],
+  "customer_signals": [{{"signal": "...", "evidence": "...", "source_url": "..."}}],
+  "opportunities": [{{"title": "...", "opportunity": "...", "action": "...", "evidence": "...", "source_url": "..."}}],
+  "sources": [{{"title": "...", "url": "...", "source_type": "official"}}]
+}}
 """
     response = with_retry(
-        lambda: client.chat.completions.create(
+        lambda: client.responses.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You help small business owners understand a competitor and find ways to stand out, grounded only in what's actually given to you."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.6,
-            response_format={"type": "json_object"},
+            tools=[{"type": "web_search"}],
+            input=prompt,
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
-    ai_text = response.choices[0].message.content.strip()
+    ai_text = response.output_text.strip()
     m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
     ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
     parsed = json.loads(ai_text_clean)
-    ideas_raw = parsed.get("differentiation_ideas") or []
-    ideas = []
-    for item in ideas_raw[:3]:
-        if not isinstance(item, dict):
-            continue
-        idea_text = str(item.get("idea") or "").strip()
-        if not idea_text:
-            continue
-        ideas.append({
-            "angle": str(item.get("angle") or "Idea").strip(),
-            "idea": idea_text,
-            "evidence": str(item.get("evidence") or "").strip(),
-        })
+
+    def _strip_inline_citations(text: str) -> str:
+        # OpenAI's web_search tool appends inline markdown citations like
+        # "([domain.com](https://...))" directly into text fields, even
+        # when asked for plain JSON — confirmed live, not hypothetical.
+        # Stripped since every item here already carries its own separate,
+        # clickable source_url field for exactly this purpose.
+        return re.sub(r"\s*\(\[[^\]]*\]\([^)]*\)\)", "", text or "").strip()
+
+    def _str_list(raw, keys, limit):
+        out = []
+        for item in (raw or [])[:limit]:
+            if not isinstance(item, dict):
+                continue
+            row = {}
+            for k in keys:
+                val = str(item.get(k) or "").strip()
+                row[k] = val if k in ("url", "source_url") else _strip_inline_citations(val)
+            if any(row.values()):
+                out.append(row)
+        return out
+
+    snapshot = parsed.get("snapshot") or {}
+    presence = parsed.get("public_presence") or {}
+    metrics = presence.get("metrics") or {}
     return {
-        "summary": str(parsed.get("summary") or "").strip(),
-        "differentiation_ideas": ideas,
+        "competitor_name": str(parsed.get("competitor_name") or "Competitor").strip(),
+        "source_url": str(parsed.get("source_url") or url).strip(),
+        "summary": _strip_inline_citations(str(parsed.get("summary") or "")),
+        "snapshot": {
+            "category": _strip_inline_citations(str(snapshot.get("category") or "")),
+            "what_they_sell": _strip_inline_citations(str(snapshot.get("what_they_sell") or "")),
+            "target_customer": _strip_inline_citations(str(snapshot.get("target_customer") or "")),
+            "positioning": _strip_inline_citations(str(snapshot.get("positioning") or "")),
+            "recent_developments": _strip_inline_citations(str(snapshot.get("recent_developments") or "")),
+        },
+        "public_presence": {
+            "website": (str(presence.get("website")).strip() or None) if presence.get("website") else None,
+            "facebook": (str(presence.get("facebook")).strip() or None) if presence.get("facebook") else None,
+            "instagram": (str(presence.get("instagram")).strip() or None) if presence.get("instagram") else None,
+            "metrics": {
+                "facebook_followers": (str(metrics.get("facebook_followers")).strip() or None) if metrics.get("facebook_followers") else None,
+                "facebook_likes": (str(metrics.get("facebook_likes")).strip() or None) if metrics.get("facebook_likes") else None,
+                "instagram_followers": (str(metrics.get("instagram_followers")).strip() or None) if metrics.get("instagram_followers") else None,
+                "visible_post_engagement": (str(metrics.get("visible_post_engagement")).strip() or None) if metrics.get("visible_post_engagement") else None,
+            },
+        },
+        "what_theyre_doing": _str_list(parsed.get("what_theyre_doing"), ["observation", "evidence", "source_url"], 3),
+        "customer_signals": _str_list(parsed.get("customer_signals"), ["signal", "evidence", "source_url"], 3),
+        "opportunities": _str_list(parsed.get("opportunities"), ["title", "opportunity", "action", "evidence", "source_url"], 3),
+        "sources": _str_list(parsed.get("sources"), ["title", "url", "source_type"], 10),
     }
 
 
@@ -9531,31 +9655,32 @@ def blog_to_posts(
 
 
 @app.post("/ads/competitor-analysis", response_model=CompetitorAnalysisResponse, tags=["ads"])
-@limiter.limit("8/minute")
+@limiter.limit("5/minute")
 def competitor_analysis(
     request: Request,
     req: CompetitorAnalysisRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Free — one fetch + one text-only GPT call, same pattern as
-    blog-to-posts. Works best on a competitor's own website; Facebook/
-    Instagram pages are JS-rendered, so only their public link-preview
-    meta tags (title/description) are reliably visible to a plain HTTP
-    fetch, not their actual post feed — no scraping login-gated content."""
+    """Free — one real web-search-grounded GPT call (see
+    _generate_competitor_analysis), no pre-fetch step. Rate limit lowered
+    from 8/min to 5/min vs the old version: this now does real web
+    search + costs real (if small, ~$0.01-0.03) money per call, and takes
+    meaningfully longer (multiple search round-trips inside one call) —
+    the old 8/min was calibrated for a single cheap fetch+summarize."""
     try:
         url = (req.url or "").strip()
         if not url:
             raise HTTPException(status_code=400, detail="Paste a competitor's website or page link.")
-        title, body_text = _extract_article_text(url)
-        if not title and not body_text:
-            raise HTTPException(status_code=422, detail="Couldn't find any content at that link.")
         category = _get_business_category(user_id)
-        result = _generate_competitor_analysis(title, body_text, category)
+        result = _generate_competitor_analysis(url, category)
         if not result["summary"]:
             raise HTTPException(status_code=502, detail="Couldn't analyze that link. Try another one.")
-        return {"competitor_name": title or "Competitor", **result}
+        return result
     except HTTPException:
         raise
+    except json.JSONDecodeError:
+        logger.error("Competitor analysis returned unparseable JSON for url=%s", req.url)
+        raise HTTPException(status_code=502, detail="Couldn't analyze that link. Try another one.")
     except requests.RequestException:
         raise HTTPException(status_code=400, detail="Couldn't reach that link.")
     except Exception as e:
