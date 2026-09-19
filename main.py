@@ -8319,7 +8319,7 @@ def sync_shopify_products(request: Request, user_id: str = Depends(get_current_u
 
 
 @app.get("/meta/connect-url", response_model=MetaConnectUrlResponse, tags=["meta"])
-def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
+def get_meta_connect_url(insights: bool = False, user_id: str = Depends(get_current_user_id)):
     """Returns the Facebook OAuth dialog URL for the frontend to
     navigate the browser to directly — generated via an authenticated
     call specifically so the signed state param can be tied to this
@@ -8353,7 +8353,11 @@ def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
         # DOES see Business-Portfolio-governed pages regardless of classic
         # per-Page access. Works immediately for app admins/testers even
         # before this permission clears its own App Review.
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management",
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management"
+        # Opt-in only (Competitive Edge "Unlock Instagram stats"): never part of
+        # the default Connect, because a scope Meta hasn't approved yet must not
+        # be able to break the normal connection for users without an app role.
+        + (",instagram_manage_insights" if insights else ""),
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
@@ -10257,6 +10261,391 @@ def delete_saved_competitor(competitor_id: str, user_id: str = Depends(get_curre
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Competitive Edge -- Instagram stats for a public Business/Creator account,
+# via Instagram's official Business Discovery API (needs instagram_manage_insights).
+# Every number below is computed in code from the real posts Instagram returns;
+# the model only names the content themes.
+# ---------------------------------------------------------------------------
+class IgStatsRequest(BaseModel):
+    username: str
+
+
+class IgTypeStat(BaseModel):
+    type: str
+    label: str
+    posts: int
+    share_pct: float
+    avg_engagement: float
+    total_engagement: int
+
+
+class IgHashtagStat(BaseModel):
+    tag: str
+    posts: int
+    avg_engagement: float
+
+
+class IgThemeStat(BaseModel):
+    theme: str
+    posts: int
+    share_pct: float
+    engagement_share_pct: float
+    avg_engagement: float
+
+
+class IgTopPost(BaseModel):
+    url: str
+    type: str
+    date: str
+    likes: Optional[int] = None
+    comments: int
+    engagement: int
+    caption: str
+
+
+class IgTimelinePoint(BaseModel):
+    label: str
+    posts: int
+    engagement: int
+
+
+class IgStatsResponse(BaseModel):
+    status: str
+    message: str = ""
+    username: str = ""
+    followers: Optional[int] = None
+    total_posts: Optional[int] = None
+    analyzed_posts: int = 0
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    avg_likes: Optional[float] = None
+    avg_comments: Optional[float] = None
+    avg_engagement: Optional[float] = None
+    engagement_rate_pct: Optional[float] = None
+    likes_hidden: bool = False
+    types: list[IgTypeStat] = []
+    heatmap_posts: list[list[int]] = []
+    heatmap_engagement: list[list[int]] = []
+    timeline: list[IgTimelinePoint] = []
+    timeline_unit: str = "week"
+    hashtags: list[IgHashtagStat] = []
+    themes: list[IgThemeStat] = []
+    top_posts: list[IgTopPost] = []
+    takeaways: list[str] = []
+
+
+class _IgError(Exception):
+    def __init__(self, status: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+IG_STATS_CACHE_SECONDS = 900
+IG_MEDIA_PAGE_SIZE = 50
+IG_MAX_PAGES = 2
+_IG_MEDIA_FIELDS = "id,caption,like_count,comments_count,media_type,timestamp,permalink"
+_IG_STATS_CACHE: dict = {}
+_IG_TYPE_LABELS = {"image": "Image", "video": "Reel / Video", "carousel": "Carousel", "other": "Other"}
+_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _clean_ig_username(raw: str) -> str:
+    v = (raw or "").strip()
+    m = re.search(r"instagram\.com/([A-Za-z0-9._]+)", v)
+    if m:
+        v = m.group(1)
+    return v.lstrip("@").strip("/ ").lower()[:60] if re.fullmatch(r"@?[A-Za-z0-9._]{1,60}/?", v) else ""
+
+
+def _fmt_num(n: float) -> str:
+    n = float(n)
+    for size, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if abs(n) >= size:
+            return f"{n / size:.1f}".rstrip("0").rstrip(".") + suffix
+    return f"{n:.0f}"
+
+
+def _ig_graph_error(payload: dict) -> _IgError:
+    err = (payload or {}).get("error") or {}
+    code = err.get("code")
+    logger.error("Instagram Business Discovery error: %s", json.dumps(err)[:500])
+    if code in (10, 190, 102) or (isinstance(code, int) and 200 <= code < 300):
+        return _IgError("needs_unlock", "Punqle needs one more Instagram permission to read competitor stats.")
+    if code == 110 or "Invalid user id" in str(err.get("message", "")):
+        return _IgError("unavailable_account", "Instagram doesn't share stats for this account. It has to be a public Business or Creator account.")
+    if code in (4, 17, 32, 613):
+        return _IgError("error", "Instagram is limiting requests right now. Try again in a few minutes.")
+    return _IgError("error", "Couldn't read that Instagram account right now.")
+
+
+def _fetch_instagram_business_discovery(ig_user_id: str, token: str, username: str) -> tuple:
+    def _query(fields: str) -> dict:
+        resp = with_retry(
+            lambda: requests.get(
+                f"{META_GRAPH_URL}/{ig_user_id}",
+                params={"fields": f"business_discovery.username({username}){{{fields}}}", "access_token": token},
+                timeout=30,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        data = resp.json()
+        if resp.status_code != 200 or "error" in data:
+            raise _ig_graph_error(data)
+        return data["business_discovery"]
+
+    first = _query(f"username,followers_count,media_count,media.limit({IG_MEDIA_PAGE_SIZE}){{{_IG_MEDIA_FIELDS}}}")
+    profile = {"followers": first.get("followers_count"), "total_posts": first.get("media_count")}
+    media = list((first.get("media") or {}).get("data", []))
+    cursor = ((first.get("media") or {}).get("paging") or {}).get("cursors", {}).get("after")
+    pages = 1
+    while cursor and pages < IG_MAX_PAGES:
+        try:
+            nxt = _query(f"media.after({cursor}).limit({IG_MEDIA_PAGE_SIZE}){{{_IG_MEDIA_FIELDS}}}")
+        except _IgError:
+            break
+        page = (nxt.get("media") or {})
+        media.extend(page.get("data", []))
+        cursor = (page.get("paging") or {}).get("cursors", {}).get("after") if page.get("data") else None
+        pages += 1
+    return profile, media
+
+
+def _parse_ig_ts(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return None
+
+
+def _label_instagram_themes(captions: list) -> list:
+    """captions: list[str] (may be empty strings). Returns a theme name per
+    caption (same length). Best-effort -- returns [] if labelling fails."""
+    numbered = [(i, c) for i, c in enumerate(captions) if c.strip()]
+    if len(numbered) < 6:
+        return []
+    squash = lambda c: re.sub(r"\s+", " ", c)[:220]
+    listing = "\n".join(f"{i + 1}. {squash(c)}" for i, c in numbered)
+    prompt = f"""Below are numbered Instagram captions from one brand. Group them into 4 to 7 content themes that describe what each post is ABOUT (e.g. "New product launches", "Behind the scenes", "Seasonal promotions"). Every numbered post must be in exactly one theme. Theme names: 1-4 words, plain English, no hashtags.
+
+{listing}
+
+Respond with ONLY this JSON: {{"themes": [{{"name": "...", "posts": [1, 2]}}]}}"""
+    messages = [
+        {"role": "system", "content": "You group social media posts into content themes and reply only with JSON."},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        try:
+            resp = with_retry(
+                lambda: client.chat.completions.create(
+                    model=COMPETITOR_STRUCTURE_MODEL, messages=messages,
+                    reasoning_effort="low", response_format={"type": "json_object"},
+                ),
+                exceptions=RETRYABLE_OPENAI_ERRORS,
+            )
+        except (NotFoundError, BadRequestError):
+            resp = with_retry(
+                lambda: client.chat.completions.create(
+                    model="gpt-4o-mini", messages=messages, temperature=0.2,
+                    response_format={"type": "json_object"},
+                ),
+                exceptions=RETRYABLE_OPENAI_ERRORS,
+            )
+        groups = json.loads(resp.choices[0].message.content.strip()).get("themes", [])
+    except Exception as e:
+        logger.error("Instagram theme labelling failed: %s", str(e), exc_info=True)
+        return []
+    labels = [""] * len(captions)
+    for g in groups:
+        name = re.sub(r"\s+", " ", str(g.get("name", ""))).strip()[:40]
+        for n in g.get("posts", []):
+            if isinstance(n, int) and 1 <= n <= len(captions) and name and not labels[n - 1]:
+                labels[n - 1] = name
+    return [l or ("Other" if captions[i].strip() else "No caption") for i, l in enumerate(labels)]
+
+
+def _aggregate_instagram_stats(username: str, profile: dict, media: list, theme_labels: Optional[list] = None) -> dict:
+    posts = []
+    for m in media:
+        ts = _parse_ig_ts(m.get("timestamp", ""))
+        if not ts or not m.get("permalink"):
+            continue
+        raw_type = (m.get("media_type") or "").upper()
+        ptype = {"IMAGE": "image", "VIDEO": "video", "CAROUSEL_ALBUM": "carousel"}.get(raw_type, "other")
+        likes = m.get("like_count")
+        comments = int(m.get("comments_count") or 0)
+        posts.append({
+            "ts": ts, "type": ptype, "likes": likes if isinstance(likes, int) else None,
+            "comments": comments, "eng": (likes if isinstance(likes, int) else 0) + comments,
+            "url": m["permalink"], "caption": m.get("caption") or "",
+        })
+    posts.sort(key=lambda p: p["ts"], reverse=True)
+    n = len(posts)
+    out: dict = {"status": "ok", "username": username, "followers": profile.get("followers"),
+                 "total_posts": profile.get("total_posts"), "analyzed_posts": n}
+    if n == 0:
+        return {**out, "status": "unavailable_account", "message": "This account has no public posts to analyze."}
+    if theme_labels and len(theme_labels) == len(media):
+        pass  # labels are matched by caption index below, not media index
+    with_likes = [p for p in posts if p["likes"] is not None]
+    out["likes_hidden"] = len(with_likes) < n / 2
+    out["avg_likes"] = round(sum(p["likes"] for p in with_likes) / len(with_likes), 1) if with_likes else None
+    out["avg_comments"] = round(sum(p["comments"] for p in posts) / n, 1)
+    avg_eng = sum(p["eng"] for p in posts) / n
+    out["avg_engagement"] = round(avg_eng, 1)
+    followers = profile.get("followers")
+    out["engagement_rate_pct"] = round(avg_eng / followers * 100, 2) if followers else None
+    out["date_from"] = posts[-1]["ts"].strftime("%Y-%m-%d")
+    out["date_to"] = posts[0]["ts"].strftime("%Y-%m-%d")
+    span_days = max((posts[0]["ts"] - posts[-1]["ts"]).days + 1, 1)
+
+    types = []
+    for t in ("image", "video", "carousel", "other"):
+        group = [p for p in posts if p["type"] == t]
+        if group:
+            total = sum(p["eng"] for p in group)
+            types.append({"type": t, "label": _IG_TYPE_LABELS[t], "posts": len(group),
+                          "share_pct": round(len(group) / n * 100, 1),
+                          "avg_engagement": round(total / len(group), 1), "total_engagement": total})
+    out["types"] = types
+
+    heat_posts = [[0] * 6 for _ in range(7)]
+    heat_eng = [[0] * 6 for _ in range(7)]
+    for p in posts:
+        r, c = p["ts"].astimezone(timezone.utc).weekday(), p["ts"].astimezone(timezone.utc).hour // 4
+        heat_posts[r][c] += 1
+        heat_eng[r][c] += p["eng"]
+    out["heatmap_posts"], out["heatmap_engagement"] = heat_posts, heat_eng
+
+    unit = "week" if span_days <= 210 else "month"
+    buckets: dict = {}
+    for p in posts:
+        d = p["ts"].astimezone(timezone.utc).date()
+        key = d - timedelta(days=d.weekday()) if unit == "week" else d.replace(day=1)
+        b = buckets.setdefault(key, {"posts": 0, "eng": 0})
+        b["posts"] += 1
+        b["eng"] += p["eng"]
+    timeline = []
+    cur, last = min(buckets), max(buckets)
+    while cur <= last:
+        b = buckets.get(cur, {"posts": 0, "eng": 0})
+        timeline.append({"label": cur.strftime("%b %d") if unit == "week" else cur.strftime("%b %Y"),
+                         "posts": b["posts"], "engagement": b["eng"]})
+        if unit == "week":
+            cur += timedelta(days=7)
+        else:
+            cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+    out["timeline"], out["timeline_unit"] = timeline, unit
+
+    tag_stats: dict = {}
+    for p in posts:
+        for tag in {t.lower() for t in re.findall(r"#([\wঀ-৿]+)", p["caption"])}:
+            s = tag_stats.setdefault(tag, {"posts": 0, "eng": 0})
+            s["posts"] += 1
+            s["eng"] += p["eng"]
+    out["hashtags"] = [
+        {"tag": t, "posts": s["posts"], "avg_engagement": round(s["eng"] / s["posts"], 1)}
+        for t, s in sorted(tag_stats.items(), key=lambda kv: (-kv[1]["posts"], -kv[1]["eng"]))[:10]
+    ]
+
+    out["top_posts"] = [
+        {"url": p["url"], "type": p["type"], "date": p["ts"].strftime("%Y-%m-%d"), "likes": p["likes"],
+         "comments": p["comments"], "engagement": p["eng"], "caption": re.sub(r"\s+", " ", p["caption"]).strip()[:140]}
+        for p in sorted(posts, key=lambda p: p["eng"], reverse=True)[:6]
+    ]
+
+    themes = []
+    if theme_labels:
+        label_by_url = {}
+        for m, lab in zip(media, theme_labels):
+            if m.get("permalink"):
+                label_by_url[m["permalink"]] = lab
+        groups: dict = {}
+        for p in posts:
+            lab = label_by_url.get(p["url"])
+            if lab:
+                g = groups.setdefault(lab, {"posts": 0, "eng": 0})
+                g["posts"] += 1
+                g["eng"] += p["eng"]
+        total_eng = sum(p["eng"] for p in posts) or 1
+        themes = [
+            {"theme": lab, "posts": g["posts"], "share_pct": round(g["posts"] / n * 100, 1),
+             "engagement_share_pct": round(g["eng"] / total_eng * 100, 1), "avg_engagement": round(g["eng"] / g["posts"], 1)}
+            for lab, g in sorted(groups.items(), key=lambda kv: -kv[1]["eng"])
+        ]
+    out["themes"] = themes
+
+    take = []
+    per_week = n / (span_days / 7)
+    take.append(f"Posts about {per_week:.1f} time{'s' if per_week >= 1.5 else ''} a week (last {span_days} days, {n} posts analyzed).")
+    ranked = [t for t in types if t["posts"] >= 3 and t["type"] != "other"]
+    if len(ranked) >= 2:
+        ranked.sort(key=lambda t: -t["avg_engagement"])
+        a, b = ranked[0], ranked[-1]
+        if a["avg_engagement"] > b["avg_engagement"] * 1.15:
+            take.append(f"{a['label']} posts earn the most engagement per post (avg {_fmt_num(a['avg_engagement'])} vs {_fmt_num(b['avg_engagement'])} for {b['label']}).")
+    if n >= 10:
+        best = max(((r, c) for r in range(7) for c in range(6)), key=lambda rc: heat_eng[rc[0]][rc[1]])
+        if heat_eng[best[0]][best[1]] > 0:
+            take.append(f"Most engagement comes from posts on {_WEEKDAYS[best[0]]}, {best[1] * 4:02d}:00-{best[1] * 4 + 4:02d}:00 UTC.")
+    top = out["top_posts"][0]
+    if avg_eng > 0 and top["engagement"] >= avg_eng * 3:
+        take.append(f"Their best post got {top['engagement'] / avg_eng:.0f}x the average engagement ({_fmt_num(top['engagement'])}).")
+    if themes and len(themes) >= 2:
+        lift = max(themes, key=lambda t: t["engagement_share_pct"] - t["share_pct"])
+        if lift["posts"] >= 3 and lift["engagement_share_pct"] - lift["share_pct"] >= 3:
+            take.append(f"\"{lift['theme']}\" is {lift['share_pct']:.0f}% of their posts but {lift['engagement_share_pct']:.0f}% of their engagement.")
+    out["takeaways"] = take
+    return out
+
+
+@app.post("/ads/competitor-instagram-stats", response_model=IgStatsResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def competitor_instagram_stats(
+    request: Request,
+    req: IgStatsRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free (no credits): Instagram's own API + one small labelling call.
+    Returns HTTP 200 with a `status` the UI can act on instead of an error
+    for the expected cases (needs_unlock / no_instagram / unavailable_account)."""
+    username = _clean_ig_username(req.username)
+    if not username:
+        raise HTTPException(status_code=400, detail="Enter a valid Instagram username.")
+    cache_key = (user_id, username)
+    hit = _IG_STATS_CACHE.get(cache_key)
+    if hit and time.time() - hit[0] < IG_STATS_CACHE_SECONDS:
+        return hit[1]
+    try:
+        res = with_retry(lambda: supabase.table("meta_connections")
+            .select("page_access_token, ig_user_id")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get meta connection for instagram stats")
+        conn = res.data[0] if res.data else None
+        if not conn or not conn.get("ig_user_id"):
+            return {"status": "no_instagram", "username": username,
+                    "message": "Connect a Facebook Page that has an Instagram Business account to see competitor Instagram stats."}
+        profile, media = _fetch_instagram_business_discovery(conn["ig_user_id"], conn["page_access_token"], username)
+        labels = _label_instagram_themes([m.get("caption") or "" for m in media])
+        result = _aggregate_instagram_stats(username, profile, media, labels)
+    except _IgError as e:
+        return {"status": e.status, "message": e.message, "username": username}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail="Couldn't load Instagram stats right now.")
+    if result["status"] == "ok":
+        if len(_IG_STATS_CACHE) > 200:
+            _IG_STATS_CACHE.clear()
+        _IG_STATS_CACHE[cache_key] = (time.time(), result)
+    return result
 
 
 @app.post("/ads/competitor-analysis", response_model=CompetitorAnalysisResponse, tags=["ads"])
