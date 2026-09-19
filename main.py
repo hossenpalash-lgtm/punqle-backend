@@ -1194,6 +1194,18 @@ class BlogToPostsResponse(BaseModel):
 
 class CompetitorAnalysisRequest(BaseModel):
     url: str
+    refresh: bool = False
+
+
+class SavedCompetitorItem(BaseModel):
+    id: str
+    competitor_name: str
+    source_url: str
+    analyzed_at: str
+
+
+class SavedCompetitorsListResponse(BaseModel):
+    competitors: list[SavedCompetitorItem]
 
 
 # Rewritten 2026-09-19 -- see _generate_competitor_analysis's own docstring
@@ -1259,6 +1271,9 @@ class CompetitorAnalysisResponse(BaseModel):
     opportunities: list[CompetitorOpportunity]
     sources: list[CompetitorSource]
     limitations: list[str] = []
+    id: Optional[str] = None
+    analyzed_at: Optional[str] = None
+    cached: bool = False
 
 
 # -----------------------
@@ -10096,6 +10111,135 @@ def blog_to_posts(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+COMPETITOR_CACHE_DAYS = 3
+COMPETITORS_RETENTION = 30
+
+
+def _competitor_source_key(url: str) -> str:
+    u = url.strip()
+    if "://" not in u:
+        u = "https://" + u
+    parts = urlsplit(u)
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return f"{host}{parts.path.rstrip('/').lower()}"[:300]
+
+
+def _parse_db_timestamp(value: str) -> datetime:
+    v = value.replace("Z", "+00:00")
+    m = re.match(r"^(.*?\.)(\d+)(.*)$", v)
+    if m:
+        v = f"{m.group(1)}{m.group(2)[:6].ljust(6, '0')}{m.group(3)}"
+    return datetime.fromisoformat(v)
+
+
+def _competitor_cache_is_fresh(updated_at: str) -> bool:
+    try:
+        return datetime.now(timezone.utc) - _parse_db_timestamp(updated_at) < timedelta(days=COMPETITOR_CACHE_DAYS)
+    except Exception:
+        return False
+
+
+def _saved_competitor_to_response(row: dict) -> dict:
+    return {**row["result"], "id": row["id"], "analyzed_at": row["updated_at"], "cached": True}
+
+
+def _get_saved_competitor_by_key(user_id: str, source_key: str) -> Optional[dict]:
+    """Best-effort — a missing/erroring table must never break the live
+    analysis path, so this returns None instead of raising."""
+    try:
+        res = with_retry(lambda: supabase.table("competitor_analyses")
+            .select("id, result, updated_at")
+            .eq("owner_id", user_id)
+            .eq("source_key", source_key)
+            .limit(1)
+            .execute())
+        res = ensure_supabase_response(res, "get saved competitor")
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logger.error("Failed to read saved competitor: %s", str(e), exc_info=True)
+        return None
+
+
+def _save_competitor_analysis(user_id: str, source_key: str, source_url: str, result: dict) -> Optional[dict]:
+    """Best-effort, same reasoning as _save_generated_post — the user is
+    already waiting on a paid analysis, a save failure must not lose it."""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        res = with_retry(lambda: supabase.table("competitor_analyses").upsert({
+            "owner_id": user_id,
+            "source_key": source_key,
+            "source_url": source_url,
+            "competitor_name": result["competitor_name"],
+            "result": result,
+            "updated_at": now,
+        }, on_conflict="owner_id,source_key").execute())
+        res = ensure_supabase_response(res, "save competitor analysis")
+        saved = res.data[0]
+        existing = with_retry(lambda: supabase.table("competitor_analyses")
+            .select("id")
+            .eq("owner_id", user_id)
+            .order("updated_at", desc=True)
+            .execute())
+        existing = ensure_supabase_response(existing, "list competitors for retention")
+        stale_ids = [row["id"] for row in existing.data[COMPETITORS_RETENTION:]]
+        if stale_ids:
+            supabase.table("competitor_analyses").delete().in_("id", stale_ids).execute()
+        return {"id": saved["id"], "updated_at": saved["updated_at"]}
+    except Exception as e:
+        logger.error("Failed to save competitor analysis: %s", str(e), exc_info=True)
+        return None
+
+
+@app.get("/ads/competitors", response_model=SavedCompetitorsListResponse, tags=["ads"])
+def list_saved_competitors(user_id: str = Depends(get_current_user_id)):
+    """Free, no AI call. Returns [] (not a 500) if the table is missing so
+    the Competitive Edge tool itself keeps working."""
+    try:
+        res = with_retry(lambda: supabase.table("competitor_analyses")
+            .select("id, competitor_name, source_url, updated_at")
+            .eq("owner_id", user_id)
+            .order("updated_at", desc=True)
+            .execute())
+        res = ensure_supabase_response(res, "list saved competitors")
+        return {"competitors": [
+            {"id": r["id"], "competitor_name": r["competitor_name"], "source_url": r["source_url"], "analyzed_at": r["updated_at"]}
+            for r in res.data
+        ]}
+    except Exception as e:
+        logger.error("Failed to list saved competitors: %s", str(e), exc_info=True)
+        return {"competitors": []}
+
+
+@app.get("/ads/competitors/{competitor_id}", response_model=CompetitorAnalysisResponse, tags=["ads"])
+def get_saved_competitor(competitor_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("competitor_analyses")
+            .select("id, result, updated_at")
+            .eq("id", competitor_id)
+            .eq("owner_id", user_id)
+            .limit(1)
+            .execute())
+        res = ensure_supabase_response(res, "get saved competitor by id")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not res.data:
+        raise HTTPException(status_code=404, detail="That saved competitor no longer exists.")
+    return _saved_competitor_to_response(res.data[0])
+
+
+@app.delete("/ads/competitors/{competitor_id}", tags=["ads"])
+def delete_saved_competitor(competitor_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        supabase.table("competitor_analyses").delete().eq("id", competitor_id).eq("owner_id", user_id).execute()
+        return {"deleted": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ads/competitor-analysis", response_model=CompetitorAnalysisResponse, tags=["ads"])
 @limiter.limit("5/minute")
 def competitor_analysis(
@@ -10113,10 +10257,18 @@ def competitor_analysis(
         url = (req.url or "").strip()
         if not url:
             raise HTTPException(status_code=400, detail="Paste a competitor's website or page link.")
+        source_key = _competitor_source_key(url)
+        if not req.refresh:
+            cached = _get_saved_competitor_by_key(user_id, source_key)
+            if cached and _competitor_cache_is_fresh(cached["updated_at"]):
+                return _saved_competitor_to_response(cached)
         category = _get_business_category(user_id)
         result = _generate_competitor_analysis(url, category)
         if not result["summary"]:
             raise HTTPException(status_code=502, detail="Couldn't analyze that link. Try another one.")
+        saved = _save_competitor_analysis(user_id, source_key, url, result)
+        if saved:
+            result = {**result, "id": saved["id"], "analyzed_at": saved["updated_at"], "cached": False}
         return result
     except HTTPException:
         raise
