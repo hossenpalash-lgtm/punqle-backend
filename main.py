@@ -3,7 +3,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, field_validator
-from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
+from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, NotFoundError, BadRequestError
 from google import genai
 from google.genai import types as genai_types
 from google.genai import errors as genai_errors
@@ -76,6 +76,12 @@ if SENTRY_DSN:
 T = TypeVar("T")
 
 RETRYABLE_OPENAI_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError)
+
+# Structuring stage of Competitive Edge only (tiny prompt, ~3k tokens in). A 2026-09-19
+# replay of identical research notes showed gpt-4o-mini writes generic opportunities
+# while this model writes concrete, evidence-grounded ones and correctly returns none
+# when the notes hold no real gap.
+COMPETITOR_STRUCTURE_MODEL = "gpt-5.4-mini"
 
 
 def with_retry(fn: Callable[[], T], attempts: int = 3, delay: float = 1.0, exceptions=(Exception,)) -> T:
@@ -3368,18 +3374,31 @@ ALLOWED SOURCE URLS:
 Respond with ONLY this JSON shape (opportunities and customer_signals may be empty lists):
 {_COMPETITOR_JSON_SHAPE}
 """
-    response = with_retry(
-        lambda: client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You turn real research notes into structured competitor intelligence and never state anything the notes do not support."},
-                {"role": "user", "content": structure_prompt},
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        ),
-        exceptions=RETRYABLE_OPENAI_ERRORS,
-    )
+    structure_messages = [
+        {"role": "system", "content": "You turn real research notes into structured competitor intelligence and never state anything the notes do not support."},
+        {"role": "user", "content": structure_prompt},
+    ]
+    try:
+        response = with_retry(
+            lambda: client.chat.completions.create(
+                model=COMPETITOR_STRUCTURE_MODEL,
+                messages=structure_messages,
+                reasoning_effort="low",
+                response_format={"type": "json_object"},
+            ),
+            exceptions=RETRYABLE_OPENAI_ERRORS,
+        )
+    except (NotFoundError, BadRequestError):
+        logger.error("Competitor structuring model %s unavailable, falling back", COMPETITOR_STRUCTURE_MODEL, exc_info=True)
+        response = with_retry(
+            lambda: client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=structure_messages,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            ),
+            exceptions=RETRYABLE_OPENAI_ERRORS,
+        )
     parsed = json.loads(response.choices[0].message.content.strip())
 
     def _strip_inline_citations(text: str) -> str:
