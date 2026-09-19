@@ -38,7 +38,8 @@ import secrets
 import stripe
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pytrends.request import TrendReq
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, urlsplit, urlunsplit, parse_qsl
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
@@ -1257,6 +1258,7 @@ class CompetitorAnalysisResponse(BaseModel):
     customer_signals: list[CompetitorCustomerSignal]
     opportunities: list[CompetitorOpportunity]
     sources: list[CompetitorSource]
+    limitations: list[str] = []
 
 
 # -----------------------
@@ -2920,75 +2922,77 @@ Respond with ONLY this JSON format, nothing else:
     return [str(i).strip() for i in ideas if str(i).strip()][:8]
 
 
-def _generate_competitor_analysis(url: str, category: str) -> dict:
-    """Rewritten 2026-09-19 — replaces the old "fetch one static page,
-    then summarize" approach. That approach was fundamentally broken for
-    Facebook/Instagram URLs, not just weak: their real content is
-    JS-rendered and login-gated, so a plain HTTP fetch only ever saw
-    Facebook's/Instagram's OWN generic page — confirmed live with a real
-    test (facebook.com/allbirds returned competitor_name: "Facebook",
-    analyzing the platform instead of the actual competitor).
+_SOCIAL_HOSTS = ("facebook.com", "fb.com", "instagram.com", "tiktok.com", "youtube.com", "linkedin.com", "twitter.com", "x.com")
+_SOCIAL_PLATFORM_NAMES = {"facebook", "instagram", "meta", "tiktok", "youtube", "linkedin", "twitter", "x"}
+# Traffic-stat / whois / site-analytics directories: they show up in a
+# plain "brand.com" search but say nothing real about the business, and
+# were being listed as "sources" (confirmed live on a real Apex Footwear
+# run) -- never surfaced or cited.
+_LOW_VALUE_SOURCE_HOSTS = (
+    "webrate.org", "rankchart.org", "semrush.com", "similarweb.com", "alexa.com", "siteprice.org",
+    "statshow.com", "urlscan.io", "who.is", "whois.com", "builtwith.com", "websiteoutlook.com",
+    # Employee / job-seeker review sites: real pages, but they're not
+    # CUSTOMER feedback -- a live Apex Footwear run turned Glassdoor
+    # employee complaints into a "customer signal" and an irrelevant
+    # "Work-Life Balance" ad opportunity.
+    "glassdoor.com", "indeed.com", "ambitionbox.com", "comparably.com", "payscale.com",
+)
+_COMPETITOR_OPPORTUNITY_EVIDENCE_TYPES = {"competitor_content", "customer_feedback", "news"}
+# Backstop for "absence of data is not evidence": catches phrasings like
+# "no visible social media engagement metrics" / "lack of publicly
+# available customer reviews" used as the reason for an opportunity.
+_ABSENCE_OF_DATA_RE = re.compile(
+    r"\b(no|not|lack(?:s|ing)?|absence|absent|limited|few|without|unavailable|missing|insufficient)\b[^.]{0,80}"
+    r"\b(social media|engagement|metrics?|followers?|likes|reviews?|testimonials?|online presence|publicly available)\b",
+    re.I,
+)
 
-    Uses OpenAI's Responses API with the real `web_search` tool instead
-    of a single pre-fetched page, so the model verifies the actual brand
-    behind the URL and pulls from multiple real, current sources (their
-    own site, public reviews, news) rather than being limited to what one
-    static fetch can see. No pre-fetch step at all now — the URL goes
-    straight into the prompt and web_search does the discovery.
 
-    Real API constraint, confirmed live before writing this: OpenAI's
-    web_search tool CANNOT be combined with strict JSON mode ("Web Search
-    cannot be used with JSON mode", a real 400) — unlike every other
-    JSON-returning OpenAI call in this file, this one can't use
-    response_format={"type": "json_object"}. Asks for JSON in the prompt
-    instead and parses defensively (same markdown-fence-stripping
-    fallback already used elsewhere in this file for exactly this
-    reason), since a malformed response is a real possibility here in a
-    way it normally isn't.
+def _host_of(u: str) -> str:
+    try:
+        host = (urlparse(u if "://" in (u or "") else f"https://{u}").hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
-    Social metrics (follower/like counts) are deliberately optional and
-    null-by-default in the prompt — web_search has no privileged access
-    to Meta's real analytics, only whatever a public source happens to
-    mention. Never fabricated; "not publicly available" in the frontend
-    when null."""
-    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
-    trending_terms = _fetch_trending_related_terms(url)
-    trending_context = (
-        f"\nReal, currently trending related searches (from Google Trends, last 7 days) in this space — "
-        f"reference one only if it genuinely fits an opportunity, don't force it: {', '.join(trending_terms)}\n"
-        if trending_terms else ""
-    )
-    prompt = f"""You are a marketing strategist helping a small business understand a competitor.
 
-{category_guidance}
-{trending_context}
-The competitor's URL is: {url}
+def _same_site(host_a: str, host_b: str) -> bool:
+    if not host_a or not host_b:
+        return False
+    return host_a == host_b or host_a.endswith("." + host_b) or host_b.endswith("." + host_a)
 
-This may be their own website, or a Facebook/Instagram page. If it's a social page you can't read directly (login wall, JavaScript-rendered feed), do NOT analyze Facebook or Instagram itself as if it were the competitor — instead, identify the real brand/business behind that URL (from the URL slug, any visible preview text, or by searching for it) and search the web for that brand's own website, public reviews, news, and other public sources instead.
 
-Search the real web for current, real information about this competitor and produce:
-1. Their real brand/company name (never "Facebook" or "Instagram" — that would mean you analyzed the platform, not the competitor).
-2. A short 2-3 sentence summary of what they focus on or offer.
-3. A snapshot: category, what they sell, their target customer, their positioning, and any genuinely relevant recent development (only include recent_developments if you actually found something real and dated — leave it empty otherwise, don't invent one).
-4. Their public presence: their website URL, Facebook page URL, Instagram URL (whichever you can find/confirm) — and, ONLY if you find real, specific numbers from an actual public source (never estimate or guess), their Facebook followers, Facebook likes, Instagram followers, and typical visible post engagement. Leave any metric you can't verify as null — do not invent a number.
-5. 2-3 real observations about what they're actually doing (content themes, messaging, offers), each with a one-sentence piece of evidence and the source URL it came from.
-6. 2-3 real customer signals from actual public reviews/discussions (Trustpilot, Reddit, etc. — only if you find real ones), each with evidence and the source URL.
-7. Exactly 3 distinct strategic opportunities a small competing business could use to stand out, each grounded in something you actually found (a gap, a complaint, an underused angle) — not generic advice like "post more" or "improve engagement." Each needs: a short title, the opportunity itself, one concrete action the user could take (a specific piece of content to create), the evidence it's based on, and the source URL.
-8. A list of every real source URL you used, with a short title and what kind of source it is (official/news/review/social/other).
+def _clean_url(u: str) -> str:
+    """Strips the utm_source=openai tracking param OpenAI's web_search
+    appends to every URL it cites (confirmed live)."""
+    u = (u or "").strip()
+    if not u:
+        return ""
+    try:
+        parts = urlsplit(u)
+    except ValueError:
+        return u
+    query = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "utm_source"])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
-Respond with ONLY this JSON format, nothing else, no markdown code fences:
-{{
-  "competitor_name": "...",
-  "source_url": "...",
-  "summary": "...",
-  "snapshot": {{"category": "...", "what_they_sell": "...", "target_customer": "...", "positioning": "...", "recent_developments": "..."}},
-  "public_presence": {{"website": "...", "facebook": "...", "instagram": "...", "metrics": {{"facebook_followers": null, "facebook_likes": null, "instagram_followers": null, "visible_post_engagement": null}}}},
-  "what_theyre_doing": [{{"observation": "...", "evidence": "...", "source_url": "..."}}],
-  "customer_signals": [{{"signal": "...", "evidence": "...", "source_url": "..."}}],
-  "opportunities": [{{"title": "...", "opportunity": "...", "action": "...", "evidence": "...", "source_url": "..."}}],
-  "sources": [{{"title": "...", "url": "...", "source_type": "official"}}]
-}}
-"""
+
+def _url_key(u: str) -> str:
+    try:
+        parts = urlsplit(_clean_url(u))
+    except ValueError:
+        return ""
+    host = (parts.hostname or "").lower()
+    host = host[4:] if host.startswith("www.") else host
+    return f"{host}{parts.path.rstrip('/')}" + (f"?{parts.query}" if parts.query else "")
+
+
+def _competitor_search(prompt: str) -> tuple:
+    """One real web_search-grounded call. Returns (plain-text notes,
+    [{url, title}] the tool actually retrieved). The citation list comes
+    from the response's own url_citation annotations, NOT from anything
+    the model writes about its sources -- a live diagnostic on a real
+    Apex Footwear run showed the model listing sources (semrush.com,
+    rankchart.org) it had never actually retrieved."""
     response = with_retry(
         lambda: client.responses.create(
             model="gpt-4o-mini",
@@ -2997,61 +3001,499 @@ Respond with ONLY this JSON format, nothing else, no markdown code fences:
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
-    ai_text = response.output_text.strip()
-    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
-    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
-    parsed = json.loads(ai_text_clean)
+    citations, seen = [], set()
+    for item in response.output:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            for ann in getattr(part, "annotations", None) or []:
+                if getattr(ann, "type", None) != "url_citation":
+                    continue
+                cleaned = _clean_url(getattr(ann, "url", "") or "")
+                key = _url_key(cleaned)
+                if cleaned and key not in seen and not any(_same_site(_host_of(cleaned), h) for h in _LOW_VALUE_SOURCE_HOSTS):
+                    seen.add(key)
+                    citations.append({"url": cleaned, "title": (getattr(ann, "title", "") or "").strip()})
+    return response.output_text.strip(), citations
+
+
+def _url_is_live(url: str) -> bool:
+    """Existence check for a URL the model wrote in its research notes
+    without the search tool annotating it (annotation is non-deterministic
+    -- confirmed live: the same news search sometimes cites its links,
+    sometimes just writes them as plain markdown). A hallucinated link
+    fails here; a real page passes. Redirects are not followed (status
+    only is read), and 401/403/405/429 count as live since real sites
+    often refuse bots while the page exists."""
+    try:
+        _assert_public_url(url)
+        r = requests.get(
+            url, timeout=6, stream=True, allow_redirects=False,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; PunqleBot/1.0)"},
+        )
+        r.close()
+        return r.status_code < 400 or r.status_code in (401, 403, 405, 429)
+    except Exception:
+        return False
+
+
+def _harvest_note_urls(notes: str) -> list:
+    out = []
+    for m in re.finditer(r"https?://[^\s)\]>\"']+", notes or ""):
+        u = _clean_url(m.group(0).rstrip(".,;:"))
+        if u:
+            out.append(u)
+    return out
+
+
+_GENERIC_BRAND_WORDS = {
+    "limited", "ltd", "company", "shop", "store", "official", "bangladesh", "fashion", "house", "group",
+    "brand", "online", "page", "the", "and", "footwear", "shoes", "retail", "world",
+}
+
+
+def _norm_alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _entity_tokens(brand: str, website_url: str) -> list:
+    """Distinguishing name fragments for the competitor (its brand words
+    and its domain label), used to reject pages about a DIFFERENT company
+    with a similar name. Found live: a fabricated Facebook URL made the
+    tool 'identify' Zuqo, then it cited a Utah-based 'Shop Zoco, LLC' BBB
+    complaint page as if it were Zuqo's."""
+    tokens = [w for w in re.split(r"[^a-z0-9]+", (brand or "").lower()) if len(w) >= 4 and w not in _GENERIC_BRAND_WORDS]
+    label = _host_of(website_url).split(".")[0] if website_url else ""
+    if len(label) >= 4:
+        tokens.append(label)
+    return list(dict.fromkeys(tokens))
+
+
+def _mentions_entity(tokens: list, url: str, title: str) -> bool:
+    if not tokens:
+        return True  # nothing distinguishing to check against
+    haystack = _norm_alnum(f"{url} {title}")
+    return any(_norm_alnum(t) in haystack for t in tokens)
+
+
+def _social_slug(url: str) -> str:
+    """The page handle of a Facebook/Instagram/TikTok URL, or '' if it
+    isn't one or is an id-style URL (profile.php?id=..., /pages/...)."""
+    try:
+        parts = urlsplit(url if "://" in url else f"https://{url}")
+    except ValueError:
+        return ""
+    if not any(_same_site((parts.hostname or "").lower().removeprefix("www."), h) for h in _SOCIAL_HOSTS):
+        return ""
+    segs = [x for x in parts.path.split("/") if x]
+    if not segs or segs[0].lower() in ("profile.php", "pages", "people", "groups", "p", "watch", "share"):
+        return ""
+    return _norm_alnum(segs[0])
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"], start=1)}
+
+
+def _too_old_for_recent(text: str, max_days: int = 400) -> bool:
+    """True when the dated item in `text` is older than ~13 months (or
+    only carries an old year). The model ignored 'last 12 months' and
+    offered a 2021 press release as a 'recent development'."""
+    t = (text or "").lower()
+    m = re.search(r"\b(?:(\d{1,2})\s+)?(" + "|".join(_MONTHS) + r")\.?\s*(?:(\d{1,2}),?\s*)?(20\d{2})\b", t)
+    if m:
+        day = int(m.group(1) or m.group(3) or 1)
+        try:
+            when = datetime(int(m.group(4)), _MONTHS[m.group(2)], min(max(day, 1), 28), tzinfo=timezone.utc)
+        except ValueError:
+            return False
+        return (datetime.now(timezone.utc) - when).days > max_days
+    y = re.search(r"\b(20\d{2})\b", t)
+    return bool(y) and int(y.group(1)) < datetime.now(timezone.utc).year - 1
+
+
+def _labelled_line(notes: str, label: str) -> str:
+    m = re.search(rf"^{label}:[ \t]*(.+)$", notes, re.M | re.I)
+    value = m.group(1).strip() if m else ""
+    return "" if not value or value.upper().startswith("NONE FOUND") else value
+
+
+def _classify_competitor_source(url: str, own_hosts: set, stage: str) -> str:
+    host = _host_of(url)
+    if any(_same_site(host, h) for h in own_hosts):
+        return "official"
+    if any(k in host for k in ("trustpilot", "bbb.org", "sitejabber", "yelp", "ratingfacts", "consumeraffairs", "tripadvisor")):
+        return "review"
+    if any(_same_site(host, h) for h in _SOCIAL_HOSTS):
+        return "social"
+    if stage == "news":
+        return "news"
+    if any(k in host for k in ("reddit.com", "quora.com")):
+        return "discussion"
+    return "other"
+
+
+_COMPETITOR_JSON_SHAPE = """{
+  "competitor_name": "...",
+  "summary": "2-3 sentences",
+  "snapshot": {"category": "...", "what_they_sell": "...", "target_customer": "...", "positioning": "...", "recent_developments": ""},
+  "public_presence": {"metrics": {"facebook_followers": null, "facebook_likes": null, "instagram_followers": null, "visible_post_engagement": null}},
+  "what_theyre_doing": [{"observation": "...", "evidence": "...", "source_url": "..."}],
+  "customer_signals": [{"signal": "...", "evidence": "...", "source_url": "..."}],
+  "opportunities": [{"title": "...", "opportunity": "...", "gap": "what the competitor lacks or does poorly, or the real complaint", "action": "one concrete piece of content to create", "evidence": "...", "source_url": "...", "evidence_type": "competitor_content", "feedback_sentiment": "n/a"}]
+}"""
+
+
+def _generate_competitor_analysis(url: str, category: str) -> dict:
+    """Rewritten twice on 2026-09-19.
+
+    Round 1 replaced the old "fetch one static page" approach (which
+    analyzed Facebook itself when given a Facebook URL -- a real, confirmed
+    bug) with one OpenAI web_search call.
+
+    Round 2 (this version) came from a real test on Apex Footwear that
+    exposed evidence-quality failures, diagnosed with real data before
+    changing anything: the model ran exactly ONE search (just the bare
+    domain) -- it never looked for reviews or news at all -- and then
+    filled "Customer Signals" with inferences from the competitor's OWN
+    website ("Customers appreciate the diverse range...", sourced to the
+    competitor's own domain), built an "opportunity" out of social
+    metrics being unavailable, and listed sources it had never retrieved.
+    A prompt saying "search for reviews too" can't fix that with a small
+    model, so the research is now split into backend-controlled stages:
+
+      1. identity + official presence (one web_search call)
+      2. third-party customer feedback (its own web_search call)
+      3. recent news (its own web_search call, runs parallel with 2)
+      4. structuring into JSON (NO tools, so strict JSON mode works --
+         it can't be combined with web_search, confirmed live) under
+         explicit evidence rules
+
+    then deterministic guardrails that don't depend on the model
+    obeying: customer signals sourced to the competitor's own site are
+    dropped, opportunities justified by missing data are dropped, every
+    source URL must be one the search tool actually retrieved, and the
+    sources list itself is built from the tool's real citations."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    limitations: list = []
+
+    # ---- Stage 1: identity + the competitor's own public presence ----
+    identity_notes, identity_cites = _competitor_search(f"""You are researching a business so a competing small business can understand it.
+
+The URL you were given is: {url}
+
+It may be the business's own website, or a Facebook/Instagram/TikTok page. If it is a social page you cannot read directly (login wall, JavaScript-rendered feed), do NOT describe Facebook, Instagram or TikTok themselves — identify the real business behind that URL (from the URL slug, any visible preview text, or by searching for it), then find and read that business's own website and public pages instead.
+
+Write plain-text research notes (NOT JSON). Start with these exact labelled lines:
+BRAND: <the real brand/company name — or exactly UNKNOWN if you cannot find real evidence that a business exists at this URL; never guess a business from the words in the URL>
+WEBSITE: <their official website URL, or NONE FOUND>
+FACEBOOK: <their Facebook page URL, or NONE FOUND>
+INSTAGRAM: <their Instagram URL, or NONE FOUND>
+
+Then, only from what you actually read on their own pages/public profiles, note:
+- What they sell, who they target, how they position themselves.
+- Observable content themes, messaging, offers or campaigns, each with the page URL it came from.
+- Follower/like/view counts ONLY if a real public page states the exact number — quote it with its URL. Never estimate.
+Do not write about customer reviews or news here — those are researched separately.""")
+
+    website = _labelled_line(identity_notes, "WEBSITE")
+    facebook = _labelled_line(identity_notes, "FACEBOOK")
+    instagram = _labelled_line(identity_notes, "INSTAGRAM")
+    brand = _labelled_line(identity_notes, "BRAND")
+    if brand.upper().startswith("UNKNOWN"):
+        raise HTTPException(status_code=422, detail="Couldn't identify a real business from that link. Try pasting their website instead.")
+    if not brand or brand.lower() in _SOCIAL_PLATFORM_NAMES:
+        input_host = _host_of(url)
+        brand = "" if any(_same_site(input_host, h) for h in _SOCIAL_HOSTS) else input_host.split(".")[0]
+    brand = brand or "this business"
+    website_url = website if website.lower().startswith("http") else ""
+
+    own_hosts = {h for h in (_host_of(website_url),) if h}
+    input_host = _host_of(url)
+    if input_host and not any(_same_site(input_host, h) for h in _SOCIAL_HOSTS):
+        own_hosts.add(input_host)
+    site_hint = f" ({website_url})" if website_url else ""
+    entity_tokens = _entity_tokens(brand, website_url)
+
+    # Does the social page the user gave us actually belong to this brand?
+    input_slug = _social_slug(url)
+    if input_slug:
+        candidate_slugs = [_social_slug(u) for u in (facebook, instagram) if u.lower().startswith("http")]
+        brand_norm = _norm_alnum(brand)
+        matches = (
+            input_slug in candidate_slugs
+            or (len(brand_norm) >= 4 and (brand_norm in input_slug or input_slug in brand_norm))
+            or any(_norm_alnum(t) in input_slug for t in entity_tokens)
+        )
+        if not matches:
+            limitations.append(
+                f"We couldn't confirm that this page belongs to {brand} — double-check this is the business you meant, or paste their website instead."
+            )
+
+    # ---- Stages 2 & 3 (+ trending terms), in parallel ----
+    def _reviews():
+        return _competitor_search(f"""Find real THIRD-PARTY customer feedback about this business: {brand}{site_hint}.
+
+Run at least two separate web searches, for example "{brand} reviews" and "{brand} complaints OR experience reddit". Look at review platforms (Trustpilot, Google reviews, Facebook reviews/recommendations, Sitejabber, BBB), forums, Reddit and public discussions.
+
+Only report feedback from CUSTOMERS (people who bought or used the products/services) that appears on a page that is NOT the business's own website. Ignore employee and job-seeker reviews (Glassdoor, Indeed, AmbitionBox) and investor commentary — those are not customer feedback. Do NOT infer what customers think from the business's own marketing, product range or brand list.
+
+Write plain-text notes: one bullet per recurring theme, marked POSITIVE or NEGATIVE, with a short paraphrase or quote and the exact source URL.
+If you find no real third-party customer feedback, write exactly: NO THIRD-PARTY FEEDBACK FOUND""")
+
+    def _news():
+        return _competitor_search(f"""Find genuinely relevant recent news or public developments about this business from roughly the last 12 months: {brand}{site_hint}.
+
+Run at least one web search for it. Report each real item as: DATE — headline — source URL. Only include items you actually found, using the article's real publication date (never today's date unless it was truly published today; if you can't tell the date, leave the item out). Skip traffic-statistics, website-safety and directory-listing pages.
+If there is nothing relevant, write exactly: NO RECENT NEWS FOUND""")
+
+    def _trending():
+        try:
+            return _fetch_trending_related_terms(brand)
+        except Exception:
+            return []
+
+    reviews_notes, reviews_cites, news_notes, news_cites, trending_terms = "", [], "", [], []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_reviews, f_news, f_trend = pool.submit(_reviews), pool.submit(_news), pool.submit(_trending)
+        try:
+            reviews_notes, reviews_cites = f_reviews.result()
+        except Exception as e:
+            logger.error("Competitor review search failed: %s", str(e))
+            limitations.append("The customer-feedback search didn't complete, so customer signals may be missing.")
+        try:
+            news_notes, news_cites = f_news.result()
+        except Exception as e:
+            logger.error("Competitor news search failed: %s", str(e))
+        trending_terms = f_trend.result() or []
+
+    # ---- What the search tool actually retrieved (the only URLs allowed) ----
+    # Plus any URL the model wrote in its notes without a tool annotation,
+    # but only if it actually resolves (see _url_is_live).
+    cites_by_stage = [("identity", identity_cites), ("reviews", reviews_cites), ("news", news_cites)]
+    known_keys = {_url_key(c["url"]) for _, cs in cites_by_stage for c in cs}
+    unannotated = []
+    for (stage, cs), notes in zip(cites_by_stage, (identity_notes, reviews_notes, news_notes)):
+        for u in _harvest_note_urls(notes):
+            k = _url_key(u)
+            if k and k not in known_keys and not any(_same_site(_host_of(u), h) for h in _LOW_VALUE_SOURCE_HOSTS):
+                known_keys.add(k)
+                unannotated.append((cs, u))
+    unannotated = unannotated[:8]
+    if unannotated:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            alive = list(pool.map(lambda pair: _url_is_live(pair[1]), unannotated))
+        for (cs, u), ok in zip(unannotated, alive):
+            if ok:
+                cs.append({"url": u, "title": ""})
+    allowed, seen_keys = [], set()
+    for stage, cites in cites_by_stage:
+        for c in cites:
+            key = _url_key(c["url"])
+            if key not in seen_keys:
+                seen_keys.add(key)
+                allowed.append({**c, "stage": stage})
+    for extra in (website_url, facebook, instagram, url):
+        key = _url_key(extra) if extra and extra.lower().startswith("http") else ""
+        if key and key not in seen_keys:
+            seen_keys.add(key)
+            allowed.append({"url": _clean_url(extra), "title": "", "stage": "identity"})
+    # Reviews/news pages must actually be about THIS business (rejects
+    # similarly-named companies); identity-stage pages are its own/directory pages.
+    allowed = [a for a in allowed if a["stage"] == "identity" or _mentions_entity(entity_tokens, a["url"], a["title"])]
+    allowed_by_key = {_url_key(a["url"]): a["url"] for a in allowed}
+    stage_by_key = {_url_key(a["url"]): a["stage"] for a in allowed}
+
+    def _resolve_url(candidate: str):
+        """Only ever returns a URL the search tool really retrieved: exact
+        match, else the first retrieved page on the same host, else None."""
+        cleaned = _clean_url(candidate)
+        if not cleaned:
+            return None
+        exact = allowed_by_key.get(_url_key(cleaned))
+        if exact:
+            return exact
+        host = _host_of(cleaned)
+        for a in allowed:
+            if _same_site(_host_of(a["url"]), host):
+                return a["url"]
+        return None
+
+    # ---- Stage 4: structure under explicit evidence rules (JSON mode, no tools) ----
+    trending_context = (
+        f"\nReal, currently trending related searches (Google Trends, last 7 days) — you may mention one only as supporting context for an opportunity that is ALREADY grounded in real evidence, never as the evidence itself: {', '.join(trending_terms)}\n"
+        if trending_terms else ""
+    )
+    allowed_list = "\n".join(f"- {a['url']}" + (f"  ({a['title']})" if a["title"] else "") for a in allowed) or "(none)"
+    structure_prompt = f"""You are a marketing strategist helping a small business understand a competitor. Below are research notes gathered from the real web. Turn them into the JSON described at the end.
+
+{category_guidance}
+{trending_context}
+STRICT EVIDENCE RULES:
+- Use ONLY facts stated in the notes. Never add facts from your own knowledge.
+- Every source_url must be copied exactly from the ALLOWED SOURCE URLS list. Never invent or alter a URL.
+- customer_signals: feedback from CUSTOMERS (buyers/users of the product — never employees, job seekers or investors), ONLY from the THIRD-PARTY FEEDBACK notes, and ONLY where the source is NOT the competitor's own website. If those notes say NO THIRD-PARTY FEEDBACK FOUND, customer_signals MUST be an empty list []. Never infer what customers think from the competitor's own marketing, product range or brand list. Each signal must be a specific theme in one sentence (e.g. "Slow refund handling"), never a bare label like "Negative Feedback".
+- what_theyre_doing (2-4 items): observable competitor behaviour or messaging, from the COMPETITOR notes only.
+- snapshot.recent_developments: if the NEWS notes contain any real dated item, write one sentence about the most relevant one, starting with its date. If they say NO RECENT NEWS FOUND, leave it "".
+- Follower/like/view metrics: ONLY if the notes quote the exact number with a source; otherwise null.
+- opportunities: 0 to 3. FEWER IS BETTER THAN GENERIC. Each must be grounded in a real observation (something the competitor actually does or says, a real customer complaint, or real news) and name one concrete piece of content the small business could create. NEVER create an opportunity from missing or unavailable data — "no visible metrics", "limited online presence", "no reviews found" are NOT evidence of anything. An opportunity is a gap, a customer complaint, a weakness, or an under-served angle the small business can take — NOT a suggestion to copy what customers already praise the competitor for. Never give generic advice like "improve your social media presence", "get more reviews" or "offer discounts". Every opportunity must state a real gap: something the competitor lacks or does poorly, or a real customer complaint. If the only evidence is customer PRAISE for the competitor, do not create an opportunity from it. Set evidence_type to exactly one of: "competitor_content", "customer_feedback", "news". Set feedback_sentiment to "negative", "mixed" or "positive" for the customer feedback the opportunity is based on, or "n/a" if it is not based on customer feedback.
+
+ALLOWED SOURCE URLS:
+{allowed_list}
+
+=== COMPETITOR NOTES (identity and own pages) ===
+{identity_notes}
+
+=== THIRD-PARTY FEEDBACK NOTES ===
+{reviews_notes or "NO THIRD-PARTY FEEDBACK FOUND"}
+
+=== NEWS NOTES ===
+{news_notes or "NO RECENT NEWS FOUND"}
+
+Respond with ONLY this JSON shape (opportunities and customer_signals may be empty lists):
+{_COMPETITOR_JSON_SHAPE}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You turn real research notes into structured competitor intelligence and never state anything the notes do not support."},
+                {"role": "user", "content": structure_prompt},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    parsed = json.loads(response.choices[0].message.content.strip())
 
     def _strip_inline_citations(text: str) -> str:
-        # OpenAI's web_search tool appends inline markdown citations like
-        # "([domain.com](https://...))" directly into text fields, even
-        # when asked for plain JSON — confirmed live, not hypothetical.
-        # Stripped since every item here already carries its own separate,
-        # clickable source_url field for exactly this purpose.
-        return re.sub(r"\s*\(\[[^\]]*\]\([^)]*\)\)", "", text or "").strip()
+        text = re.sub(r"\s*\(\[[^\]]*\]\([^)]*\)\)", "", text or "")
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        return text.strip()
 
-    def _str_list(raw, keys, limit):
-        out = []
-        for item in (raw or [])[:limit]:
-            if not isinstance(item, dict):
-                continue
-            row = {}
-            for k in keys:
-                val = str(item.get(k) or "").strip()
-                row[k] = val if k in ("url", "source_url") else _strip_inline_citations(val)
-            if any(row.values()):
-                out.append(row)
-        return out
+    def _txt(value) -> str:
+        return _strip_inline_citations(str(value or ""))
+
+    is_own = lambda u: any(_same_site(_host_of(u), h) for h in own_hosts)
+
+    doing = []
+    for item in (parsed.get("what_theyre_doing") or [])[:4]:
+        if not isinstance(item, dict) or not _txt(item.get("observation")):
+            continue
+        resolved = _resolve_url(str(item.get("source_url") or ""))
+        if not resolved:
+            continue  # unsourced claim (e.g. one that only came from a traffic-stats directory)
+        doing.append({
+            "observation": _txt(item.get("observation")),
+            "evidence": _txt(item.get("evidence")),
+            "source_url": resolved,
+        })
+
+    signals = []
+    for item in (parsed.get("customer_signals") or [])[:4]:
+        if not isinstance(item, dict) or not _txt(item.get("signal")):
+            continue
+        resolved = _resolve_url(str(item.get("source_url") or ""))
+        # Deterministic guardrail: a customer signal must come from a
+        # third-party page, never the competitor's own site.
+        if not resolved or is_own(resolved):
+            continue
+        if len(_txt(item.get("signal")).split()) < 3:
+            continue  # a bare label like "Negative Feedback" is not a signal
+        signals.append({"signal": _txt(item.get("signal")), "evidence": _txt(item.get("evidence")), "source_url": resolved})
+    signals = signals[:3]
+
+    opportunities = []
+    for item in (parsed.get("opportunities") or [])[:6]:
+        if not isinstance(item, dict) or not _txt(item.get("opportunity")):
+            continue
+        if str(item.get("evidence_type") or "").strip() not in _COMPETITOR_OPPORTUNITY_EVIDENCE_TYPES:
+            continue
+        if _ABSENCE_OF_DATA_RE.search(f"{item.get('opportunity') or ''} {item.get('evidence') or ''}"):
+            continue
+        # A gap, not praise: an opportunity built on feedback must rest on
+        # negative/mixed feedback (a live Apex run offered "showcase
+        # testimonials" because customers PRAISE the competitor).
+        sentiment = str(item.get("feedback_sentiment") or "").strip().lower()
+        if sentiment == "positive" or (item.get("evidence_type") == "customer_feedback" and sentiment not in ("negative", "mixed")):
+            continue
+        if not _txt(item.get("gap")):
+            continue
+        resolved = _resolve_url(str(item.get("source_url") or ""))
+        if not resolved:
+            continue
+        # Evidence must match what it claims to be, structurally (regexes
+        # can't win against a model that rephrases "limited reviews"):
+        # customer-feedback opportunities must rest on a customer signal
+        # that survived the filters above; news ones on a news-stage page;
+        # competitor-content ones on the competitor's own/identity pages.
+        stage = stage_by_key.get(_url_key(resolved), "identity")
+        etype = str(item.get("evidence_type") or "").strip()
+        if etype == "customer_feedback" and resolved not in {sg["source_url"] for sg in signals}:
+            continue
+        if (etype == "news" and stage != "news") or (etype == "competitor_content" and stage != "identity"):
+            continue
+        opportunities.append({
+            "title": _txt(item.get("title")) or "Opportunity",
+            "opportunity": _txt(item.get("opportunity")),
+            "action": _txt(item.get("action")),
+            "evidence": _txt(item.get("evidence")),
+            "source_url": resolved,
+        })
+    opportunities = opportunities[:3]
+
+    sources = []
+    for a in allowed[:12]:
+        sources.append({
+            "title": a["title"] or _host_of(a["url"]),
+            "url": a["url"],
+            "source_type": _classify_competitor_source(a["url"], own_hosts, a["stage"]),
+        })
+    if not any(s["source_type"] in ("review", "news", "discussion", "other") for s in sources):
+        limitations.append("Only the competitor's own pages turned up — treat this as based on their own messaging, not independent sources.")
+    if 0 < len(opportunities) < 3:
+        limitations.append(f"Showing {len(opportunities)} of 3 possible opportunities — there wasn't enough real evidence to support more.")
 
     snapshot = parsed.get("snapshot") or {}
-    presence = parsed.get("public_presence") or {}
-    metrics = presence.get("metrics") or {}
+    metrics_raw = ((parsed.get("public_presence") or {}).get("metrics")) or {}
+    notes_compact = re.sub(r"\s", "", identity_notes).lower()
+
+    def _verified_metric(key: str):
+        value = str(metrics_raw.get(key) or "").strip()
+        # Only kept if that exact figure actually appears in the research notes.
+        return value if value and re.sub(r"\s", "", value).lower() in notes_compact else None
+
+    name = str(parsed.get("competitor_name") or "").strip()
+    if not name or name.lower() in _SOCIAL_PLATFORM_NAMES:
+        name = brand
     return {
-        "competitor_name": str(parsed.get("competitor_name") or "Competitor").strip(),
-        "source_url": str(parsed.get("source_url") or url).strip(),
-        "summary": _strip_inline_citations(str(parsed.get("summary") or "")),
+        "competitor_name": name,
+        "source_url": website_url or url,
+        "summary": _txt(parsed.get("summary")),
         "snapshot": {
-            "category": _strip_inline_citations(str(snapshot.get("category") or "")),
-            "what_they_sell": _strip_inline_citations(str(snapshot.get("what_they_sell") or "")),
-            "target_customer": _strip_inline_citations(str(snapshot.get("target_customer") or "")),
-            "positioning": _strip_inline_citations(str(snapshot.get("positioning") or "")),
-            "recent_developments": _strip_inline_citations(str(snapshot.get("recent_developments") or "")),
+            "category": _txt(snapshot.get("category")),
+            "what_they_sell": _txt(snapshot.get("what_they_sell")),
+            "target_customer": _txt(snapshot.get("target_customer")),
+            "positioning": _txt(snapshot.get("positioning")),
+            "recent_developments": "" if _too_old_for_recent(_txt(snapshot.get("recent_developments"))) else _txt(snapshot.get("recent_developments")),
         },
         "public_presence": {
-            "website": (str(presence.get("website")).strip() or None) if presence.get("website") else None,
-            "facebook": (str(presence.get("facebook")).strip() or None) if presence.get("facebook") else None,
-            "instagram": (str(presence.get("instagram")).strip() or None) if presence.get("instagram") else None,
+            "website": website_url or None,
+            "facebook": facebook if facebook.lower().startswith("http") else None,
+            "instagram": instagram if instagram.lower().startswith("http") else None,
             "metrics": {
-                "facebook_followers": (str(metrics.get("facebook_followers")).strip() or None) if metrics.get("facebook_followers") else None,
-                "facebook_likes": (str(metrics.get("facebook_likes")).strip() or None) if metrics.get("facebook_likes") else None,
-                "instagram_followers": (str(metrics.get("instagram_followers")).strip() or None) if metrics.get("instagram_followers") else None,
-                "visible_post_engagement": (str(metrics.get("visible_post_engagement")).strip() or None) if metrics.get("visible_post_engagement") else None,
+                "facebook_followers": _verified_metric("facebook_followers"),
+                "facebook_likes": _verified_metric("facebook_likes"),
+                "instagram_followers": _verified_metric("instagram_followers"),
+                "visible_post_engagement": _verified_metric("visible_post_engagement"),
             },
         },
-        "what_theyre_doing": _str_list(parsed.get("what_theyre_doing"), ["observation", "evidence", "source_url"], 3),
-        "customer_signals": _str_list(parsed.get("customer_signals"), ["signal", "evidence", "source_url"], 3),
-        "opportunities": _str_list(parsed.get("opportunities"), ["title", "opportunity", "action", "evidence", "source_url"], 3),
-        "sources": _str_list(parsed.get("sources"), ["title", "url", "source_type"], 10),
+        "what_theyre_doing": doing,
+        "customer_signals": signals,
+        "opportunities": opportunities,
+        "sources": sources,
+        "limitations": limitations,
     }
 
 
