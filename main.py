@@ -3139,6 +3139,32 @@ def _labelled_line(notes: str, label: str) -> str:
     return "" if not value or value.upper().startswith("NONE FOUND") else value
 
 
+_IG_HANDLE_IGNORE = {"p", "reel", "reels", "explore", "stories", "accounts", "about", "share", "tv", "direct", "web",
+                     "developer", "legal", "privacy", "sharer", "intent", "instagram"}
+
+
+def _instagram_handle_from_site(website_url: str) -> Optional[str]:
+    """Deterministic (no AI, so no chance of naming a look-alike account): most brands
+    link their own Instagram in the site header/footer. Best-effort, never raises."""
+    try:
+        _assert_public_url(website_url)
+        resp = requests.get(
+            website_url, timeout=8, stream=True,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"},
+        )
+        if resp.status_code != 200:
+            return None
+        html = resp.raw.read(_MAX_LINK_FETCH_BYTES, decode_content=True).decode("utf-8", "ignore")
+        counts: dict = {}
+        for m in re.findall(r"instagram\.com/([A-Za-z0-9._]{2,30})", html):
+            h = m.lower().rstrip(".")
+            if h not in _IG_HANDLE_IGNORE:
+                counts[h] = counts.get(h, 0) + 1
+        return max(counts, key=counts.get) if counts else None
+    except Exception:
+        return None
+
+
 def _classify_competitor_source(url: str, own_hosts: set, stage: str) -> str:
     host = _host_of(url)
     if any(_same_site(host, h) for h in own_hosts):
@@ -3501,6 +3527,10 @@ Respond with ONLY this JSON shape (opportunities and customer_signals may be emp
     name = str(parsed.get("competitor_name") or "").strip()
     if not name or name.lower() in _SOCIAL_PLATFORM_NAMES:
         name = brand
+    if not instagram.lower().startswith("http") and website_url:
+        site_handle = _instagram_handle_from_site(website_url)
+        if site_handle:
+            instagram = f"https://www.instagram.com/{site_handle}/"
     return {
         "competitor_name": name,
         "source_url": website_url or url,
@@ -10316,6 +10346,8 @@ class IgStatsResponse(BaseModel):
     status: str
     message: str = ""
     username: str = ""
+    account_name: str = ""
+    account_website: str = ""
     followers: Optional[int] = None
     total_posts: Optional[int] = None
     analyzed_posts: int = 0
@@ -10398,8 +10430,9 @@ def _fetch_instagram_business_discovery(ig_user_id: str, token: str, username: s
             raise _ig_graph_error(data)
         return data["business_discovery"]
 
-    first = _query(f"username,followers_count,media_count,media.limit({IG_MEDIA_PAGE_SIZE}){{{_IG_MEDIA_FIELDS}}}")
-    profile = {"followers": first.get("followers_count"), "total_posts": first.get("media_count")}
+    first = _query(f"username,name,website,followers_count,media_count,media.limit({IG_MEDIA_PAGE_SIZE}){{{_IG_MEDIA_FIELDS}}}")
+    profile = {"followers": first.get("followers_count"), "total_posts": first.get("media_count"),
+               "name": first.get("name") or "", "website": first.get("website") or ""}
     media = list((first.get("media") or {}).get("data", []))
     cursor = ((first.get("media") or {}).get("paging") or {}).get("cursors", {}).get("after")
     pages = 1
@@ -10487,7 +10520,8 @@ def _aggregate_instagram_stats(username: str, profile: dict, media: list, theme_
     posts.sort(key=lambda p: p["ts"], reverse=True)
     n = len(posts)
     out: dict = {"status": "ok", "username": username, "followers": profile.get("followers"),
-                 "total_posts": profile.get("total_posts"), "analyzed_posts": n}
+                 "total_posts": profile.get("total_posts"), "analyzed_posts": n,
+                 "account_name": profile.get("name") or "", "account_website": profile.get("website") or ""}
     if n == 0:
         return {**out, "status": "unavailable_account", "message": "This account has no public posts to analyze."}
     if theme_labels and len(theme_labels) == len(media):
