@@ -8541,8 +8541,39 @@ def meta_oauth_callback(request: Request):
                             raw_pages.extend(owned_resp.json().get("data", []))
             except requests.RequestException as biz_err:
                 logger.error("Meta DEBUG: Business Manager fallback raised: %s", biz_err)
+        granted_pages: list = []
+        granted_biz: list = []
         if not raw_pages:
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error&reason=no_pages")
+            # Last resort: read exactly which Pages the user ticked in Facebook's
+            # own dialog (granular scopes) and fetch each one directly.
+            try:
+                dbg = requests.get(
+                    f"{META_GRAPH_URL}/debug_token",
+                    params={"input_token": user_token, "access_token": f"{META_APP_ID}|{META_APP_SECRET}"},
+                    timeout=15,
+                )
+                logger.error("Meta DEBUG: debug_token = %s", dbg.text)
+                for gs in ((dbg.json().get("data") or {}).get("granular_scopes") or []):
+                    ids = [str(i) for i in gs.get("target_ids", [])]
+                    if gs.get("scope") in ("pages_show_list", "pages_read_engagement", "pages_manage_posts"):
+                        granted_pages.extend(ids)
+                    elif gs.get("scope") == "business_management":
+                        granted_biz.extend(ids)
+                for pid in dict.fromkeys(granted_pages):
+                    page_resp = requests.get(
+                        f"{META_GRAPH_URL}/{pid}",
+                        params={"fields": "id,name,access_token", "access_token": user_token},
+                        timeout=15,
+                    )
+                    logger.error("Meta DEBUG: direct page %s = %s", pid, page_resp.text)
+                    if page_resp.ok and page_resp.json().get("access_token"):
+                        raw_pages.append(page_resp.json())
+            except requests.RequestException as dbg_err:
+                logger.error("Meta DEBUG: granular-scope fallback raised: %s", dbg_err)
+        if not raw_pages:
+            return _meta_error_redirect(
+                "no_pages", f"pages shared: {len(set(granted_pages))}, businesses shared: {len(set(granted_biz))}"
+            )
 
         pages = []
         for p in raw_pages:
