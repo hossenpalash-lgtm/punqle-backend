@@ -3635,7 +3635,7 @@ GPT_IMAGE_SIZE_BY_ASPECT_RATIO = {
 _IMAGE_AD_ACTORS = [
     {
         "id": "maya", "name": "Maya", "gender": "female", "style": "casual",
-        "description": "a warm, friendly woman in her early 30s with long wavy brown hair, light olive skin, wearing a soft cream knit sweater, natural everyday makeup",
+        "description": "a warm woman in her late 30s with an olive complexion and long wavy dark hair, a calm natural expression and no visible makeup, wearing a black button-up shirt",
     },
     {
         "id": "liam", "name": "Liam", "gender": "male", "style": "casual",
