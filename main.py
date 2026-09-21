@@ -3639,7 +3639,7 @@ _IMAGE_AD_ACTORS = [
     },
     {
         "id": "liam", "name": "Liam", "gender": "male", "style": "casual",
-        "description": "a friendly young man in his mid-20s with short dark brown hair, light stubble, tan skin, wearing a relaxed denim jacket over a white t-shirt",
+        "description": "a rugged, approachable man in his early 30s with short wavy brown hair, light stubble and a relaxed natural smile, wearing a rolled-sleeve red-and-black plaid flannel shirt",
     },
     {
         "id": "sofia", "name": "Sofia", "gender": "female", "style": "business",
