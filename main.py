@@ -8927,6 +8927,18 @@ def publish_to_meta(
             result["instagram"] = _publish_to_instagram(
                 connection["ig_user_id"], connection["page_access_token"], image_bytes, mime_type, caption,
             )
+            ig = result["instagram"]
+            # Instagram has no scheduling, so this is always an immediate
+            # publish — saved as 'published' right now, whatever
+            # scheduled_time the Facebook side was given.
+            _save_scheduled_post(
+                user_id, "instagram", caption, base64.b64encode(image_bytes).decode(),
+                datetime.now(timezone.utc),
+                ig.get("posted", False), ig.get("media_id"), ig.get("error"),
+                source=source, content_plan_id=content_plan_id, content_plan_day=content_plan_day,
+                immediate=True,
+                goal=goal, angle=angle, style=style,
+            )
 
         return result
     except HTTPException:
@@ -10137,6 +10149,14 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                     "views": None, "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
                     "raw": m["raw"],
                 }, on_conflict="scheduled_post_id,fetch_bucket").execute())
+            elif row["platform"] == "instagram":
+                # Saved so the history exists, but reading an Instagram
+                # post's numbers needs instagram_manage_insights, which
+                # Meta hasn't approved yet — an honest "not yet", never a
+                # made-up zero.
+                unavailable_reasons[row["id"]] = (
+                    "Instagram numbers will appear here once Meta approves Punqle's Instagram insights access."
+                )
             else:
                 # TikTok (or any future platform this function hasn't been
                 # taught yet) — this `else` used to silently assume
