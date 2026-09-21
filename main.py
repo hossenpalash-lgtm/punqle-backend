@@ -3654,8 +3654,8 @@ _IMAGE_AD_ACTORS = [
         "description": "an energetic athletic woman in her mid-20s with a blonde ponytail, fair freckled skin, wearing a fitted grey athletic top, healthy outdoorsy glow",
     },
     {
-        "id": "ethan", "name": "Ethan", "gender": "male", "style": "outdoor",
-        "description": "a rugged outdoorsy man in his early 30s with short wavy brown hair, a light beard, tan weathered skin, wearing a rolled-sleeve flannel shirt",
+        "id": "ethan", "name": "Ethan", "gender": "male", "style": "casual",
+        "description": "a relaxed man around 30 with dark brown tousled curly hair, light stubble and a natural, slightly asymmetric smile, wearing a plain white t-shirt",
     },
     {
         "id": "zara", "name": "Zara", "gender": "female", "style": "elegant",
@@ -6303,7 +6303,7 @@ def _start_sync_redub(video_bytes: bytes, audio_bytes: bytes) -> str:
                 "sync_mode": "loop",
                 "temperature": SYNC_TEMPERATURE,
             }},
-            timeout=20,
+            timeout=60,
         ),
         exceptions=(requests.RequestException,),
         attempts=2,
@@ -6684,7 +6684,7 @@ def start_actor_video_v2(
                     "sync_mode": "loop",
                     "temperature": SYNC_TEMPERATURE,
                 }},
-                timeout=20,
+                timeout=60,
             ),
             exceptions=(requests.RequestException,),
             attempts=2,
