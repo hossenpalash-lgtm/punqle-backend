@@ -38,7 +38,7 @@ import secrets
 import stripe
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from pytrends.request import TrendReq
-from urllib.parse import urlparse, urlencode, urlsplit, urlunsplit, parse_qsl
+from urllib.parse import urlparse, urlencode, urlsplit, urlunsplit, parse_qsl, quote
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -8392,6 +8392,20 @@ def get_meta_connect_url(insights: bool = False, user_id: str = Depends(get_curr
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
 
+def _meta_graph_error_text(resp) -> str:
+    try:
+        return str(resp.json().get("error", {}).get("message", ""))[:140]
+    except Exception:
+        return ""
+
+
+def _meta_error_redirect(reason: str, detail: str = ""):
+    """The connect panel turns these into a specific, actionable message
+    instead of one generic failure -- the cause was invisible before."""
+    q = f"reason={reason}" + (f"&detail={quote(detail[:140])}" if detail else "")
+    return RedirectResponse(f"{FRONTEND_URL}/?meta=error&{q}")
+
+
 @app.get("/meta/callback", tags=["meta"])
 def meta_oauth_callback(request: Request):
     """Facebook redirects the business owner's browser here after they
@@ -8402,12 +8416,12 @@ def meta_oauth_callback(request: Request):
         params = dict(request.query_params)
         if not META_APP_ID or not META_APP_SECRET:
             logger.error("Meta DEBUG: missing META_APP_ID/META_APP_SECRET env vars")
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("config")
         error = params.get("error")
         code = params.get("code", "")
         if error or not code:
             logger.error("Meta DEBUG: error=%r code_present=%s params=%r", error, bool(code), params)
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("denied" if error else "no_code", params.get("error_description") or params.get("error_reason") or "")
 
         try:
             user_id = _verify_meta_state(params.get("state", ""))
@@ -8432,11 +8446,11 @@ def meta_oauth_callback(request: Request):
         )
         if not token_resp.ok:
             logger.error("Meta code exchange failed: %s", token_resp.text)
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("code_exchange", _meta_graph_error_text(token_resp))
         short_lived_token = token_resp.json().get("access_token")
         if not short_lived_token:
             logger.error("Meta DEBUG: token_resp.ok but no access_token in body: %s", token_resp.text)
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("code_exchange")
 
         # Exchange for a long-lived user token (~60 days) — Page tokens
         # derived from it don't expire on their own barring revocation
@@ -8457,11 +8471,11 @@ def meta_oauth_callback(request: Request):
         )
         if not long_resp.ok:
             logger.error("Meta long-lived token exchange failed: %s", long_resp.text)
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("long_token", _meta_graph_error_text(long_resp))
         user_token = long_resp.json().get("access_token")
         if not user_token:
             logger.error("Meta DEBUG: long_resp.ok but no access_token in body: %s", long_resp.text)
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("long_token")
 
         try:
             perms_resp = requests.get(
@@ -8496,7 +8510,7 @@ def meta_oauth_callback(request: Request):
         )
         if not pages_resp.ok:
             logger.error("Meta /me/accounts failed: %s", pages_resp.text)
-            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+            return _meta_error_redirect("pages_api", _meta_graph_error_text(pages_resp))
         raw_pages = pages_resp.json().get("data", [])
         if not raw_pages:
             logger.error("Meta DEBUG: /me/accounts returned zero pages, full body: %s — trying Business Manager fallback", pages_resp.text)
@@ -8581,13 +8595,13 @@ def meta_oauth_callback(request: Request):
         return RedirectResponse(f"{FRONTEND_URL}/?meta=pick-page")
     except HTTPException as e:
         logger.error("Meta DEBUG: HTTPException at top level: %s", e.detail)
-        return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        return _meta_error_redirect("state", str(e.detail))
     except requests.RequestException as e:
         logger.error("Meta DEBUG: RequestException: %s", str(e))
-        return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        return _meta_error_redirect("network")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
-        return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        return _meta_error_redirect("server", type(e).__name__)
 
 
 @app.get("/meta/available-pages", response_model=MetaAvailablePagesResponse, tags=["meta"])
