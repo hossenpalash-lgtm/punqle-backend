@@ -327,6 +327,17 @@ class ImageActorOut(BaseModel):
     gender: str
     style: str
     preview_image_base64: str
+    # A frame from the actor's own real Talking Actors base video (their
+    # actual kitchen/car/bedroom), only present for actors that have one
+    # -- see assets/actors/{id}_situation.jpg and
+    # scripts/make_situation_thumbnail.py. preview_image_base64 stays the
+    # clean studio-style persona photo, since THAT is also the reference
+    # image fed into Image Ad's actor-compositing calls (AdCreationForm's
+    # picker, the home page's Product/Show Your App pickers) -- those
+    # want a plain, well-lit portrait, not a cropped video frame. Only
+    # the Talking Actors pickers (which show a real result, not a
+    # compositing input) use this field when it's present.
+    situation_preview_base64: Optional[str] = None
 
 
 class ImageActorsListResponse(BaseModel):
@@ -3824,9 +3835,16 @@ def list_image_actors(user_id: str = Depends(get_current_user_id)):
                 preview_b64 = base64.b64encode(f.read()).decode("ascii")
         except FileNotFoundError:
             continue
+        situation_path = os.path.join(_IMAGE_ACTORS_DIR, f"{a['id']}_situation.jpg")
+        try:
+            with open(situation_path, "rb") as f:
+                situation_b64 = base64.b64encode(f.read()).decode("ascii")
+        except FileNotFoundError:
+            situation_b64 = None
         actors.append({
             "id": a["id"], "name": a["name"], "gender": a["gender"],
             "style": a["style"], "preview_image_base64": preview_b64,
+            "situation_preview_base64": situation_b64,
         })
     return {"actors": actors}
 
