@@ -3643,6 +3643,24 @@ GPT_IMAGE_SIZE_BY_ASPECT_RATIO = {
 # AI-generated child in ad content is extra sensitive, not worth it for
 # V1. `description` is fed directly into the Gemini prompt; `preview`
 # is only for the picker UI.
+
+# 2026-09-22 — trimmed to the real Punqle Actors v2 roster only. The
+# original 16-persona batch (Sofia/Noah/Ava/Zara/Marcus/Priya/Elena/
+# Hannah/Grace/Diego/Kwame/Ravi/James) is gone — those were the FIRST,
+# lower-quality generation round, never updated when the v2 pipeline
+# (real filmed footage + locked, human-reviewed faces) replaced them
+# for Talking Actors, so they'd gone stale here even though this list
+# is Image-Ad-only (compositing, no video). Maya/Liam/Ethan are the 3
+# with real filmed base clips (see [[punqle_actors_v2_b_architecture]]).
+# Nia/Piper/Malik/Victor are the 4 remaining round-2 locked faces
+# (`actors_v2_approved_base_videos/_locked_faces_round2/`) that don't
+# have a filmed clip yet — usable here today since compositing only
+# needs a still photo, not motion. STANDING RULE: this list IS the
+# actor roster now — when a locked face gets real footage and goes
+# live as a new Talking Actor, update its description/style here in
+# the same pass (matching Maya/Liam/Ethan's own history), and when a
+# brand-new face gets locked, add it here immediately, not just to the
+# video pipeline — never let this list drift stale again.
 _IMAGE_AD_ACTORS = [
     {
         "id": "maya", "name": "Maya", "gender": "female", "style": "casual",
@@ -3653,64 +3671,24 @@ _IMAGE_AD_ACTORS = [
         "description": "a rugged, approachable man in his early 30s with short wavy brown hair, light stubble and a relaxed natural smile, wearing a rolled-sleeve red-and-black plaid flannel shirt",
     },
     {
-        "id": "sofia", "name": "Sofia", "gender": "female", "style": "business",
-        "description": "a confident professional woman in her late 30s with sleek straight black hair, fair skin, wearing a tailored charcoal blazer over a white blouse",
-    },
-    {
-        "id": "noah", "name": "Noah", "gender": "male", "style": "business",
-        "description": "a polished professional man in his 40s with short greying dark hair, a neatly trimmed beard, medium skin tone, wearing a navy blue blazer over a light shirt",
-    },
-    {
-        "id": "ava", "name": "Ava", "gender": "female", "style": "outdoor",
-        "description": "an energetic athletic woman in her mid-20s with a blonde ponytail, fair freckled skin, wearing a fitted grey athletic top, healthy outdoorsy glow",
-    },
-    {
         "id": "ethan", "name": "Ethan", "gender": "male", "style": "casual",
         "description": "a relaxed man around 30 with dark brown tousled curly hair, light stubble and a natural, slightly asymmetric smile, wearing a plain white t-shirt",
     },
     {
-        "id": "zara", "name": "Zara", "gender": "female", "style": "elegant",
-        "description": "an elegant woman in her late 20s with voluminous curly dark hair, deep brown skin, wearing a simple elegant neutral-toned top, soft glam makeup",
+        "id": "nia", "name": "Nia", "gender": "female", "style": "casual",
+        "description": "a warm woman in her early 30s with deep brown skin and a short natural curly afro, wearing a charcoal knit sweater, warm genuine smile",
     },
     {
-        "id": "marcus", "name": "Marcus", "gender": "male", "style": "casual",
-        "description": "a stylish young man in his early 20s with short curly black hair, dark skin, wearing a relaxed graphic t-shirt, friendly approachable smile",
-    },
-    # Second batch (2026-09-11) — added to reach 8 female + 8 male for
-    # Punqle Actors v2's 16-situation library (see the "B" architecture
-    # plan), real diversity beyond the first 8's range. Same fully-
-    # synthetic, no-real-person rationale as the original batch.
-    {
-        "id": "priya", "name": "Priya", "gender": "female", "style": "casual",
-        "description": "a bright, energetic woman in her mid-20s with a dark high ponytail, warm brown skin, wearing a fitted coral athletic top, natural dewy glow",
+        "id": "piper", "name": "Piper", "gender": "female", "style": "outdoor",
+        "description": "an energetic woman in her late 20s with fair, lightly freckled skin and a wavy blonde ponytail, wearing a heather-grey t-shirt, bright natural outdoor smile",
     },
     {
-        "id": "elena", "name": "Elena", "gender": "female", "style": "business",
-        "description": "a poised professional woman in her early 30s with shoulder-length wavy auburn hair, warm tan skin, wearing a fitted emerald green blouse, subtle gold jewelry",
+        "id": "malik", "name": "Malik", "gender": "male", "style": "casual",
+        "description": "a friendly man in his late 20s with warm brown skin and short cropped curly hair, a light goatee, wearing a cream crewneck sweatshirt, relaxed confident smile",
     },
     {
-        "id": "hannah", "name": "Hannah", "gender": "female", "style": "casual",
-        "description": "a cheerful woman in her late 20s with a sleek black bob haircut, fair skin, wearing an oversized soft grey hoodie, fresh natural makeup",
-    },
-    {
-        "id": "grace", "name": "Grace", "gender": "female", "style": "elegant",
-        "description": "a warm, graceful woman in her mid-40s with shoulder-length silver-streaked brown hair, light tan skin, wearing a relaxed linen button-up shirt, kind confident smile",
-    },
-    {
-        "id": "diego", "name": "Diego", "gender": "male", "style": "outdoor",
-        "description": "an athletic man in his mid-30s with short black wavy hair, a light beard, warm brown skin, wearing a fitted navy performance polo, easygoing confident smile",
-    },
-    {
-        "id": "kwame", "name": "Kwame", "gender": "male", "style": "business",
-        "description": "a sharp professional man in his late 20s with a short fade haircut, deep brown skin, wearing a fitted grey suit jacket over a black t-shirt, confident modern style",
-    },
-    {
-        "id": "ravi", "name": "Ravi", "gender": "male", "style": "casual",
-        "description": "a friendly man in his early 30s with short black hair and thin-framed glasses, medium brown skin, wearing a plain heather-grey crewneck sweatshirt, approachable smile",
-    },
-    {
-        "id": "james", "name": "James", "gender": "male", "style": "elegant",
-        "description": "a warm, distinguished man in his mid-50s with short greying hair and a trimmed grey beard, fair skin, wearing a casual open-collar denim shirt, friendly confident expression",
+        "id": "victor", "name": "Victor", "gender": "male", "style": "elegant",
+        "description": "a distinguished man in his mid-50s with swept-back grey hair and a grey stubble beard, fair skin, wearing a navy button-up shirt, calm confident expression",
     },
 ]
 _IMAGE_ACTORS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "actors")
