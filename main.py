@@ -309,6 +309,27 @@ class VideoScriptAnglesResponse(BaseModel):
     recommended_reason: str = ""
 
 
+class GenerateCarouselPlanRequest(BaseModel):
+    description: str
+    slide_count: int = 4
+
+    @field_validator("slide_count")
+    @classmethod
+    def validate_carousel_slide_count(cls, v):
+        if not (3 <= v <= 6):
+            raise ValueError("slide_count must be between 3 and 6")
+        return v
+
+
+class CarouselSlideOut(BaseModel):
+    visual: str
+    headline: str
+
+
+class CarouselPlanResponse(BaseModel):
+    slides: list[CarouselSlideOut]
+
+
 class AvatarOptionOut(BaseModel):
     avatar_id: str
     name: str
@@ -5015,6 +5036,68 @@ Respond with ONLY this JSON format, nothing else:
     }
 
 
+def _generate_carousel_plan(description: str, slide_count: int) -> dict:
+    """Free -- text-only GPT call, same pattern/cost shape as
+    _generate_video_script_angles. The real gap this closes: competitor
+    research (Predis, Canva Carousel Studio) found every real carousel
+    tool auto-designs a full multi-slide carousel from one prompt, while
+    Punqle's own CarouselBuilder was purely a curate-from-already-
+    generated-images tool with no way to get N *distinct, sequenced*
+    slides from one topic. This call is the missing planning step --
+    each returned slide's "visual" is fed into the exact same
+    generateAd/generateAdImageVariant image pipeline every other image
+    on this app already uses (one call per slide, same per-image credit
+    cost as generating that many images normally -- no new pricing),
+    and "headline" is burned on via the same canvas compositing every
+    post already uses. This function only plans; it never touches image
+    generation or credits itself.
+    """
+    prompt = f"""You are planning a {slide_count}-slide Instagram/Facebook carousel ad for a small business.
+
+The carousel is about: {description}
+
+Write exactly {slide_count} slides that build one coherent visual narrative across the swipe -- for example hook/attention-grabber, then a feature or benefit, then more detail or social proof, then a closing offer or call to action. Adapt this arc to whatever actually fits this specific offer; don't force a structure that doesn't apply.
+
+Each slide has two parts:
+1. "visual" -- a short, specific description of what THIS ONE slide's photo should show (for an AI image generator). Describe only this slide's own content, not the whole carousel's story.
+2. "headline" -- a short, punchy line of on-image text for this slide, 3 to 7 words, under 40 characters, no hashtags, no emoji, no quotation marks.
+
+Respond with ONLY this JSON format, nothing else:
+{{"slides": [{{"visual": "...", "headline": "..."}}]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You plan short, visually distinct carousel-ad slide sequences for small business social ads.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.8,
+            response_format={"type": "json_object"},
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    slides_raw = parsed.get("slides") or []
+    slides = [
+        {
+            "visual": (s.get("visual") or "").strip(),
+            "headline": (s.get("headline") or "").strip().strip('"').strip("'")[:60],
+        }
+        for s in slides_raw[:slide_count]
+        if (s.get("visual") or "").strip()
+    ]
+    if not slides:
+        raise ValueError("No carousel slides were generated.")
+    return {"slides": slides}
+
+
 # Veo always renders at exactly one of these two 720p frame sizes (see
 # GenerateVideosConfig's resolution="720p" in start_video_generation) —
 # known deterministically, so the logo's target pixel size can be
@@ -5329,6 +5412,31 @@ def generate_video_angles(
             raise HTTPException(status_code=400, detail="Tell us what the video is about.")
         category = _get_business_category(user_id)
         return _generate_video_script_angles(item_description, category, req.goal, language=req.language)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-carousel-plan", response_model=CarouselPlanResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def generate_carousel_plan(
+    request: Request,
+    req: GenerateCarouselPlanRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only GPT call, same economics as generate_video_angles.
+    Plans a real multi-slide carousel narrative from one topic; the
+    frontend then generates one real image per returned slide through
+    the existing generateAd/generateAdImageVariant pipeline (each
+    charged normally, same as generating that many images any other
+    way). See _generate_carousel_plan."""
+    try:
+        description = (req.description or "").strip()
+        if not description:
+            raise HTTPException(status_code=400, detail="Tell us what the carousel is about.")
+        return _generate_carousel_plan(description, req.slide_count)
     except HTTPException:
         raise
     except Exception as e:
