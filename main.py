@@ -4449,6 +4449,8 @@ async def generate_ad(
 
         copy = _generate_ad_copy(item_description, category)
         banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id, model)
+        if _is_free_tier(user_id):
+            banner_bytes = _add_watermark_to_image(banner_bytes)
 
         new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
         banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
@@ -4498,6 +4500,8 @@ async def generate_ad_image_variant(
 
         category = _get_business_category(user_id)
         banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id, model)
+        if _is_free_tier(user_id):
+            banner_bytes = _add_watermark_to_image(banner_bytes)
 
         new_credits = _spend_ad_credits(user_id, expected_cost, "image_variant", model)
 
@@ -4545,6 +4549,8 @@ async def generate_image_direct(
         banner_bytes = await run_in_threadpool(
             _generate_ai_banner_image, prompt.strip(), "other", aspect_ratio, None, model,
         )
+        if _is_free_tier(user_id):
+            banner_bytes = _add_watermark_to_image(banner_bytes)
         new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
 
         return {
@@ -5480,6 +5486,96 @@ def _burn_text_on_video(
             return f.read()
 
 
+def _render_watermark_badge_png(canvas_w: int, canvas_h: int) -> bytes:
+    """A small "Made with Punqle" pill badge, bottom-right corner -- the
+    free-tier gate for both images and video (see
+    _add_watermark_to_image/_add_watermark_to_video, 2026-09-24). Same
+    transparent-RGBA-PNG technique _render_caption_bar_png already uses,
+    just a small pill instead of a full-width bar."""
+    text = "Made with Punqle"
+    font_size = max(14, round(canvas_w * 0.022))
+    font = ImageFont.truetype(VIDEO_FONT_PATH, font_size)
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    text_bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    pad_x = round(font_size * 0.7)
+    pad_y = round(font_size * 0.45)
+    margin = round(canvas_w * 0.03)
+    pill_w = text_w + 2 * pad_x
+    pill_h = text_h + 2 * pad_y
+    pill_x0 = canvas_w - margin - pill_w
+    pill_y0 = canvas_h - margin - pill_h
+    draw.rounded_rectangle(
+        [pill_x0, pill_y0, pill_x0 + pill_w, pill_y0 + pill_h],
+        radius=pill_h / 2, fill=(0, 0, 0, 140),
+    )
+    draw.text(
+        (pill_x0 + pad_x - text_bbox[0], pill_y0 + pad_y - text_bbox[1]),
+        text, font=font, fill=(255, 255, 255, 230),
+    )
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _is_free_tier(user_id: str) -> bool:
+    """True unless the user has a real, currently-paying subscription --
+    same status check get_subscription_status itself uses. Gates the
+    watermark, not credit spending: a free-trial user and a lapsed/
+    cancelled former subscriber are both watermarked, since both are
+    generating on the free allotment either way."""
+    row = _get_subscription_row(user_id)
+    return not (row and row["status"] in ("active", "trialing", "past_due"))
+
+
+def _add_watermark_to_image(image_bytes: bytes) -> bytes:
+    """Pastes the free-tier watermark directly onto the pixels, server-
+    side -- unlike Brand Kit's logo (a client-side canvas composite,
+    fine for an optional user choice), a watermark's whole job is not
+    being strippable by whatever the frontend does or doesn't render."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    badge = Image.open(io.BytesIO(_render_watermark_badge_png(img.width, img.height)))
+    composited = Image.alpha_composite(img, badge).convert("RGB")
+    buf = io.BytesIO()
+    composited.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def _add_watermark_to_video(video_bytes: bytes, aspect_ratio: str = "16:9") -> bytes:
+    """Same technique as _burn_text_on_video's logo overlay, kept as its
+    own small function rather than a new param threaded through that
+    one -- every existing caller there carefully preserves specific
+    default behavior, and this is an orthogonal, always-on-for-free-tier
+    concern, not a user-facing Brand Kit choice. On any ffmpeg failure,
+    returns the original video rather than blocking the whole result --
+    a missing watermark is a much smaller problem than a broken video."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        badge_path = os.path.join(tmp_dir, "badge.png")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+        with open(input_path, "wb") as f:
+            f.write(video_bytes)
+        with open(badge_path, "wb") as f:
+            f.write(_render_watermark_badge_png(video_w, video_h))
+        cmd = [
+            ffmpeg_exe, "-y", "-i", input_path, "-i", badge_path,
+            "-filter_complex", "[0:v][1:v]overlay=0:0[out]",
+            "-map", "[out]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "ultrafast", "-bf", "0", "-threads", "1",
+            "-c:a", "copy", output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            logger.error("ffmpeg watermark overlay failed: %s", result.stderr[-2000:])
+            return video_bytes
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
 @app.post("/ads/generate-video-angles", response_model=VideoScriptAnglesResponse, tags=["ads"])
 @limiter.limit("10/minute")
 def generate_video_angles(
@@ -5648,6 +5744,12 @@ def check_video_status(
                 # already-generated, already-about-to-be-charged-for video
                 # over a text/logo-overlay step failing.
                 logger.error("Text/logo burn-in failed, returning video without it: %s", str(e), exc_info=True)
+
+        if _is_free_tier(user_id):
+            try:
+                video_bytes = _add_watermark_to_video(video_bytes, req.aspect_ratio)
+            except Exception as e:
+                logger.error("Watermark overlay failed, returning video without it: %s", str(e), exc_info=True)
 
         new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "video_generate")
         return {
