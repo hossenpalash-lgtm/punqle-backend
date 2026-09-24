@@ -5521,13 +5521,27 @@ def _render_watermark_badge_png(canvas_w: int, canvas_h: int) -> bytes:
 
 
 def _is_free_tier(user_id: str) -> bool:
-    """True unless the user has a real, currently-paying subscription --
-    same status check get_subscription_status itself uses. Gates the
-    watermark, not credit spending: a free-trial user and a lapsed/
-    cancelled former subscriber are both watermarked, since both are
-    generating on the free allotment either way."""
+    """True unless the user has ever actually paid Punqle real money --
+    either a real, currently-paying subscription (same status check
+    get_subscription_status itself uses), or at least one credit-pack
+    purchase (see credit_pack_purchases, 2026-09-24). A credit pack has
+    no ongoing "active" status the way a subscription does -- it's a
+    one-time, no-commitment purchase -- so once ever bought, that alone
+    permanently lifts the watermark, the same way it would be unfair to
+    keep watermarking a subscriber's images after their card happens to
+    briefly fail. A free-trial user and a lapsed/cancelled former
+    subscriber who never bought a pack are both still watermarked,
+    since both are generating on the free allotment either way."""
     row = _get_subscription_row(user_id)
-    return not (row and row["status"] in ("active", "trialing", "past_due"))
+    if row and row["status"] in ("active", "trialing", "past_due"):
+        return False
+    pack_res = with_retry(lambda: supabase.table("credit_pack_purchases")
+        .select("stripe_session_id")
+        .eq("owner_id", user_id)
+        .limit(1)
+        .execute())
+    pack_res = ensure_supabase_response(pack_res, "check credit pack purchases")
+    return not pack_res.data
 
 
 def _add_watermark_to_image(image_bytes: bytes) -> bytes:
