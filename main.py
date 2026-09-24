@@ -1393,11 +1393,19 @@ PRICE_ID_TO_TIER = {cfg["price_id"]: tier for tier, cfg in TIER_CONFIG.items() i
 # One-time credit top-ups — a real gap found by the 2026-09-24 cost audit
 # (see punqle_cost_margin_audit): before this, a user could only ever get
 # more credits by changing their subscription tier, never by just buying
-# a block on top of whatever plan they're already on. Priced from the
-# same audit's worst-case-protected math (the worst confirmed $/credit
-# rate once the image-generation credit-cost fix shipped), not from
-# TIER_CONFIG's own $/credit rate — these are one-off purchases with no
-# ongoing commitment, so they don't get a subscription's bulk discount.
+# a block on top of whatever plan they're already on.
+#
+# Repriced 2026-09-25 — the first pass priced these purely off the
+# audit's margin-safety floor and ended up BELOW every TIER_CONFIG
+# plan's own $/credit rate, Pro included (A$0.1499/credit for the
+# 100-pack vs Pro's A$0.1500) — a real bug: it meant a user could always
+# get a better rate stacking one-time packs than by ever subscribing,
+# undercutting the whole point of the subscription tiers. Now priced
+# above every plan's rate (100-pack ≈ Starter's own A$0.1997/credit,
+# the least-commitment option; 1,000-pack still above Growth's
+# A$0.1727) — a pack is deliberately never the cheapest way to get
+# credits, subscribing always is. Still comfortably above the audit's
+# real margin-safety floor too.
 CREDIT_PACKS = {
     "pack_100": {"price_id": os.getenv("STRIPE_PRICE_CREDIT_PACK_100", "").strip(), "credits": 100},
     "pack_500": {"price_id": os.getenv("STRIPE_PRICE_CREDIT_PACK_500", "").strip(), "credits": 500},
