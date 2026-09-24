@@ -1560,6 +1560,34 @@ def _log_feature_usage(user_id: str, feature: str, credits_spent: int, tier: Opt
         logger.error("Failed to log credit usage (%s): %s", feature, str(e), exc_info=True)
 
 
+def _log_real_cost_metric(feature: str, provider: str, model: Optional[str], metrics: Optional[dict]) -> None:
+    """Best-effort, same shape as _log_feature_usage -- but this records
+    the real VENDOR billing signal (Replicate's own per-prediction
+    `metrics` field: predict_time, or a model-specific field like
+    Topaz's `unspecified_billing_metric`), not what the user was
+    charged. Added 2026-09-24 after the cost audit (see
+    punqle_cost_margin_audit memory) found every credit-cost constant in
+    this file was a point-in-time snapshot that would silently go stale
+    if a vendor changed pricing -- this gives a real, queryable trend of
+    actual production cost over time instead of only ever being
+    re-researched from scratch. Not tied to owner_id deliberately: this
+    is aggregate vendor-cost telemetry, not per-user usage accounting
+    (that's credit_usage_log's job). Deliberately silent no-op when
+    metrics is falsy, since not every call site has one to offer (e.g. a
+    job that failed before reaching a Replicate status check)."""
+    if not metrics:
+        return
+    try:
+        with_retry(lambda: supabase.table("real_cost_metrics").insert({
+            "feature": feature,
+            "provider": provider,
+            "model": model,
+            "metrics": metrics,
+        }).execute())
+    except Exception as e:
+        logger.error("Failed to log real cost metric (%s): %s", feature, str(e), exc_info=True)
+
+
 def _spend_ad_credit(user_id: str, feature: str) -> int:
     """Checks the caller has at least 1 credit, decrements by 1, and
     returns the new balance. Raises 402 if there's nothing left to spend.
@@ -4345,6 +4373,7 @@ def _upscale_image_replicate(image_bytes: bytes, mime_type: str) -> bytes:
         raise Exception("Replicate did not return an image")
     image_resp = requests.get(image_url, timeout=30)
     image_resp.raise_for_status()
+    _log_real_cost_metric("upscale_image", "replicate", REAL_ESRGAN_MODEL, data.get("metrics"))
     return image_resp.content
 
 
@@ -5980,6 +6009,7 @@ def check_cinematic_ugc_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
+        _log_real_cost_metric("cinematic_ugc", "replicate", SEEDANCE_MODEL, data.get("metrics"))
         new_credits = _spend_ad_credits(user_id, CINEMATIC_UGC_CREDIT_COST[tier], "cinematic_ugc", tier)
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
@@ -6094,6 +6124,7 @@ def check_video_upscale_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
+        _log_real_cost_metric("video_upscale", "replicate", TOPAZ_VIDEO_UPSCALE_MODEL, data.get("metrics"))
         new_credits = _spend_ad_credits(user_id, VIDEO_UPSCALE_CREDIT_COST[tier], "video_upscale", tier)
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
@@ -6308,6 +6339,7 @@ def check_image_to_video_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
+        _log_real_cost_metric("image_to_video", "replicate", model, data.get("metrics"))
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model])
         new_credits = _spend_ad_credits(user_id, cost, "image_to_video", model)
 
@@ -6542,6 +6574,7 @@ def check_talking_video_status(
                 video_resp = requests.get(video_url, timeout=60)
                 video_resp.raise_for_status()
                 video_bytes = video_resp.content
+                _log_real_cost_metric("talking_video_motion", "replicate", model, data.get("metrics"))
 
             # Motion clip is ready -- synthesize narration and kick off
             # the redub, moving this job into its second stage.
@@ -6580,6 +6613,7 @@ def check_talking_video_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
+        _log_real_cost_metric("talking_video_redub", "replicate", SYNC_MODEL, data.get("metrics"))
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
         new_credits = _spend_ad_credits(user_id, cost, "talking_video", model)
 
@@ -6725,6 +6759,7 @@ def check_ai_actor_video_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
+        _log_real_cost_metric("ai_actor_video", "replicate", AI_ACTOR_MODEL, data.get("metrics"))
         new_credits = _spend_ad_credits(user_id, AI_ACTOR_VIDEO_CREDIT_COST, "ai_actor_video")
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
@@ -6912,6 +6947,7 @@ def check_actor_video_v2_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
+        _log_real_cost_metric("actor_video_v2", "replicate", SYNC_MODEL, data.get("metrics"))
         new_credits = _spend_ad_credits(user_id, ACTOR_VIDEO_V2_CREDIT_COST, "actor_video_v2")
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
