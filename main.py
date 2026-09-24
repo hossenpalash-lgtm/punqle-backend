@@ -192,6 +192,19 @@ class AdCreditsOut(BaseModel):
     credits: int
 
 
+class FeatureTrialsOut(BaseModel):
+    """One bool per FEATURE_TRIAL_KEYS entry — True means that trial is
+    still available (not yet claimed), so the frontend can show "Try
+    free" instead of a flat credit cost. See _has_unclaimed_trial."""
+    image: bool
+    product: bool
+    unboxing: bool
+    show_app: bool
+    upscale_image: bool
+    tryon: bool
+    video_ad: bool
+
+
 class ReferralRedeemRequest(BaseModel):
     referrer_id: str
 
@@ -1643,6 +1656,26 @@ def _spend_ad_credits(user_id: str, amount: int, feature: str, tier: Optional[st
 def ad_credits(user_id: str = Depends(get_current_user_id)):
     try:
         return {"credits": _get_ad_credits(user_id)}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ads/feature-trials", response_model=FeatureTrialsOut, tags=["ads"])
+def get_feature_trials(user_id: str = Depends(get_current_user_id)):
+    """Free — a single read telling the frontend which of the 8
+    guaranteed-once-free features (see FEATURE_TRIAL_KEYS, 2026-09-25)
+    this user still has available, so a button can show "Try free"
+    instead of a flat credit cost when there's really no charge coming.
+    One query instead of 7 separate _has_unclaimed_trial calls."""
+    try:
+        res = with_retry(lambda: supabase.table("feature_trial_uses")
+            .select("feature")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get feature trials")
+        used = {row["feature"] for row in res.data}
+        return {key: key not in used for key in FEATURE_TRIAL_KEYS}
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
