@@ -3647,6 +3647,22 @@ GPT_IMAGE_SIZE_BY_ASPECT_RATIO = {
     "story": "1024x1536",
 }
 
+# Real per-image provider cost varies a lot across the 3 picker options —
+# confirmed live 2026-09-24: Nano Banana Pro ~$0.134, Nano Banana 2
+# ~$0.067, GPT Image ~$0.042 — but every one of them was charged the same
+# flat 1 credit, which put the default (Nano Banana Pro, no photo
+# uploaded) at a real, negative margin. This only applies to the
+# no-photo/fully-AI-generated path — a real uploaded photo always routes
+# to the fixed, cheap gemini-2.5-flash-image edit model regardless of
+# `model` (see _get_banner_image), so that path stays 1 credit.
+IMAGE_GEN_CREDIT_COST = {"nano_banana_pro": 3, "nano_banana_2": 2, "gpt_image": 1}
+
+
+def _image_generate_credit_cost(has_photo: bool, model: str) -> int:
+    if has_photo:
+        return 1
+    return IMAGE_GEN_CREDIT_COST.get(model, 3)
+
 
 # A small, hardcoded, curated library — same "small curated set, not a
 # live vendor catalog" pattern as _HEYGEN_VOICES below. Every persona is
@@ -4354,21 +4370,26 @@ async def generate_ad(
             aspect_ratio = "square"
         if model not in IMAGE_GEN_MODELS:
             model = "nano_banana_pro"
-        credits = _get_ad_credits(user_id)
-        if credits <= 0:
-            raise HTTPException(
-                status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
-            )
-
         image_bytes = await file.read() if file is not None else None
         mime_type = file.content_type if file is not None else None
+        # Checked against the real expected cost, not just "not broke" —
+        # image generation's cost now varies by model (1-3 credits), so a
+        # flat credits<=0 gate could let a generation start (spending real
+        # provider $) that the user then can't actually afford to pay for.
+        expected_cost = _image_generate_credit_cost(image_bytes is not None, model)
+        credits = _get_ad_credits(user_id)
+        if credits < expected_cost:
+            raise HTTPException(
+                status_code=402,
+                detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
+            )
+
         category = _get_business_category(user_id)
 
         copy = _generate_ad_copy(item_description, category)
         banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id, model)
 
-        new_credits = _spend_ad_credit(user_id, "image_generate")
+        new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
         banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
         _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
@@ -4404,19 +4425,20 @@ async def generate_ad_image_variant(
             aspect_ratio = "square"
         if model not in IMAGE_GEN_MODELS:
             model = "nano_banana_pro"
-        credits = _get_ad_credits(user_id)
-        if credits <= 0:
-            raise HTTPException(
-                status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
-            )
-
         image_bytes = await file.read() if file is not None else None
         mime_type = file.content_type if file is not None else None
+        expected_cost = _image_generate_credit_cost(image_bytes is not None, model)
+        credits = _get_ad_credits(user_id)
+        if credits < expected_cost:
+            raise HTTPException(
+                status_code=402,
+                detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
+            )
+
         category = _get_business_category(user_id)
         banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio, actor_id, model)
 
-        new_credits = _spend_ad_credit(user_id, "image_variant")
+        new_credits = _spend_ad_credits(user_id, expected_cost, "image_variant", model)
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4451,17 +4473,18 @@ async def generate_image_direct(
             aspect_ratio = "square"
         if model not in IMAGE_GEN_MODELS:
             model = "nano_banana_pro"
+        expected_cost = _image_generate_credit_cost(False, model)
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if credits < expected_cost:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         banner_bytes = await run_in_threadpool(
             _generate_ai_banner_image, prompt.strip(), "other", aspect_ratio, None, model,
         )
-        new_credits = _spend_ad_credit(user_id, "image_generate")
+        new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -11105,11 +11128,15 @@ async def generate_content_plan_post(
     the user edit the AI's idea before spending a credit on it, without
     needing a separate "update plan" round-trip."""
     try:
+        # No file.read() needed yet to know has_photo — file's presence
+        # alone determines which _get_banner_image branch (and real cost)
+        # this call will hit, same reasoning as /ads/generate's own gate.
+        expected_cost = _image_generate_credit_cost(file is not None, "nano_banana_pro")
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if credits < expected_cost:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         plan_res = with_retry(lambda: supabase.table("content_plans")
@@ -11149,7 +11176,7 @@ async def generate_content_plan_post(
             "image_base64": banner_b64,
         }
 
-        new_credits = _spend_ad_credit(user_id, "weekly_plan_day")
+        new_credits = _spend_ad_credits(user_id, expected_cost, "weekly_plan_day")
         supabase.table("content_plans").update({"posts": posts}).eq("id", plan_id).execute()
         _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
