@@ -4446,8 +4446,9 @@ async def generate_ad(
         # flat credits<=0 gate could let a generation start (spending real
         # provider $) that the user then can't actually afford to pay for.
         expected_cost = _image_generate_credit_cost(image_bytes is not None, model)
+        has_trial = _has_unclaimed_trial(user_id, "image")
         credits = _get_ad_credits(user_id)
-        if credits < expected_cost:
+        if not has_trial and credits < expected_cost:
             raise HTTPException(
                 status_code=402,
                 detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
@@ -4460,7 +4461,10 @@ async def generate_ad(
         if _is_free_tier(user_id):
             banner_bytes = _add_watermark_to_image(banner_bytes)
 
-        new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
+        if has_trial and _claim_feature_trial(user_id, "image"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
         banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
         _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
@@ -4499,8 +4503,9 @@ async def generate_ad_image_variant(
         image_bytes = await file.read() if file is not None else None
         mime_type = file.content_type if file is not None else None
         expected_cost = _image_generate_credit_cost(image_bytes is not None, model)
+        has_trial = _has_unclaimed_trial(user_id, "image")
         credits = _get_ad_credits(user_id)
-        if credits < expected_cost:
+        if not has_trial and credits < expected_cost:
             raise HTTPException(
                 status_code=402,
                 detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
@@ -4511,7 +4516,10 @@ async def generate_ad_image_variant(
         if _is_free_tier(user_id):
             banner_bytes = _add_watermark_to_image(banner_bytes)
 
-        new_credits = _spend_ad_credits(user_id, expected_cost, "image_variant", model)
+        if has_trial and _claim_feature_trial(user_id, "image"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credits(user_id, expected_cost, "image_variant", model)
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4547,8 +4555,9 @@ async def generate_image_direct(
         if model not in IMAGE_GEN_MODELS:
             model = "nano_banana_pro"
         expected_cost = _image_generate_credit_cost(False, model)
+        has_trial = _has_unclaimed_trial(user_id, "image")
         credits = _get_ad_credits(user_id)
-        if credits < expected_cost:
+        if not has_trial and credits < expected_cost:
             raise HTTPException(
                 status_code=402,
                 detail=f"This needs {expected_cost} credits — you have {credits}. Upgrade to keep generating.",
@@ -4559,7 +4568,10 @@ async def generate_image_direct(
         )
         if _is_free_tier(user_id):
             banner_bytes = _add_watermark_to_image(banner_bytes)
-        new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
+        if has_trial and _claim_feature_trial(user_id, "image"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credits(user_id, expected_cost, "image_generate", model)
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4592,8 +4604,9 @@ async def combine_actor_and_product(
             raise HTTPException(status_code=400, detail="Describe how they're using the product.")
         if aspect_ratio not in ASPECT_RATIO_PROMPTS:
             aspect_ratio = "square"
+        has_trial = _has_unclaimed_trial(user_id, "product")
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if not has_trial and credits <= 0:
             raise HTTPException(
                 status_code=402,
                 detail="You're out of ad credits. Upgrade to keep generating.",
@@ -4607,7 +4620,10 @@ async def combine_actor_and_product(
             product_bytes, product_file.content_type or "image/jpeg",
             prompt.strip(), aspect_ratio,
         )
-        new_credits = _spend_ad_credit(user_id, "image_generate")
+        if has_trial and _claim_feature_trial(user_id, "product"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credit(user_id, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4636,8 +4652,9 @@ async def generate_show_app_shot(
     try:
         if aspect_ratio not in ASPECT_RATIO_PROMPTS:
             aspect_ratio = "square"
+        has_trial = _has_unclaimed_trial(user_id, "show_app")
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if not has_trial and credits <= 0:
             raise HTTPException(
                 status_code=402,
                 detail="You're out of ad credits. Upgrade to keep generating.",
@@ -4651,7 +4668,10 @@ async def generate_show_app_shot(
             screenshot_bytes, screenshot_file.content_type or "image/jpeg",
             aspect_ratio,
         )
-        new_credits = _spend_ad_credit(user_id, "image_generate")
+        if has_trial and _claim_feature_trial(user_id, "show_app"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credit(user_id, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4690,8 +4710,9 @@ async def generate_unboxing_shot(
             raise HTTPException(status_code=400, detail="Describe the surface or setting for your product.")
         if aspect_ratio not in ASPECT_RATIO_PROMPTS:
             aspect_ratio = "square"
+        has_trial = _has_unclaimed_trial(user_id, "unboxing")
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if not has_trial and credits <= 0:
             raise HTTPException(
                 status_code=402,
                 detail="You're out of ad credits. Upgrade to keep generating.",
@@ -4702,7 +4723,10 @@ async def generate_unboxing_shot(
             _generate_banner_image,
             product_bytes, product_file.content_type or "image/jpeg", scene.strip(), aspect_ratio,
         )
-        new_credits = _spend_ad_credit(user_id, "image_generate")
+        if has_trial and _claim_feature_trial(user_id, "unboxing"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credit(user_id, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -5552,6 +5576,63 @@ def _is_free_tier(user_id: str) -> bool:
     return not pack_res.data
 
 
+# Hybrid free-trial model, 2026-09-25 (see punqle_cost_margin_audit memory
+# for the full design discussion): the flat 15-credit pool alone didn't
+# guarantee feature *discovery* -- a user could spend everything
+# repeatedly regenerating one image and never reach Video or Try-On at
+# all. Each of a curated set of cheap/moderate "core" features (not the
+# expensive ones -- Cinematic UGC, Ready Actors v2, Custom AI Actor,
+# Talking Video, Try-On Animate, Image-to-Video's Kling/Seedance options
+# all stay credit-gated only, real cost too high to give away) now gets
+# exactly one guaranteed free try per account, on top of the unchanged
+# 15-credit pool -- not a replacement for it. FEATURE_TRIAL_KEYS names
+# every category this applies to; image generation's 3 separate
+# endpoints (generate/generate-image/generate-image-variant) and
+# Carousel's own per-slide image calls all share the single "image" key
+# deliberately -- whichever happens first claims it, since they're all
+# the same real underlying cost.
+FEATURE_TRIAL_KEYS = {"image", "product", "unboxing", "show_app", "upscale_image", "tryon", "video_ad"}
+
+
+def _has_unclaimed_trial(user_id: str, feature: str) -> bool:
+    """Read-only check, used at the pre-generation gate (before spending
+    any real provider $) to decide whether the credit-balance check
+    should even apply. Never claims anything itself -- claiming only
+    happens after a real generation succeeds, see _claim_feature_trial."""
+    res = with_retry(lambda: supabase.table("feature_trial_uses")
+        .select("feature")
+        .eq("owner_id", user_id)
+        .eq("feature", feature)
+        .execute())
+    res = ensure_supabase_response(res, "check feature trial")
+    return not res.data
+
+
+def _claim_feature_trial(user_id: str, feature: str) -> bool:
+    """Attempts to claim this user's one-time free trial for `feature`.
+    Returns True if this call just claimed it (so this generation should
+    be free -- caller must NOT spend credits), False if it was already
+    claimed before now (normal credit charging applies). Only ever
+    called AFTER a real generation has already succeeded -- a failed
+    generation (API error, moderation rejection, etc.) must never burn
+    someone's only free try at a feature. feature_trial_uses' composite
+    (owner_id, feature) primary key makes this atomic and race-safe: two
+    concurrent requests can both pass _has_unclaimed_trial's read, but
+    only one INSERT here ever succeeds -- the loser gets a real 23505
+    and correctly falls back to spending credits instead of both
+    generations landing free."""
+    try:
+        with_retry(lambda: supabase.table("feature_trial_uses").insert({
+            "owner_id": user_id,
+            "feature": feature,
+        }).execute())
+        return True
+    except APIError as e:
+        if e.code == "23505":
+            return False
+        raise
+
+
 def _add_watermark_to_image(image_bytes: bytes) -> bytes:
     """Pastes the free-tier watermark directly onto the pixels, server-
     side -- unlike Brand Kit's logo (a client-side canvas composite,
@@ -5665,7 +5746,7 @@ def start_video_generation(
         if gemini_client is None:
             raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
         credits = _get_ad_credits(user_id)
-        if credits < VIDEO_CREDIT_COST:
+        if not _has_unclaimed_trial(user_id, "video_ad") and credits < VIDEO_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
                 detail=f"Video needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
@@ -5773,7 +5854,10 @@ def check_video_status(
             except Exception as e:
                 logger.error("Watermark overlay failed, returning video without it: %s", str(e), exc_info=True)
 
-        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "video_generate")
+        if _claim_feature_trial(user_id, "video_ad"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "video_generate")
         return {
             "done": True,
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
@@ -7845,7 +7929,7 @@ def start_tryon(
         if not FASHN_API_KEY:
             raise HTTPException(status_code=503, detail="Try-On isn't enabled yet.")
         credits = _get_ad_credits(user_id)
-        if credits < TRYON_CREDIT_COST:
+        if not _has_unclaimed_trial(user_id, "tryon") and credits < TRYON_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
                 detail=f"Try-On needs {TRYON_CREDIT_COST} credits — you have {credits}.",
@@ -7924,7 +8008,10 @@ def check_tryon_status(
             raise HTTPException(status_code=502, detail="Try-On didn't return a result. Please try again.")
 
         image_bytes, _ = _fetch_url_bytes(output[0])
-        new_credits = _spend_ad_credits(user_id, TRYON_CREDIT_COST, "tryon_image")
+        if _claim_feature_trial(user_id, "tryon"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credits(user_id, TRYON_CREDIT_COST, "tryon_image")
         return {
             "done": True,
             "image_base64": base64.b64encode(image_bytes).decode("ascii"),
@@ -8124,8 +8211,9 @@ async def upscale_image(
     image tool here -- the real Replicate cost is a fraction of a cent,
     well inside that price."""
     try:
+        has_trial = _has_unclaimed_trial(user_id, "upscale_image")
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if not has_trial and credits <= 0:
             raise HTTPException(
                 status_code=402,
                 detail="You're out of ad credits. Upgrade to keep generating.",
@@ -8135,7 +8223,10 @@ async def upscale_image(
         mime_type = file.content_type or "image/jpeg"
         result_bytes = await run_in_threadpool(_upscale_image_replicate, image_bytes, mime_type)
 
-        new_credits = _spend_ad_credit(user_id, "upscale_image")
+        if has_trial and _claim_feature_trial(user_id, "upscale_image"):
+            new_credits = _get_ad_credits(user_id)
+        else:
+            new_credits = _spend_ad_credit(user_id, "upscale_image")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
