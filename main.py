@@ -222,6 +222,17 @@ class CheckoutResponse(BaseModel):
     checkout_url: str
 
 
+class CreditPackCheckoutRequest(BaseModel):
+    pack: str
+
+    @field_validator("pack")
+    @classmethod
+    def validate_pack(cls, v):
+        if v not in CREDIT_PACKS:
+            raise ValueError(f"pack must be one of {sorted(CREDIT_PACKS)}")
+        return v
+
+
 class PortalResponse(BaseModel):
     portal_url: str
 
@@ -1378,6 +1389,21 @@ TIER_CONFIG = {
     "pro": {"price_id": os.getenv("STRIPE_PRICE_PRO", "").strip(), "credits": 300},
 }
 PRICE_ID_TO_TIER = {cfg["price_id"]: tier for tier, cfg in TIER_CONFIG.items() if cfg["price_id"]}
+
+# One-time credit top-ups — a real gap found by the 2026-09-24 cost audit
+# (see punqle_cost_margin_audit): before this, a user could only ever get
+# more credits by changing their subscription tier, never by just buying
+# a block on top of whatever plan they're already on. Priced from the
+# same audit's worst-case-protected math (the worst confirmed $/credit
+# rate once the image-generation credit-cost fix shipped), not from
+# TIER_CONFIG's own $/credit rate — these are one-off purchases with no
+# ongoing commitment, so they don't get a subscription's bulk discount.
+CREDIT_PACKS = {
+    "pack_100": {"price_id": os.getenv("STRIPE_PRICE_CREDIT_PACK_100", "").strip(), "credits": 100},
+    "pack_500": {"price_id": os.getenv("STRIPE_PRICE_CREDIT_PACK_500", "").strip(), "credits": 500},
+    "pack_1000": {"price_id": os.getenv("STRIPE_PRICE_CREDIT_PACK_1000", "").strip(), "credits": 1000},
+}
+CREDIT_PACK_PRICE_ID_TO_PACK = {cfg["price_id"]: pack for pack, cfg in CREDIT_PACKS.items() if cfg["price_id"]}
 # Where the browser lands after completing (or cancelling) the Shopify
 # OAuth flow — reuses the same env var CORS already trusts as "the real
 # frontend," so there's no separate env var to keep in sync.
@@ -1466,8 +1492,14 @@ def home():
 # -----------------------
 # Every new user starts with a small free trial so they can experience the
 # product before needing to pay — granted lazily the first time their
-# ad_credits row is ever touched.
-TRIAL_AD_CREDITS = 3
+# ad_credits row is ever touched. Raised from 3 -> 15 on 2026-09-24: at 3
+# credits, no free user could ever reach any video or talking-actor
+# feature (the cheapest, Avatar Standard, needs 4) -- see the free-trial
+# economics audit. Worst-case real cost per signup is now $0.67 (5x
+# Nano Banana Pro, the worst confirmed always-reachable action after the
+# same day's image-credit-cost fix) -- sequenced deliberately after that
+# fix, since raising this first would have meant a $2.01 worst case.
+TRIAL_AD_CREDITS = 15
 
 
 def _ensure_ad_credits_row(user_id: str) -> None:
@@ -4714,22 +4746,24 @@ CINEMATIC_UGC_CREDIT_COST = {
 # a fraction of a cent per image per third-party pricing research) --
 # flat 1 credit via _spend_ad_credit, same as every other Gemini image
 # edit in this app. Video side is genuinely slow and non-trivial cost --
-# Topaz Labs' own official Replicate model, confirmed live via a real
-# prediction log (2026-09-19): billed in "units" at $0.08/unit (Topaz's
-# November 2025 rate, found via direct research, not assumed), units
-# scale with output pixel count (resolution x fps x duration) -- a
-# real 4K/60fps run in Replicate's own example logged 33 units (~$2.64).
-# Standard/Premium mirrors Avatar's own tier-naming and 4/10-credit split
-# exactly (same real-cost range for an 8s clip at 1080p vs 4K, by the
-# same reasoning already used there) -- treated as provisional until
-# confirmed against one real, first production run's actual bill, same
-# as every other new vendor integration's pricing in this project.
+# Topaz Labs' own official Replicate model, billed in "units" at
+# $0.08/unit (Topaz's November 2025 rate, found via direct research).
+# CONFIRMED live 2026-09-24 (was provisional before this) with a real
+# 8s/540x960/24fps test clip run through both tiers end to end:
+# Standard (1080p) billed 2 units (~$0.16 real cost), Premium (4K)
+# billed 5 units (~$0.40) -- both well under the original provisional
+# estimate (~$0.40/~$1.36), so the existing 4/10-credit pricing already
+# clears 62-72% margin on every plan, no repricing needed. (The original
+# provisional estimate was scaled down from Replicate's own 33-unit/
+# 4K/60fps documentation example -- that source clip's higher frame rate
+# meant it billed far more units than Punqle's real 24fps clips actually
+# do.)
 REAL_ESRGAN_MODEL = "nightmareai/real-esrgan"
 TOPAZ_VIDEO_UPSCALE_MODEL = "topazlabs/video-upscale"
 VIDEO_UPSCALE_RESOLUTION_BY_TIER = {"standard": "1080p", "premium": "4k"}
 VIDEO_UPSCALE_CREDIT_COST = {
-    "standard": 4,   # ~1080p, 8s -- provisional, see comment above
-    "premium": 10,   # ~4K, 8s -- provisional, see comment above
+    "standard": 4,   # 1080p, 8s -- confirmed ~$0.16 real cost, 62-72% margin
+    "premium": 10,   # 4K, 8s -- confirmed ~$0.40 real cost, 62-72% margin
 }
 
 # Image -> video tool: turn an already-generated image into a short clip,
@@ -11288,6 +11322,37 @@ def create_checkout_session(request: Request, req: CheckoutRequest, user_id: str
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/billing/checkout-credit-pack", response_model=CheckoutResponse, tags=["billing"])
+@limiter.limit("10/minute")
+def create_credit_pack_checkout_session(request: Request, req: CreditPackCheckoutRequest, user_id: str = Depends(get_current_user_id)):
+    """Same real pattern as create_checkout_session, but mode="payment"
+    (one-time, no ongoing commitment) instead of mode="subscription" —
+    for a user who just wants more credits without changing their plan.
+    client_reference_id carries owner_id through to the webhook exactly
+    like the subscription flow; credits are granted there once payment is
+    actually confirmed, never here."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Credit packs aren't available right now.")
+    price_id = CREDIT_PACKS[req.pack]["price_id"]
+    if not price_id:
+        raise HTTPException(status_code=503, detail="This credit pack isn't available right now.")
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{"price": price_id, "quantity": 1}],
+            client_reference_id=user_id,
+            success_url=f"{FRONTEND_URL}/?billing=success",
+            cancel_url=f"{FRONTEND_URL}/?billing=cancelled",
+        )
+        return {"checkout_url": session.url}
+    except stripe.error.StripeError as e:
+        logger.error("Stripe credit pack checkout error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/billing/subscription", response_model=SubscriptionStatusOut, tags=["billing"])
 def get_subscription_status(user_id: str = Depends(get_current_user_id)):
     try:
@@ -11356,7 +11421,35 @@ async def stripe_webhook(request: Request):
         # once up front lets the rest of this handler use plain .get().
         data = event["data"]["object"].to_dict()
 
-        if event_type == "checkout.session.completed":
+        if event_type == "checkout.session.completed" and data.get("mode") == "payment":
+            # One-time credit-pack purchase — unlike a subscription,
+            # there's no later invoice.paid to grant credits from, so
+            # this is the only place a pack purchase ever gets credited.
+            # Idempotency via credit_pack_purchases' session_id primary
+            # key: Stripe can redeliver the same event, and insert()
+            # (not upsert) means a redelivery hits a real 23505 unique
+            # violation instead of silently double-granting credits.
+            owner_id = data.get("client_reference_id")
+            session_id = data.get("id")
+            if owner_id and session_id and data.get("payment_status") == "paid":
+                line_items = stripe.checkout.Session.list_line_items(session_id, limit=1)
+                price_id = line_items.data[0].price.id if line_items.data else None
+                pack = CREDIT_PACK_PRICE_ID_TO_PACK.get(price_id)
+                if pack:
+                    try:
+                        with_retry(lambda: supabase.table("credit_pack_purchases").insert({
+                            "stripe_session_id": session_id,
+                            "owner_id": owner_id,
+                            "pack": pack,
+                            "credits": CREDIT_PACKS[pack]["credits"],
+                        }).execute())
+                    except APIError as e:
+                        if e.code != "23505":
+                            raise
+                    else:
+                        _add_ad_credits(owner_id, CREDIT_PACKS[pack]["credits"])
+
+        elif event_type == "checkout.session.completed":
             owner_id = data.get("client_reference_id")
             subscription_id = data.get("subscription")
             customer_id = data.get("customer")
