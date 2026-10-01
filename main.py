@@ -4208,6 +4208,7 @@ def _generate_ai_banner_image(
     aspect_ratio: str = "square",
     actor_description: Optional[str] = None,
     model: str = "nano_banana_pro",
+    solo_person: bool = False,
 ) -> bytes:
     """Generates a banner image from scratch (no real photo) for users
     without one to upload. The pictured product is AI-imagined rather than
@@ -4222,6 +4223,19 @@ def _generate_ai_banner_image(
     doing real two-image compositing, validated via a live spike before
     it shipped (see that function's own docstring).
 
+    solo_person: the "Create your own actor" flow's "Generate with AI"
+    step reuses this exact function (via /ads/generate-image) for the
+    actor's source photo, with the user's own free-form description —
+    if that description implies a scene (e.g. "riding a rickshaw"), the
+    model will plausibly render a second person into frame (a driver) to
+    make the scene coherent. The resulting photo then gets animated by
+    OmniHuman (image+audio -> talking video), which lip-syncs EVERY face
+    it detects to the one narration track -- a real bug found live
+    2026-10-01 (a generated "rickshaw" actor photo came back with both
+    the actor and the driver mouthing the narration). This flag appends
+    an explicit single-person constraint so that can't happen again,
+    regardless of what scene the user describes.
+
     model: one of IMAGE_GEN_MODELS. Only this from-scratch path offers a
     choice — the photo-edit/compositing functions above are Gemini-specific
     edit operations a from-scratch generator like GPT Image isn't built
@@ -4235,12 +4249,21 @@ def _generate_ai_banner_image(
         f"Feature {actor_description}, naturally holding or using the product, looking genuine and candid, not posed like a model. "
         if actor_description else ""
     )
+    solo_instruction = (
+        "This photo must show exactly ONE person and no one else — if the description implies a "
+        "setting that would normally include other people (a driver, a crowd, a shopkeeper, etc.), "
+        "show only the main subject and leave everyone else out of frame entirely. This photo will "
+        "later be animated to make this one person speak, so any other visible face would be "
+        "incorrectly animated too. "
+        if solo_person else ""
+    )
     prompt = (
         "Generate a clean, professional, photorealistic promotional banner image "
         "for a Facebook ad for a small business. "
         f"Context: {category_guidance} "
         f"The image should visually represent this product/offer: {item_description}. "
         f"{actor_instruction}"
+        f"{solo_instruction}"
         "Make it well-lit, visually appealing, and contextually appropriate. "
         "Do NOT add any text, letters, numbers, or words anywhere in the image — "
         "leave clean, uncluttered space (e.g. near the top or bottom) where text "
@@ -4437,7 +4460,12 @@ def _refine_actor_photo(image_bytes: bytes, mime_type: str, instruction: str) ->
         f"Edit this photo of a person: {instruction.strip()}. Keep the person's "
         "face and identity clearly recognizable as the same person, unless the "
         "instruction explicitly asks to change their appearance. Keep the result "
-        "photorealistic, matching the original photo's lighting, style, and quality."
+        "photorealistic, matching the original photo's lighting, style, and quality. "
+        "The result must still show exactly this one person and no one else — if "
+        "the instruction implies a setting that would normally include other "
+        "people (a driver, a crowd, a shopkeeper, etc.), apply the setting but "
+        "leave everyone else out of frame, since this photo will later be "
+        "animated to make only this person speak."
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
@@ -4572,6 +4600,7 @@ async def generate_image_direct(
     prompt: str,
     aspect_ratio: str = "square",
     model: str = "nano_banana_pro",
+    for_actor: bool = False,
     user_id: str = Depends(get_current_user_id),
 ):
     """A standalone, no-frills text-to-image generator — the home page's
@@ -4579,7 +4608,12 @@ async def generate_image_direct(
     simple "type a prompt, pick a model, generate" tool exactly (no ad
     copy, no goal/platform/actor framing — those stay Ad Creation's job).
     Reuses _generate_ai_banner_image unchanged; the caller's free-form
-    prompt is passed straight through as item_description."""
+    prompt is passed straight through as item_description.
+
+    for_actor: set only by "Create your own actor"'s "Generate with AI"
+    step — see _generate_ai_banner_image's solo_person docstring for why
+    this matters (a multi-person actor photo gets every face lip-synced
+    by OmniHuman, not just the intended one)."""
     try:
         if not prompt.strip():
             raise HTTPException(status_code=400, detail="Describe what you want to create.")
@@ -4597,7 +4631,7 @@ async def generate_image_direct(
             )
 
         banner_bytes = await run_in_threadpool(
-            _generate_ai_banner_image, prompt.strip(), "other", aspect_ratio, None, model,
+            _generate_ai_banner_image, prompt.strip(), "other", aspect_ratio, None, model, for_actor,
         )
         if _is_free_tier(user_id):
             banner_bytes = _add_watermark_to_image(banner_bytes)
