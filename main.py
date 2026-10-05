@@ -4974,6 +4974,12 @@ CINEMATIC_UGC_CREDIT_COST = {
     "standard": 25,  # 8s x ~$0.103/s = ~$0.82 real cost
     "premium": 46,   # 8s x ~$0.231/s = ~$1.85 real cost
 }
+# 2026-10-05: Cinematic UGC runs on Gemini Omni (8 s, 1080p, with sound) at the
+# Video Ad price instead of Seedance's silent 480p/720p tiers. A trial showed Omni
+# handling the same prompts (a person walking, then showing a product's stitching
+# and clasp in hand) very well, and it costs less than Seedance Premium (46) for
+# better quality. Seedance stays below only for a deployment without a Gemini key.
+CINEMATIC_UGC_OMNI_CREDIT_COST = 30  # same cost basis as VIDEO_CREDIT_COST (~$1.22 per clip)
 
 # Upscale (image + video) -- the home page's "Upscale" pill, matching
 # Arcads' own real feature (confirmed via frame-by-frame video review,
@@ -5065,9 +5071,9 @@ _OMNI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 _OMNI_CLEAN_LABELS = "Any product label, packaging or sign must stay clean with no readable text."
 
 
-def _omni_prompt(prompt: str, duration: int, has_image: bool, sound_hint: str = "") -> str:
+def _omni_prompt(prompt: str, duration: int, has_image: bool, sound_hint: str = "", identity_only: bool = False) -> str:
     parts = [prompt.strip()]
-    if has_image:
+    if has_image and not identity_only:
         parts.append("Use the provided image as the first frame and keep the subject and product exactly as shown.")
     n = int(duration)
     parts.append(f"{'An' if n in (8, 11, 18) else 'A'} {n}-second video.")
@@ -5167,11 +5173,11 @@ def _omni_run_job(job_id: str, body: dict) -> None:
 
 
 def _omni_start(prompt: str, duration: int, image_bytes: Optional[bytes] = None, image_mime: str = "image/jpeg",
-                aspect_ratio: str = "9:16", sound_hint: str = "") -> str:
+                aspect_ratio: str = "9:16", sound_hint: str = "", identity_only: bool = False) -> str:
     """Starts an Omni generation on a background thread and returns OUR job id."""
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
-    text = _omni_prompt(prompt, duration, image_bytes is not None, sound_hint)
+    text = _omni_prompt(prompt, duration, image_bytes is not None, sound_hint, identity_only)
     if image_bytes:
         inp = [{"type": "image", "data": base64.b64encode(image_bytes).decode("ascii"), "mime_type": image_mime},
                {"type": "text", "text": text}]
@@ -5349,6 +5355,52 @@ def _round_to_even_veo_duration(duration: int) -> int:
 # narration costs ~$0.75 on top of the Omni clip: at 10 credits Talking Video
 # held only ~54% at Pro, at 18 it holds ~62% (a 15 s narration ~52%).
 TALKING_VIDEO_REDUB_SURCHARGE = 18
+
+# Custom actors (a user's own saved photo) used to be OmniHuman only: a still
+# photo + audio, so only the mouth and head moved. A trial on 2026-10-05 showed
+# Gemini Omni turns the same kind of photo into a far more natural clip (body,
+# hands, a real-looking place), which is then lip-synced to the narration just
+# like Talking Video. One Omni clip is capped at 10 s, so narrations up to
+# OMNI_ACTOR_MAX_NARRATION_SECONDS use Omni and longer ones stay on OmniHuman,
+# which has no length limit.
+OMNI_ACTOR_MAX_NARRATION_SECONDS = 9
+
+
+def _omni_actor_clip_seconds(narration: str) -> Optional[int]:
+    """Omni clip length for a custom-actor narration, or None when the
+    narration is too long for a single Omni clip."""
+    est = _estimate_avatar_seconds(narration)
+    if est > OMNI_ACTOR_MAX_NARRATION_SECONDS:
+        return None
+    return max(4, min(10, math.ceil(est) + 1))
+
+
+def _omni_actor_cost(clip_seconds: int) -> int:
+    return math.ceil(clip_seconds * IMAGE_TO_VIDEO_CREDIT_PER_SECOND["omni"]) + TALKING_VIDEO_REDUB_SURCHARGE
+
+
+# "scene": the photo only fixes WHO the person is and Omni films them in a
+# natural everyday place (what the trial clip did). "photo": the photo is the
+# first frame, so the clip stays in the photo's own setting.
+OMNI_ACTOR_MODE = "scene"
+
+
+def _omni_actor_prompt(mode: str = OMNI_ACTOR_MODE) -> str:
+    base = (
+        "This is authentic, casual UGC-style footage filmed on a phone, not a professional advertisement. "
+        "The camera does not move at all. The person talks to the camera casually, like mid-conversation with a friend, "
+        "with small head shifts and relaxed natural gestures, their attention returning warmly to the lens. "
+        "Movement stays subtle and continuous, never a sequence of instructed actions. No eating, drinking or phone use. "
+        "Blinks are normal, complete human blinks at a relaxed rate. "
+        "They say, \"Hi, let me tell you about something I think you will love.\" in a warm, natural voice and keep talking casually. "
+        "Keep the same person, face, hair and clothing for the whole clip."
+    )
+    if mode == "photo":
+        return base
+    return (
+        "The person shown in the provided photo is sitting comfortably in a bright, real-looking everyday indoor space "
+        "such as a living room or a cafe corner, with soft natural window light. " + base
+    )
 
 # AI Actor talking video (OmniHuman, via Replicate) — a fourth video
 # path: like Avatar (HeyGen), a presenter reads your script, but using
@@ -6611,7 +6663,7 @@ def start_cinematic_ugc_generation(
     competitors (Creatify, Arcads) use — confirmed live, not assumed."""
     try:
         tier = req.tier if req.tier in CINEMATIC_UGC_CREDIT_COST else "standard"
-        cost = CINEMATIC_UGC_CREDIT_COST[tier]
+        cost = CINEMATIC_UGC_OMNI_CREDIT_COST if GEMINI_API_KEY else CINEMATIC_UGC_CREDIT_COST[tier]
         credits = _get_ad_credits(user_id)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
@@ -6619,6 +6671,19 @@ def start_cinematic_ugc_generation(
         prompt = f"{req.item_description.strip()}, {req.style_prompt.strip()}".strip(", ")
         if not prompt:
             raise HTTPException(status_code=400, detail="Nothing to generate a video from.")
+
+        if GEMINI_API_KEY:
+            omni_job_id = _omni_start(
+                f"Authentic UGC-style phone footage. {prompt}", CINEMATIC_UGC_DURATION_SEC, None, "image/jpeg", req.aspect_ratio,
+                sound_hint="Natural ambient sound that fits the scene only, no speech, no music.",
+            )
+            # The row makes the final poll charge exactly once (it is deleted on completion).
+            with_retry(lambda: supabase.table("cinematic_ugc_jobs").insert({
+                "prediction_id": f"omni:{omni_job_id}",
+                "owner_id": user_id,
+                "tier": "standard",
+            }).execute())
+            return {"prediction_id": f"omni:{omni_job_id}"}
 
         resolution = CINEMATIC_UGC_RESOLUTION_BY_TIER[tier]
         r = with_retry(
@@ -6675,6 +6740,16 @@ def check_cinematic_ugc_status(
         if not job_res.data:
             raise HTTPException(status_code=404, detail="Cinematic UGC job not found.")
         tier = job_res.data[0]["tier"]
+
+        if req.prediction_id.startswith("omni:"):
+            done, video_bytes, failed = _omni_poll(req.prediction_id[5:], "cinematic_ugc")
+            if not done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            with_retry(lambda: supabase.table("cinematic_ugc_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+            if failed or not video_bytes:
+                return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+            new_credits = _spend_ad_credits(user_id, CINEMATIC_UGC_OMNI_CREDIT_COST, "cinematic_ugc", "omni")
+            return {"done": True, "video_base64": base64.b64encode(video_bytes).decode("ascii"), "credits_remaining": new_credits}
 
         r = requests.get(
             f"https://api.replicate.com/v1/predictions/{req.prediction_id}",
@@ -7351,8 +7426,34 @@ def start_ai_actor_video_generation(
         else:
             raise HTTPException(status_code=400, detail="No actor selected.")
 
-        cost = AI_ACTOR_VIDEO_CREDIT_COST
         credits = _get_ad_credits(user_id)
+
+        # Short narration: Gemini Omni films the actor naturally, then Sync Labs
+        # lip-syncs it (the Talking Video chain). The job lives in
+        # talking_video_jobs; the client gets an opaque "tv:<job id>" it polls on
+        # ai-actor-video-status like any other actor job.
+        omni_clip = _omni_actor_clip_seconds(narration) if GEMINI_API_KEY else None
+        if omni_clip is not None:
+            omni_cost = _omni_actor_cost(omni_clip)
+            if credits < omni_cost:
+                raise HTTPException(status_code=402, detail=f"This needs {omni_cost} credits — you have {credits}.")
+            omni_job_id = _omni_start(
+                _omni_actor_prompt(), omni_clip, base64.b64decode(image_b64), image_mime_type, "9:16",
+                identity_only=(OMNI_ACTOR_MODE == "scene"),
+            )
+            job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
+                "owner_id": user_id,
+                "model": "omni",
+                "duration_seconds": omni_clip,
+                "narration": narration,
+                "voice_gender": actor_gender,
+                "stage": "animating",
+                "prediction_id": omni_job_id,
+            }).execute())
+            job_id = ensure_supabase_response(job_res, "create actor video job").data[0]["id"]
+            return {"prediction_id": f"tv:{job_id}"}
+
+        cost = AI_ACTOR_VIDEO_CREDIT_COST
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
@@ -7402,6 +7503,10 @@ def check_ai_actor_video_status(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
+        if req.prediction_id.startswith("tv:"):
+            # An Omni + Sync Labs actor job (see start_ai_actor_video_generation).
+            tv = check_talking_video_status(request, TalkingVideoStatusRequest(job_id=req.prediction_id[3:]), user_id)
+            return {"done": tv["done"], "video_base64": tv.get("video_base64"), "credits_remaining": tv.get("credits_remaining")}
         job_res = with_retry(lambda: supabase.table("ai_actor_video_jobs")
             .select("*")
             .eq("prediction_id", req.prediction_id)
