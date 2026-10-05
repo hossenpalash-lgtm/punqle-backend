@@ -29,6 +29,8 @@ import ipaddress
 import socket
 import subprocess
 import tempfile
+import threading
+import uuid
 import imageio_ffmpeg
 import csv
 import io
@@ -507,15 +509,15 @@ class UpscaleVideoStatusResponse(BaseModel):
     credits_remaining: Optional[int] = None
 
 
-IMAGE_TO_VIDEO_MODELS = {"veo_3_1", "kling_3_pro", "seedance_2_5"}
+IMAGE_TO_VIDEO_MODELS = {"omni", "veo_3_1", "kling_3_pro", "seedance_2_5"}  # veo_3_1 only for stale clients; it is mapped to omni
 
 
 class GenerateImageToVideoRequest(BaseModel):
     image_base64: str
     image_mime_type: str = "image/png"
     prompt: str
-    model: str = "kling_3_pro"
-    duration_seconds: int = 5
+    model: str = "omni"
+    duration_seconds: int = 8
     aspect_ratio: str = "9:16"
 
     @field_validator("model")
@@ -554,8 +556,8 @@ class GenerateTalkingVideoRequest(BaseModel):
     image_mime_type: str = "image/png"
     narration: str
     voice_gender: str = "female"
-    model: str = "kling_3_pro"
-    duration_seconds: int = 5
+    model: str = "omni"
+    duration_seconds: int = 8
     aspect_ratio: str = "9:16"
 
     @field_validator("model")
@@ -4870,8 +4872,8 @@ async def generate_unboxing_shot(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-VIDEO_CREDIT_COST = 64  # Video Ad: one fixed 8 s Kling 3.0 Pro (1080p) clip WITH native sound = 8 s x 8 credits/s. Real cost ~$2.69 (Replicate $0.336/s with audio) -> ~61% margin at Pro, ~67% at Growth. Was 10 on Veo 3.1 Lite ($0.40/8 s).
-TRYON_ANIMATE_CREDIT_COST = 48  # Try-On Animate: 8 s Kling 3.0 Pro (1080p), silent = 8 s x 6 credits/s. Real cost ~$1.79 -> ~65% at Pro.
+VIDEO_CREDIT_COST = 30  # Video Ad: one fixed 8 s Gemini Omni 1.1 Flash clip at 1080p, sound included. Real cost ~$1.22 ($0.152/s) -> ~62% margin at Pro, ~67% at Growth. History: 10 on Veo 3.1 Lite ($0.40), 48-64 on Kling for a few hours on 2026-10-05 before the Omni trial showed Omni looked better at ~half the cost.
+TRYON_ANIMATE_CREDIT_COST = 30  # Try-On Animate: same Omni 8 s clip (sound included), same cost.
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 # VideoOverlay-Bold has zero Bangla glyph coverage (confirmed live —
@@ -5012,9 +5014,10 @@ VIDEO_UPSCALE_CREDIT_COST = {
 # now. Kling 2.6 Pro/Seedance 1.5/Grok Video also excluded -- the ask
 # was for a simple picker, not every option Arcads happens to show.
 KLING_MODEL = "kwaivgi/kling-v3-video"
-IMAGE_TO_VIDEO_MIN_DURATION = {"veo_3_1": 4, "kling_3_pro": 3, "seedance_2_5": 3}
-IMAGE_TO_VIDEO_MAX_DURATION = {"veo_3_1": 8, "kling_3_pro": 15, "seedance_2_5": 15}
+IMAGE_TO_VIDEO_MIN_DURATION = {"omni": 4, "veo_3_1": 4, "kling_3_pro": 3, "seedance_2_5": 3}
+IMAGE_TO_VIDEO_MAX_DURATION = {"omni": 10, "veo_3_1": 8, "kling_3_pro": 15, "seedance_2_5": 15}  # omni max is a conservative guess: Google documents no per-clip cap
 IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
+    "omni": 3.75,         # 2026-10-05: Gemini Omni 1.1 Flash at 1080p = $0.152/s with sound -> 3.75 credits/s holds ~60% at Pro; an 8 s clip = 30 credits
     "veo_3_1": 1.25,      # LEGACY: Veo is retired 22 Oct 2026 and is no longer offered; the key stays only so a job already in flight at deploy time can still be polled and charged
     "seedance_2_5": 6,    # matches Cinematic UGC's real, billed 720p rate (~$0.231/s x 25 credits/$)
     "kling_3_pro": 6,     # 2026-10-05: 8 -> 6 credits/s (Kling is now the default engine; at 8/s an 8 s Video Ad would be 64 credits and a 15 s clip 120, more than a whole Growth month). 6/s still holds ~65% at Pro on Replicate's $0.224/s (3rd-party figure, still unverified against an invoice). Original note: PROVISIONAL -- no real billed Replicate invoice checked yet for
@@ -5024,6 +5027,220 @@ IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
                            # cost is checked, same as Cinematic UGC's own rate was corrected
                            # after its first real invoice.
 }
+
+
+# ---------------------------------------------------------------------------
+# Gemini Omni 1.1 Flash — the DEFAULT video engine (2026-10-05). Veo 3.1's
+# preview models retire 22 Oct 2026 and Google names this as the successor.
+# A side-by-side trial (wallets, serum, iced coffee, a Try-On photo) found
+# Omni more cinematic than Veo Lite and Kling, with sound included and a
+# fuller frame on Try-On, at ~$0.152/s for 1080p (8 s = $1.22; Kling with
+# sound was $2.69). Founder's rule: when 720p and 1080p both exist, use 1080p
+# — note Google says Omni's 1080p/4K are UPSCALED from 720p.
+#
+# It is NOT a Veo-style long-running operation: it is Google's Interactions
+# API (REST only — the pinned SDK has no `interactions`). Documented at
+# https://ai.google.dev/gemini-api/docs/omni.
+#
+# LIVE-FOUND (2026-10-05): the documented background mode (background=true,
+# then GET /interactions/{id}) does NOT work with our API key — the GET
+# answers 400 "Multiple authentication credentials received" even from
+# Google's own latest SDK (2.28), while the synchronous call (one POST that
+# returns the finished video in ~40-70 s) works every time. ~$2.4 of
+# generations were lost to this before it was caught. So: the synchronous
+# call runs on a SERVER-SIDE THREAD, its result lands as a file under /tmp,
+# and the client polls our own job id exactly as it used to poll Veo/Kling.
+# Consequences: a job lives on one server instance and for three hours (a
+# restart mid-generation fails that attempt — never charged, since credits
+# are spent only on delivery); Render must keep a single instance.
+# The API key travels in the x-goog-api-key HEADER, never the URL: a key in
+# the URL ends up in `requests` exception text, which several endpoints echo
+# back to the client.
+# ---------------------------------------------------------------------------
+OMNI_MODEL = _model_id("OMNI_VIDEO_MODEL", "gemini-omni-1.1-flash")
+OMNI_RESOLUTION = _model_id("OMNI_VIDEO_RESOLUTION", "1080p")
+_OMNI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+# Omni sometimes invents garbled text on product labels (seen on a serum
+# bottle in the trial), so every prompt tells it to keep them clean.
+_OMNI_CLEAN_LABELS = "Any product label, packaging or sign must stay clean with no readable text."
+
+
+def _omni_prompt(prompt: str, duration: int, has_image: bool, sound_hint: str = "") -> str:
+    parts = [prompt.strip()]
+    if has_image:
+        parts.append("Use the provided image as the first frame and keep the subject and product exactly as shown.")
+    n = int(duration)
+    parts.append(f"{'An' if n in (8, 11, 18) else 'A'} {n}-second video.")
+    parts.append(_OMNI_CLEAN_LABELS)
+    if sound_hint:
+        parts.append(sound_hint)
+    return " ".join(parts)
+
+
+def _omni_aspect(aspect_ratio: str) -> str:
+    return "16:9" if aspect_ratio == "16:9" else "9:16"  # Omni offers only these two
+
+
+_OMNI_DIR = os.path.join(tempfile.gettempdir(), "punqle_omni_jobs")
+_OMNI_JOB_TTL_SECONDS = 3 * 3600
+_OMNI_MAX_WAIT_SECONDS = 15 * 60
+
+
+def _omni_path(job_id: str, ext: str) -> str:
+    return os.path.join(_OMNI_DIR, f"{job_id}.{ext}")
+
+
+def _omni_cleanup_old_jobs() -> None:
+    try:
+        now = time.time()
+        for name in os.listdir(_OMNI_DIR):
+            path = os.path.join(_OMNI_DIR, name)
+            if now - os.path.getmtime(path) > _OMNI_JOB_TTL_SECONDS:
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def _normalize_omni_loudness(video_bytes: bytes) -> bytes:
+    """Omni's generated soundtrack is far too quiet to notice (measured
+    2026-10-05: -31 LUFS on a Video Ad, -43 LUFS on a Try-On clip, versus
+    the -14..-18 LUFS social platforms expect), which is why the founder
+    saw "no sound". Lifts it to -18 LUFS, leaving the picture untouched.
+    Best-effort: any failure returns the original clip."""
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_path = os.path.join(tmp_dir, "in.mp4")
+            out_path = os.path.join(tmp_dir, "out.mp4")
+            with open(in_path, "wb") as f:
+                f.write(video_bytes)
+            probe = subprocess.run([ffmpeg_exe, "-i", in_path], capture_output=True, text=True, timeout=30)
+            if "Audio:" not in (probe.stderr or ""):
+                return video_bytes
+            proc = subprocess.run(
+                [ffmpeg_exe, "-y", "-i", in_path, "-c:v", "copy", "-af", "loudnorm=I=-18:TP=-2:LRA=11",
+                 "-c:a", "aac", "-b:a", "160k", out_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0:
+                logger.error("Omni loudness normalisation failed: %s", proc.stderr[-500:])
+                return video_bytes
+            with open(out_path, "rb") as f:
+                return f.read()
+    except Exception as e:
+        logger.error("Omni loudness normalisation crashed: %s", type(e).__name__)
+        return video_bytes
+
+
+def _omni_run_job(job_id: str, body: dict) -> None:
+    """Thread target: the synchronous Omni call. Writes <id>.mp4 on success or
+    <id>.err (a short, key-free reason) on failure."""
+    try:
+        r = requests.post(
+            f"{_OMNI_BASE}/interactions",
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json=body, timeout=900,
+        )
+        if not r.ok:
+            logger.error("Omni job %s failed (HTTP %s): %s", job_id, r.status_code, r.text[:300])
+            with open(_omni_path(job_id, "err"), "w") as f:
+                f.write(f"http {r.status_code}")
+            return
+        video = _omni_extract_video(r.json())
+        if not video:
+            logger.error("Omni job %s returned no video (safety filter?)", job_id)
+            with open(_omni_path(job_id, "err"), "w") as f:
+                f.write("no video")
+            return
+        video = _normalize_omni_loudness(video)
+        tmp = _omni_path(job_id, "tmp")
+        with open(tmp, "wb") as f:
+            f.write(video)
+        os.replace(tmp, _omni_path(job_id, "mp4"))
+    except Exception as e:
+        logger.error("Omni job %s crashed: %s", job_id, type(e).__name__)  # type only: never log the URL/key
+        try:
+            with open(_omni_path(job_id, "err"), "w") as f:
+                f.write(type(e).__name__)
+        except Exception:
+            pass
+
+
+def _omni_start(prompt: str, duration: int, image_bytes: Optional[bytes] = None, image_mime: str = "image/jpeg",
+                aspect_ratio: str = "9:16", sound_hint: str = "") -> str:
+    """Starts an Omni generation on a background thread and returns OUR job id."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+    text = _omni_prompt(prompt, duration, image_bytes is not None, sound_hint)
+    if image_bytes:
+        inp = [{"type": "image", "data": base64.b64encode(image_bytes).decode("ascii"), "mime_type": image_mime},
+               {"type": "text", "text": text}]
+    else:
+        inp = text
+    body = {
+        "model": OMNI_MODEL,
+        "input": inp,
+        "response_format": {"type": "video", "aspect_ratio": _omni_aspect(aspect_ratio), "resolution": OMNI_RESOLUTION},
+        "background": False,
+        "store": False,
+        "stream": False,
+    }
+    os.makedirs(_OMNI_DIR, exist_ok=True)
+    _omni_cleanup_old_jobs()
+    job_id = uuid.uuid4().hex
+    with open(_omni_path(job_id, "pending"), "w") as f:
+        f.write(str(time.time()))
+    threading.Thread(target=_omni_run_job, args=(job_id, body), daemon=True, name=f"omni-{job_id[:8]}").start()
+    return job_id
+
+
+def _omni_operation(omni_job_id: str) -> dict:
+    return {"provider": "omni", "omni_job_id": omni_job_id}
+
+
+def _is_omni_operation(operation: Optional[dict]) -> bool:
+    return isinstance(operation, dict) and operation.get("provider") == "omni" and bool(operation.get("omni_job_id"))
+
+
+def _omni_extract_video(payload: dict) -> Optional[bytes]:
+    """Finds the generated video (base64) anywhere in an interaction's steps."""
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("type") == "video" and o.get("data"):
+                return o["data"]
+            for v in o.values():
+                f = walk(v)
+                if f:
+                    return f
+        elif isinstance(o, list):
+            for v in o:
+                f = walk(v)
+                if f:
+                    return f
+        return None
+    data = walk(payload.get("steps") or payload)
+    return base64.b64decode(data) if data else None
+
+
+def _omni_poll(job_id: str, feature: str) -> tuple:
+    """Returns (done, video_bytes_or_None, failed) for one of OUR Omni job ids."""
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id or ""):
+        return True, None, True
+    mp4, err, pending = _omni_path(job_id, "mp4"), _omni_path(job_id, "err"), _omni_path(job_id, "pending")
+    if os.path.exists(mp4):
+        with open(mp4, "rb") as f:
+            return True, f.read(), False
+    if os.path.exists(err):
+        with open(err) as f:
+            logger.error("Omni job %s (%s) ended: %s", job_id, feature, f.read()[:60])
+        return True, None, True
+    if os.path.exists(pending):
+        if time.time() - os.path.getmtime(pending) > _OMNI_MAX_WAIT_SECONDS:
+            logger.error("Omni job %s (%s) timed out", job_id, feature)
+            return True, None, True
+        return False, None, False
+    logger.error("Omni job %s (%s) is unknown here (server restarted or another instance)", job_id, feature)
+    return True, None, True
 
 
 # ---------------------------------------------------------------------------
@@ -6040,11 +6257,8 @@ def start_video_generation(
             "Professional, well-lit, realistic. No on-screen text, captions, or logos. "
             "Natural ambient sound that fits the scene only — no speech, no music."
         )
-        prediction_id = _kling_start_prediction(
-            prompt, 8, image_bytes, req.image_mime_type or "image/jpeg", req.aspect_ratio,
-            generate_audio=True,
-        )
-        return {"operation": _kling_operation(prediction_id), "headline": script["headline"], "narration": script["narration"]}
+        omni_job_id = _omni_start(prompt, 8, image_bytes, req.image_mime_type or "image/jpeg", req.aspect_ratio)
+        return {"operation": _omni_operation(omni_job_id), "headline": script["headline"], "narration": script["narration"]}
     except HTTPException:
         raise
     except genai_errors.ClientError as e:
@@ -6069,7 +6283,13 @@ def check_video_status(
     client instead of being kept in server memory, so a mid-generation
     backend restart/redeploy on Render doesn't strand anyone's job."""
     try:
-        if _is_kling_operation(req.operation):
+        if _is_omni_operation(req.operation):
+            done, video_bytes, failed = _omni_poll(req.operation["omni_job_id"], "video_generate")
+            if not done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            if failed or not video_bytes:
+                raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
+        elif _is_kling_operation(req.operation):
             done, video_bytes, failed = _kling_poll(req.operation["prediction_id"], "video_generate")
             if not done:
                 return {"done": False, "video_base64": None, "credits_remaining": None}
@@ -6647,8 +6867,8 @@ def start_image_to_video(
     tier tracking."""
     try:
         # Veo is retired (22 Oct 2026): a stale client that still sends
-        # "veo_3_1" gets Kling 3.0 Pro, the default engine now.
-        model = "kling_3_pro" if req.model == "veo_3_1" else req.model
+        # "veo_3_1" gets Gemini Omni, its Google-named successor and our default.
+        model = "omni" if req.model == "veo_3_1" else req.model
         duration = max(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
@@ -6663,6 +6883,17 @@ def start_image_to_video(
             raise HTTPException(status_code=400, detail="Describe the motion you want.")
         if not req.image_base64:
             raise HTTPException(status_code=400, detail="Missing the image to animate.")
+
+        if model == "omni":
+            omni_job_id = _omni_start(prompt, duration, base64.b64decode(req.image_base64), req.image_mime_type, req.aspect_ratio)
+            job_res = with_retry(lambda: supabase.table("image_to_video_jobs").insert({
+                "owner_id": user_id,
+                "model": model,
+                "duration_seconds": duration,
+                "prediction_id": omni_job_id,  # the column holds whichever vendor id this job uses
+            }).execute())
+            job_id = ensure_supabase_response(job_res, "create image-to-video job").data[0]["id"]
+            return {"job_id": job_id, "operation": None}
 
         replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
         image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
@@ -6766,6 +6997,17 @@ def check_image_to_video_status(
                 "credits_remaining": new_credits,
             }
 
+        if model == "omni":
+            done, video_bytes, failed = _omni_poll(job["prediction_id"], "image_to_video")
+            if not done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            with_retry(lambda: supabase.table("image_to_video_jobs").delete().eq("id", req.job_id).execute())
+            if failed or not video_bytes:
+                return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+            cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND["omni"])
+            new_credits = _spend_ad_credits(user_id, cost, "image_to_video", "omni")
+            return {"done": True, "video_base64": base64.b64encode(video_bytes).decode("ascii"), "credits_remaining": new_credits}
+
         prediction_id = job["prediction_id"]
         r = requests.get(
             f"https://api.replicate.com/v1/predictions/{prediction_id}",
@@ -6827,7 +7069,7 @@ def start_talking_video(
     redubbed video is in hand (motion-cost + TALKING_VIDEO_REDUB_SURCHARGE),
     never on partial success."""
     try:
-        model = "kling_3_pro" if req.model == "veo_3_1" else req.model  # Veo retired, see start_image_to_video
+        model = "omni" if req.model == "veo_3_1" else req.model  # Veo retired, see start_image_to_video
         duration = max(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
@@ -6842,6 +7084,23 @@ def start_talking_video(
             raise HTTPException(status_code=400, detail="Write what they should say.")
         if not req.image_base64:
             raise HTTPException(status_code=400, detail="Missing the image to animate.")
+
+        if model == "omni":
+            omni_job_id = _omni_start(
+                "A person naturally talking to the camera, subtle head and hand movement, no on-screen text.",
+                duration, base64.b64decode(req.image_base64), req.image_mime_type, req.aspect_ratio,
+            )
+            job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
+                "owner_id": user_id,
+                "model": model,
+                "duration_seconds": duration,
+                "narration": narration,
+                "voice_gender": req.voice_gender,
+                "stage": "animating",
+                "prediction_id": omni_job_id,
+            }).execute())
+            job_id = ensure_supabase_response(job_res, "create talking video job").data[0]["id"]
+            return {"job_id": job_id, "operation": None}
 
         replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
         image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
@@ -6955,7 +7214,14 @@ def check_talking_video_status(
         stage = job["stage"]
 
         if stage == "animating":
-            if model == "veo_3_1":
+            if model == "omni":
+                done, video_bytes, failed = _omni_poll(job["prediction_id"], "talking_video_motion")
+                if not done:
+                    return {"done": False, "stage": "animating", "video_base64": None, "credits_remaining": None}
+                if failed or not video_bytes:
+                    with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
+                    return {"done": True, "stage": "animating", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+            elif model == "veo_3_1":
                 if gemini_client is None:
                     raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
                 if not req.operation:
@@ -7837,6 +8103,12 @@ def _download_operation_video(operation: dict) -> bytes:
     only by the Edit Video flow (_render_edited_video); check_video_
     status has its own inline version of this, deliberately left
     untouched so its already-verified default behavior can't regress."""
+    if _is_omni_operation(operation):
+        # Omni results live on this server for _OMNI_JOB_TTL_SECONDS (see _omni_start).
+        done, video, failed = _omni_poll(operation["omni_job_id"], "edit_video")
+        if not done or failed or not video:
+            raise Exception("This video has expired — generate a new one to edit it.")
+        return video
     if _is_kling_operation(operation):
         # Replicate keeps a prediction's output files for about an hour, so
         # editing a Kling video long after it was made needs a fresh one.
@@ -8406,8 +8678,14 @@ def start_tryon_animation(
                 detail=f"Animating needs {TRYON_ANIMATE_CREDIT_COST} credits — you have {credits}.",
             )
         prompt = req.motion_prompt.strip() if req.motion_prompt and req.motion_prompt.strip() else _TRYON_ANIMATE_PROMPT
-        prediction_id = _kling_start_prediction(prompt, 8, base64.b64decode(req.image_base64), "image/png", "9:16")
-        return {"operation": _kling_operation(prediction_id)}
+        omni_job_id = _omni_start(
+            prompt, 8, base64.b64decode(req.image_base64), "image/png", "9:16",
+            # Founder asked for audible sound here (2026-10-05); without a cue Omni's
+            # track came out almost silent (mean -49 dB). No speech: a customer's own
+            # photo must never be made to "say" anything.
+            sound_hint="Clear, audible sound: gentle footsteps, soft fabric rustle and a light, stylish fashion-shoot background beat. No speech.",
+        )
+        return {"operation": _omni_operation(omni_job_id)}
     except HTTPException:
         raise
     except genai_errors.ClientError as e:
@@ -8431,7 +8709,13 @@ def check_tryon_animation_status(
     person's photo (animated or not) has no business sitting in a shared
     history table."""
     try:
-        if _is_kling_operation(req.operation):
+        if _is_omni_operation(req.operation):
+            done, video_bytes, failed = _omni_poll(req.operation["omni_job_id"], "tryon_animate")
+            if not done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            if failed or not video_bytes:
+                raise HTTPException(status_code=502, detail="Animating this photo failed. Please try again.")
+        elif _is_kling_operation(req.operation):
             done, video_bytes, failed = _kling_poll(req.operation["prediction_id"], "tryon_animate")
             if not done:
                 return {"done": False, "video_base64": None, "credits_remaining": None}
