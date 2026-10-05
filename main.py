@@ -7475,7 +7475,7 @@ def start_ai_actor_video_generation(
         if len(narration) > CUSTOM_ACTOR_MAX_NARRATION_CHARS:
             raise HTTPException(
                 status_code=400,
-                detail=f"That's too long for one actor video: keep it under {CUSTOM_ACTOR_MAX_NARRATION_CHARS} characters (about 45 seconds). You have {len(narration)}.",
+                detail=f"That's too long for one actor video: keep it under {CUSTOM_ACTOR_MAX_NARRATION_CHARS} characters (about 60 seconds). You have {len(narration)}.",
             )
 
         if req.custom_actor_id:
