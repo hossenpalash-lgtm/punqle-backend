@@ -5380,26 +5380,10 @@ ACTOR_VIDEO_V2_CREDIT_COST = AI_ACTOR_VIDEO_CREDIT_COST  # same real-cost range 
 # default -- a real, tested choice for this specific talking-actor use case.
 SYNC_TEMPERATURE = 0.3
 
-# Three voice engines, kept as a real user-facing dropdown rather than
-# picking one winner -- the founder's own call after a live, controlled
-# A/B/C listening test (same base clip, same script, only the engine
-# swapped) found the cost difference negligible (all three land within
-# ~$0.03-0.04 of each other per video, since Sync Labs' own cost
-# dominates regardless of which engine feeds it) and after seeing a real
-# competitor's own simple model-picker dropdown UI. "openai_natural"
-# (gpt-4o-mini-tts + instructions) won that first listening test, but a
-# later, separate comparison against a saved reference clip (2026-09-11)
-# found "openai_standard" (plain tts-1-hd)'s brisker pace more natural
-# than Natural's "unhurried" instructed pacing -- Standard is now the
-# frontend's default. Both stay real, selectable options either way.
-ACTOR_VOICE_ENGINES = {"openai_natural", "openai_standard", "elevenlabs"}
-OPENAI_NATURAL_TTS_MODEL = "gpt-4o-mini-tts"
-OPENAI_NATURAL_TTS_INSTRUCTIONS = (
-    "Voice: warm, natural, conversational, like talking to a close friend. "
-    "Pacing: unhurried, with genuine natural pauses at commas and sentence "
-    "breaks -- don't rush. Let real emotion build across the read rather "
-    "than staying flat. Natural breathing, not robotic."
-)
+# Ready Actors used to offer three voice engines. After a listening test
+# (2026-10-05) the founder preferred ElevenLabs, and OpenAI's tts-1 /
+# gpt-4o-mini-tts shut down on 6 Jan 2027, so ElevenLabs is the only one.
+ACTOR_VOICE_ENGINES = {"elevenlabs"}  # OpenAI Natural/Standard removed 2026-10-05 (tts-1 / gpt-4o-mini-tts shut down 6 Jan 2027); old clients' values fall back to elevenlabs
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 ELEVENLABS_MODEL = "eleven_v3"
 # One real voice per gender, pulled live from ElevenLabs' own /v2/voices
@@ -7923,66 +7907,40 @@ def _synthesize_actor_voiceover(
     voice_engine: str,
     elevenlabs_settings: Optional["ElevenLabsVoiceSettings"] = None,
 ) -> bytes:
-    """One narration track for Punqle Actors v2, from whichever of the
-    three real, live-tested engines the caller picked (ACTOR_VOICE_ENGINES).
-    All three hand back plain audio bytes to the same Sync Labs redub step
-    afterward -- this is the only place the engines actually differ.
-
-    Real, live-confirmed finding: ElevenLabs' Stability/Similarity/Style
-    sliders have no equivalent on OpenAI's models -- sending them to
-    OpenAI's speech endpoint is silently ignored (200 OK, no effect), so
-    they're never applied outside the "elevenlabs" branch below.
-    elevenlabs_settings (a real, user-facing "Audio Settings" panel,
+    """One narration track for Punqle Actors v2 (ElevenLabs; voice_engine is
+    kept only so older clients that still send an OpenAI value keep working).
+    Returns plain audio bytes for the Sync Labs redub step. elevenlabs_settings (a real, user-facing "Audio Settings" panel,
     added 2026-09-11) overrides ELEVENLABS_VOICE_SETTINGS per-field when
     provided -- None (the default) reproduces today's exact behavior."""
     text = narration[:MAX_NARRATION_CHARS]
-
-    if voice_engine == "elevenlabs" and not ELEVENLABS_API_KEY:
-        # ElevenLabs is the default engine now; a missing key must not take Ready Actors down.
-        logger.error("ELEVENLABS_API_KEY missing, using OpenAI Natural for this actor video")
-        voice_engine = "openai_natural"
-
-    if voice_engine == "elevenlabs":
-        voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
-        overrides = elevenlabs_settings.model_dump(exclude_none=True) if elevenlabs_settings else {}
-        voice_settings = {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0, **overrides}
-        r = with_retry(
-            lambda: requests.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-                headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "text": text,
-                    "model_id": ELEVENLABS_MODEL,
-                    "voice_settings": voice_settings,
-                },
-                timeout=30,
-            ),
-            exceptions=(requests.RequestException,),
-            attempts=2,
-        )
-        if r.ok:
-            return r.content
-        logger.error("ElevenLabs TTS failed (%s): %s — falling back to OpenAI Natural", r.status_code, r.text[:300])
-        voice_engine = "openai_natural"
-
     voice = AI_ACTOR_VOICE_BY_GENDER.get(gender, TTS_VOICE)
 
-    if voice_engine == "openai_natural":
-        response = with_retry(
-            lambda: client.audio.speech.create(
-                model=OPENAI_NATURAL_TTS_MODEL,
-                voice=voice if voice in _TTS_VOICES else TTS_VOICE,
-                input=text,
-                instructions=OPENAI_NATURAL_TTS_INSTRUCTIONS,
-                speed=1.0,
-                response_format="mp3",
-            ),
-            exceptions=RETRYABLE_OPENAI_ERRORS,
-        )
-        return response.content
+    if not ELEVENLABS_API_KEY:
+        # A missing key must not take Ready Actors down.
+        logger.error("ELEVENLABS_API_KEY missing, using OpenAI TTS for this actor video")
+        return _synthesize_voiceover_openai(text, voice)
 
-    # "openai_standard" (or any unrecognized value) -- the existing,
-    # already-proven plain path, unchanged from the OmniHuman-era feature.
+    voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
+    overrides = elevenlabs_settings.model_dump(exclude_none=True) if elevenlabs_settings else {}
+    voice_settings = {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0, **overrides}
+    r = with_retry(
+        lambda: requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            json={
+                "text": text,
+                "model_id": ELEVENLABS_MODEL,
+                "voice_settings": voice_settings,
+            },
+            timeout=30,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if r.ok:
+        return r.content
+    # Last resort until OpenAI's TTS shuts down on 6 Jan 2027, so an ElevenLabs outage doesn't block the video.
+    logger.error("ElevenLabs TTS failed (%s): %s — falling back to OpenAI TTS", r.status_code, r.text[:300])
     return _synthesize_voiceover_openai(text, voice)
 
 
@@ -12479,7 +12437,6 @@ def _registry_models() -> list:
         ("replicate", AI_ACTOR_MODEL, "custom AI actor video (OmniHuman)"),
         ("openai", GPT_IMAGE_MODEL, "GPT Image generation"),
         ("openai", TTS_MODEL, "voiceover"),
-        ("openai", OPENAI_NATURAL_TTS_MODEL, "Ready Actors natural voice"),
         ("openai", TRANSCRIBE_MODEL, "caption word timestamps"),
         ("openai", "gpt-4o-mini", "copy, scripts and plans"),
     ]
