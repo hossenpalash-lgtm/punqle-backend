@@ -618,16 +618,6 @@ class GenerateAiActorVideoRequest(BaseModel):
     custom_actor_id: Optional[str] = None
     narration: str
     language: str = "english"
-    # Only matters for a custom actor's narration over ~30 s: "720p" = one
-    # continuous take (default), "1080p" = full HD, joined once at a sentence break.
-    resolution: str = "720p"
-
-    @field_validator("resolution")
-    @classmethod
-    def validate_actor_resolution(cls, v):
-        if v not in ("720p", "1080p"):
-            raise ValueError("resolution must be '720p' or '1080p'")
-        return v
 
 
 # A custom actor is just a saved photo + name + gender (for voice
@@ -5459,16 +5449,14 @@ def _actor_v2_cost(seconds: float) -> int:
     return max(ACTOR_VIDEO_V2_CREDIT_COST, math.ceil(seconds * 2))
 
 
-# Custom actors on OmniHuman 1.5 (Replicate): the audio must be under 35 s per
-# call, so a narration up to 45 s is split at a sentence break into two calls
-# and the two clips are joined. ~$0.16 per output second (third-party figure,
-# unverified against a Replicate invoice) -> 3.5 credits per second (~57% at Pro);
-# the old flat 30 credits only held up to ~8 s.
+# Custom actors on OmniHuman 1.5: up to ~35 s on Replicate (its audio limit),
+# 35-60 s as one 720p take on fal.ai. ~$0.16 per output second (third-party figure,
+# unverified against an invoice) -> 3.5 credits per second (~57% at Pro); the old
+# flat 30 credits only held up to ~8 s. Clips are never joined.
 CUSTOM_ACTOR_MAX_NARRATION_CHARS = 900  # ~60 s
-# Over ~30 s a custom actor can be made as ONE take on fal.ai's OmniHuman 1.5 at
-# 720p (audio < 60 s there; at 1080p the limit is 30 s), or as two 1080p calls
-# joined at a sentence break on Replicate. FAL_KEY enables the first; without it
-# (or when the user picks 1080p) the second is used.
+# Over ~35 s a custom actor is ONE take on fal.ai's OmniHuman 1.5 at 720p (audio
+# < 60 s there; at 1080p fal allows only 30 s). Without FAL_KEY such a request is
+# declined with a clear message.
 FAL_KEY = os.getenv("FAL_KEY", "").strip()
 FAL_OMNIHUMAN_SUBMIT_URL = "https://queue.fal.run/fal-ai/bytedance/omnihuman/v1.5"
 FAL_QUEUE_BASE = "https://queue.fal.run/fal-ai/bytedance"  # the status/result URLs fal returns live under this base
@@ -5484,18 +5472,6 @@ OMNIHUMAN_ACTOR_PROMPT = (
 def _omnihuman_actor_cost(seconds: float) -> int:
     return max(AI_ACTOR_VIDEO_CREDIT_COST, math.ceil(seconds * OMNIHUMAN_CREDITS_PER_SECOND))
 
-
-def _split_narration_in_two(text: str) -> tuple:
-    """Splits at the sentence break nearest the middle (falls back to the nearest
-    space) so each half keeps whole sentences."""
-    mid = len(text) // 2
-    candidates = [m.end() for m in re.finditer(r"[.!?।]\s+", text)]
-    if candidates:
-        cut = min(candidates, key=lambda i: abs(i - mid))
-    else:
-        spaces = [m.start() for m in re.finditer(r"\s", text)]
-        cut = min(spaces, key=lambda i: abs(i - mid)) if spaces else mid
-    return text[:cut].strip(), text[cut:].strip()
 
 # Punqle Actors v2 -- a pre-baked Veo 3.1 base clip (see
 # scripts/populate_actor_video_clips.py, actor_video_clips table)
@@ -7565,25 +7541,20 @@ def start_ai_actor_video_generation(
         voice = AI_ACTOR_VOICE_BY_GENDER.get(actor_gender, TTS_VOICE)
         # The route is chosen from the REAL length of the voice, not the estimate:
         # under ~35 s one Replicate call (full HD or better); longer, one 720p take
-        # on fal.ai, or (user picked 1080p, or no fal key) two Replicate calls
-        # split at a sentence break and joined.
+        # on fal.ai.
         full_audio = _synthesize_voiceover(narration, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
         audio_seconds = _media_duration_seconds(full_audio, ".mp3") or est_seconds
         if audio_seconds >= FAL_MAX_AUDIO_SECONDS_720P:
             raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
         if audio_seconds < REPLICATE_OMNIHUMAN_MAX_AUDIO_SECONDS:
             prediction_id = _start_omnihuman_prediction(image_b64, image_mime_type, full_audio)
-        elif FAL_KEY and req.resolution != "1080p":
+        elif FAL_KEY:
             prediction_id = _start_fal_omnihuman(image_b64, image_mime_type, full_audio, "720p")
         else:
-            prediction_ids = []
-            for part in _split_narration_in_two(narration):
-                part_audio = _synthesize_voiceover(part, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
-                part_seconds = _media_duration_seconds(part_audio, ".mp3")
-                if part_seconds and part_seconds >= REPLICATE_OMNIHUMAN_MAX_AUDIO_SECONDS:
-                    raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
-                prediction_ids.append(_start_omnihuman_prediction(image_b64, image_mime_type, part_audio))
-            prediction_id = ",".join(prediction_ids)
+            # No silent fallback to joining two clips (the founder doesn't want cuts):
+            # over ~35 s needs fal.ai, so without it the request is declined clearly.
+            logger.error("FAL_KEY missing: declined a %.0f s custom actor narration", audio_seconds)
+            raise HTTPException(status_code=503, detail="Videos over about 35 seconds aren't available right now. Please shorten it a little.")
 
         with_retry(lambda: supabase.table("ai_actor_video_jobs").insert({
             "prediction_id": prediction_id,
