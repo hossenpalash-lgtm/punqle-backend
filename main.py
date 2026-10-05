@@ -5038,7 +5038,7 @@ IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
     "omni": 3.75,         # 2026-10-05: Gemini Omni 1.1 Flash at 1080p = $0.152/s with sound -> 3.75 credits/s holds ~60% at Pro; an 8 s clip = 30 credits
     "veo_3_1": 1.25,      # LEGACY: Veo is retired 22 Oct 2026 and is no longer offered; the key stays only so a job already in flight at deploy time can still be polled and charged
     "seedance_2_5": 6,    # matches Cinematic UGC's real, billed 720p rate (~$0.231/s x 25 credits/$)
-    "kling_3_pro": 6,     # 2026-10-05: 8 -> 6 credits/s (Kling is now the default engine; at 8/s an 8 s Video Ad would be 64 credits and a 15 s clip 120, more than a whole Growth month). 6/s still holds ~65% at Pro on Replicate's $0.224/s (3rd-party figure, still unverified against an invoice). Original note: PROVISIONAL -- no real billed Replicate invoice checked yet for
+    "kling_3_pro": 9,     # 2026-10-06: Image->Video Kling now makes its own sound: $0.336/s -> 9 credits/s (~65% at Pro). (Was 6 silent; Talking Video keeps 6, see TALKING_VIDEO_CREDIT_PER_SECOND.) Older note: 8 -> 6 credits/s (Kling is now the default engine; at 8/s an 8 s Video Ad would be 64 credits and a 15 s clip 120, more than a whole Growth month). 6/s still holds ~65% at Pro on Replicate's $0.224/s (3rd-party figure, still unverified against an invoice). Original note: PROVISIONAL -- no real billed Replicate invoice checked yet for
                            # Kling 3.0 Pro specifically (its own pricing page shows no $ figure).
                            # Set deliberately above Seedance's known real rate since "pro" mode
                            # targets 1080p. Correct this once a real generation's actual billed
@@ -5150,7 +5150,42 @@ def _normalize_omni_loudness(video_bytes: bytes) -> bytes:
         return video_bytes
 
 
-def _omni_run_job(job_id: str, body: dict) -> None:
+def _omni_try_kling_fallback(job_id: str, fb: Optional[dict], reason: str) -> bool:
+    """When Gemini Omni can't deliver (balance depleted, outage, a safety refusal),
+    the same request continues on Kling 3.0 Pro so the user gets a video instead
+    of an error. Runs inside the Omni worker thread: starts the Kling prediction,
+    waits for it, and writes the finished clip under the SAME job id, so every
+    endpoint that polls this job (Video Ad, Cinematic UGC, Try-On Animate,
+    Image->Video, Talking Video, custom actors) benefits with no changes. The user
+    is charged the normal price (the margin is thinner only during an outage).
+    Returns True when the clip was produced."""
+    if not fb or not REPLICATE_API_TOKEN:
+        return False
+    try:
+        logger.error("Omni job %s failed (%s): continuing on Kling", job_id, reason)
+        pid = _kling_start_prediction(
+            fb["prompt"], max(3, min(15, int(fb["duration"]))), fb["image"], fb["mime"], fb["aspect"],
+            generate_audio=fb["audio"],
+        )
+        deadline = time.time() + _OMNI_MAX_WAIT_SECONDS - 90
+        while time.time() < deadline:
+            time.sleep(6)
+            done, video, failed = _kling_poll(pid, "omni_fallback")
+            if done:
+                if failed or not video:
+                    return False
+                tmp = _omni_path(job_id, "tmp")
+                with open(tmp, "wb") as f:
+                    f.write(video)
+                os.replace(tmp, _omni_path(job_id, "mp4"))
+                return True
+        return False
+    except Exception as e:
+        logger.error("Kling fallback for %s failed: %s", job_id, type(e).__name__)
+        return False
+
+
+def _omni_run_job(job_id: str, body: dict, fb: Optional[dict] = None) -> None:
     """Thread target: the synchronous Omni call. Writes <id>.mp4 on success or
     <id>.err (a short, key-free reason) on failure."""
     try:
@@ -5161,12 +5196,16 @@ def _omni_run_job(job_id: str, body: dict) -> None:
         )
         if not r.ok:
             logger.error("Omni job %s failed (HTTP %s): %s", job_id, r.status_code, r.text[:300])
+            if _omni_try_kling_fallback(job_id, fb, f"http {r.status_code}"):
+                return
             with open(_omni_path(job_id, "err"), "w") as f:
                 f.write(f"http {r.status_code}")
             return
         video = _omni_extract_video(r.json())
         if not video:
             logger.error("Omni job %s returned no video (safety filter?)", job_id)
+            if _omni_try_kling_fallback(job_id, fb, "no video"):
+                return
             with open(_omni_path(job_id, "err"), "w") as f:
                 f.write("no video")
             return
@@ -5177,6 +5216,8 @@ def _omni_run_job(job_id: str, body: dict) -> None:
         os.replace(tmp, _omni_path(job_id, "mp4"))
     except Exception as e:
         logger.error("Omni job %s crashed: %s", job_id, type(e).__name__)  # type only: never log the URL/key
+        if _omni_try_kling_fallback(job_id, fb, type(e).__name__):
+            return
         try:
             with open(_omni_path(job_id, "err"), "w") as f:
                 f.write(type(e).__name__)
@@ -5185,8 +5226,11 @@ def _omni_run_job(job_id: str, body: dict) -> None:
 
 
 def _omni_start(prompt: str, duration: int, image_bytes: Optional[bytes] = None, image_mime: str = "image/jpeg",
-                aspect_ratio: str = "9:16", sound_hint: str = "", identity_only: bool = False) -> str:
-    """Starts an Omni generation on a background thread and returns OUR job id."""
+                aspect_ratio: str = "9:16", sound_hint: str = "", identity_only: bool = False,
+                kling_audio: bool = True) -> str:
+    """Starts an Omni generation on a background thread and returns OUR job id.
+    kling_audio: whether the Kling fallback (used only if Omni fails) should make
+    its own sound; off where the clip's sound is replaced by a voice anyway."""
     if not GEMINI_API_KEY:
         raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
     text = _omni_prompt(prompt, duration, image_bytes is not None, sound_hint, identity_only)
@@ -5208,7 +5252,9 @@ def _omni_start(prompt: str, duration: int, image_bytes: Optional[bytes] = None,
     job_id = uuid.uuid4().hex
     with open(_omni_path(job_id, "pending"), "w") as f:
         f.write(str(time.time()))
-    threading.Thread(target=_omni_run_job, args=(job_id, body), daemon=True, name=f"omni-{job_id[:8]}").start()
+    fb = {"prompt": prompt, "duration": duration, "image": image_bytes, "mime": image_mime,
+          "aspect": _omni_aspect(aspect_ratio), "audio": kling_audio}
+    threading.Thread(target=_omni_run_job, args=(job_id, body, fb), daemon=True, name=f"omni-{job_id[:8]}").start()
     return job_id
 
 
@@ -5367,6 +5413,9 @@ def _round_to_even_veo_duration(duration: int) -> int:
 # narration costs ~$0.75 on top of the Omni clip: at 10 credits Talking Video
 # held only ~54% at Pro, at 18 it holds ~62% (a 15 s narration ~52%).
 TALKING_VIDEO_REDUB_SURCHARGE = 18
+# Talking Video animates silently (the narration replaces any sound), so its Kling
+# keeps the silent rate; Omni and the legacy keys match IMAGE_TO_VIDEO_CREDIT_PER_SECOND.
+TALKING_VIDEO_CREDIT_PER_SECOND = {"omni": 3.75, "veo_3_1": 1.25, "kling_3_pro": 6, "seedance_2_5": 6}
 
 # Custom actors (a user's own saved photo) used to be OmniHuman only: a still
 # photo + audio, so only the mouth and head moved. A trial on 2026-10-05 showed
@@ -6732,7 +6781,7 @@ def start_cinematic_ugc_generation(
     competitors (Creatify, Arcads) use — confirmed live, not assumed."""
     try:
         tier = req.tier if req.tier in CINEMATIC_UGC_CREDIT_COST else "standard"
-        use_omni = req.engine != "seedance" and bool(GEMINI_API_KEY)
+        use_omni = bool(GEMINI_API_KEY)  # Seedance option removed 2026-10-06; an old client's "seedance" is served by Omni
         cost = CINEMATIC_UGC_OMNI_CREDIT_COST if use_omni else CINEMATIC_UGC_CREDIT_COST[tier]
         credits = _get_ad_credits(user_id)
         if credits < cost:
@@ -7001,7 +7050,7 @@ def start_image_to_video(
     try:
         # Veo is retired (22 Oct 2026): a stale client that still sends
         # "veo_3_1" gets Gemini Omni, its Google-named successor and our default.
-        model = "omni" if req.model == "veo_3_1" else req.model
+        model = {"veo_3_1": "omni", "seedance_2_5": "kling_3_pro"}.get(req.model, req.model)  # Veo retired, Seedance removed
         duration = max(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
@@ -7028,25 +7077,17 @@ def start_image_to_video(
             job_id = ensure_supabase_response(job_res, "create image-to-video job").data[0]["id"]
             return {"job_id": job_id, "operation": None}
 
-        replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
+        # Kling 3.0 Pro (the only Replicate model offered here now): 1080p with its own
+        # sound, since the founder's rule is the best quality everywhere (9 credits/s).
+        replicate_model_id = KLING_MODEL
         image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
-        if model == "kling_3_pro":
-            input_body = {
-                "prompt": prompt,
-                "start_image": image_uri,
-                "duration": duration,
-                "mode": "pro",
-                "generate_audio": False,
-            }
-        else:
-            input_body = {
-                "prompt": prompt,
-                "image": image_uri,
-                "duration": duration,
-                "resolution": "720p",
-                "aspect_ratio": req.aspect_ratio,
-                "generate_audio": False,
-            }
+        input_body = {
+            "prompt": prompt,
+            "start_image": image_uri,
+            "duration": duration,
+            "mode": "pro",
+            "generate_audio": True,
+        }
 
         r = with_retry(
             lambda: requests.post(
@@ -7202,12 +7243,12 @@ def start_talking_video(
     redubbed video is in hand (motion-cost + TALKING_VIDEO_REDUB_SURCHARGE),
     never on partial success."""
     try:
-        model = "omni" if req.model == "veo_3_1" else req.model  # Veo retired, see start_image_to_video
+        model = {"veo_3_1": "omni", "seedance_2_5": "kling_3_pro"}.get(req.model, req.model)  # Veo retired, Seedance removed (see start_image_to_video)
         duration = max(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
         )
-        cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
+        cost = math.ceil(duration * TALKING_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
         credits = _get_ad_credits(user_id)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
@@ -7222,6 +7263,7 @@ def start_talking_video(
             omni_job_id = _omni_start(
                 "A person naturally talking to the camera, subtle head and hand movement, no on-screen text.",
                 duration, base64.b64decode(req.image_base64), req.image_mime_type, req.aspect_ratio,
+                kling_audio=False,
             )
             job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
                 "owner_id": user_id,
@@ -7436,7 +7478,7 @@ def check_talking_video_status(
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
         _log_real_cost_metric("talking_video_redub", "replicate", SYNC_MODEL, data.get("metrics"))
-        cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
+        cost = math.ceil(duration * TALKING_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
         new_credits = _spend_ad_credits(user_id, cost, "talking_video", model)
 
         return {"done": True, "stage": "redubbing", "video_base64": video_base64, "credits_remaining": new_credits}
@@ -7514,7 +7556,7 @@ def start_ai_actor_video_generation(
                 raise HTTPException(status_code=402, detail=f"This needs {omni_cost} credits — you have {credits}.")
             omni_job_id = _omni_start(
                 _omni_actor_prompt(), omni_clip, base64.b64decode(image_b64), image_mime_type, "9:16",
-                identity_only=(OMNI_ACTOR_MODE == "scene"),
+                identity_only=(OMNI_ACTOR_MODE == "scene"), kling_audio=False,
             )
             job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
                 "owner_id": user_id,
