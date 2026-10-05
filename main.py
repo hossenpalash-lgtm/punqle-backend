@@ -5424,9 +5424,60 @@ def _omni_actor_prompt(mode: str = OMNI_ACTOR_MODE) -> str:
 # environmental scenes (e.g. "driving a car") the way Arcads' own
 # pre-made actor catalog apparently can; that's a separate, harder,
 # not-yet-proven capability, deliberately out of scope here.
-AI_ACTOR_MODEL = "bytedance/omni-human"
+AI_ACTOR_MODEL = "bytedance/omni-human-1.5"  # was bytedance/omni-human (1.0): quality fades after 15 s of audio; 1.5 takes up to 35 s and accepts a scene/motion prompt
 AI_ACTOR_VIDEO_CREDIT_COST = 30  # 8s x $0.14/s = $1.12 real cost, same credit-per-dollar ratio as Cinematic UGC above
 AI_ACTOR_VOICE_BY_GENDER = {"female": "nova", "male": "onyx"}
+
+# 2026-10-05: longer actor videos. Competitors cap talking-actor ads around
+# 30-60 s; ours was cut silently at 220 characters (~15 s). Speech runs ~15.7
+# characters per second on ElevenLabs (measured: 79 chars -> 5.04 s).
+ACTOR_SPEECH_CHARS_PER_SECOND = 15.0
+
+
+def _actor_est_seconds(text: str) -> float:
+    return max(3.0, len(text) / ACTOR_SPEECH_CHARS_PER_SECOND)
+
+
+# Ready Actors (the founder's real footage + Sync Labs lip-sync). Footage is
+# at most ~29.9 s (Fal's limit); a narration longer than the specific clip makes
+# it loop. Sync bills ~$0.083 per OUTPUT second, so the flat 30 credits only
+# covers 15 s: beyond that it is 2 credits per second (~60% at Pro).
+ACTOR_V2_MAX_NARRATION_CHARS = 420  # ~28 s
+
+
+def _actor_v2_cost(seconds: float) -> int:
+    return max(ACTOR_VIDEO_V2_CREDIT_COST, math.ceil(seconds * 2))
+
+
+# Custom actors on OmniHuman 1.5 (Replicate): the audio must be under 35 s per
+# call, so a narration up to 45 s is split at a sentence break into two calls
+# and the two clips are joined. ~$0.16 per output second (third-party figure,
+# unverified against a Replicate invoice) -> 3.5 credits per second (~57% at Pro);
+# the old flat 30 credits only held up to ~8 s.
+CUSTOM_ACTOR_MAX_NARRATION_CHARS = 675  # ~45 s
+CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS = 30
+OMNIHUMAN_CREDITS_PER_SECOND = 3.5
+OMNIHUMAN_ACTOR_PROMPT = (
+    "A person talking casually to the camera, natural small gestures and head movement, "
+    "warm eye contact, authentic UGC-style, relaxed and conversational."
+)
+
+
+def _omnihuman_actor_cost(seconds: float) -> int:
+    return max(AI_ACTOR_VIDEO_CREDIT_COST, math.ceil(seconds * OMNIHUMAN_CREDITS_PER_SECOND))
+
+
+def _split_narration_in_two(text: str) -> tuple:
+    """Splits at the sentence break nearest the middle (falls back to the nearest
+    space) so each half keeps whole sentences."""
+    mid = len(text) // 2
+    candidates = [m.end() for m in re.finditer(r"[.!?।]\s+", text)]
+    if candidates:
+        cut = min(candidates, key=lambda i: abs(i - mid))
+    else:
+        spaces = [m.start() for m in re.finditer(r"\s", text)]
+        cut = min(spaces, key=lambda i: abs(i - mid)) if spaces else mid
+    return text[:cut].strip(), text[cut:].strip()
 
 # Punqle Actors v2 -- a pre-baked Veo 3.1 base clip (see
 # scripts/populate_actor_video_clips.py, actor_video_clips table)
@@ -7427,6 +7478,11 @@ def start_ai_actor_video_generation(
         narration = (req.narration or "").strip()
         if not narration:
             raise HTTPException(status_code=400, detail="Nothing for the actor to say.")
+        if len(narration) > CUSTOM_ACTOR_MAX_NARRATION_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"That's too long for one actor video: keep it under {CUSTOM_ACTOR_MAX_NARRATION_CHARS} characters (about 45 seconds). You have {len(narration)}.",
+            )
 
         if req.custom_actor_id:
             custom_res = with_retry(lambda: supabase.table("custom_actors")
@@ -7478,34 +7534,24 @@ def start_ai_actor_video_generation(
             job_id = ensure_supabase_response(job_res, "create actor video job").data[0]["id"]
             return {"prediction_id": f"tv:{job_id}"}
 
-        cost = AI_ACTOR_VIDEO_CREDIT_COST
+        # Longer narration: OmniHuman 1.5 (photo + audio). It takes under 35 s of audio
+        # per call, so a narration over ~30 s is split at a sentence break into two
+        # calls whose clips are joined when both finish.
+        est_seconds = _actor_est_seconds(narration)
+        cost = _omnihuman_actor_cost(est_seconds)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
         voice = AI_ACTOR_VOICE_BY_GENDER.get(actor_gender, TTS_VOICE)
-        audio_bytes = _synthesize_voiceover(narration, voice)
-
-        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
-
-        r = with_retry(
-            lambda: requests.post(
-                f"https://api.replicate.com/v1/models/{AI_ACTOR_MODEL}/predictions",
-                headers=_replicate_headers(),
-                json={"input": {
-                    "image": f"data:{image_mime_type};base64,{image_b64}",
-                    "audio": f"data:audio/mp3;base64,{audio_b64}",
-                }},
-                timeout=20,
-            ),
-            exceptions=(requests.RequestException,),
-            attempts=2,
-        )
-        if not r.ok:
-            logger.error("Replicate create prediction failed: %s", r.text)
-            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the actor video."))
-        prediction_id = r.json().get("id")
-        if not prediction_id:
-            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+        parts = [narration] if est_seconds <= CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS else list(_split_narration_in_two(narration))
+        prediction_ids = []
+        for part in parts:
+            audio_bytes = _synthesize_voiceover(part, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
+            audio_seconds = _media_duration_seconds(audio_bytes, ".mp3")
+            if audio_seconds and audio_seconds >= 34.5:
+                raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
+            prediction_ids.append(_start_omnihuman_prediction(image_b64, image_mime_type, audio_bytes))
+        prediction_id = ",".join(prediction_ids)
 
         with_retry(lambda: supabase.table("ai_actor_video_jobs").insert({
             "prediction_id": prediction_id,
@@ -7518,6 +7564,31 @@ def start_ai_actor_video_generation(
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _start_omnihuman_prediction(image_b64: str, image_mime_type: str, audio_bytes: bytes) -> str:
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+    r = with_retry(
+        lambda: requests.post(
+            f"https://api.replicate.com/v1/models/{AI_ACTOR_MODEL}/predictions",
+            headers=_replicate_headers(),
+            json={"input": {
+                "image": f"data:{image_mime_type};base64,{image_b64}",
+                "audio": f"data:audio/mp3;base64,{audio_b64}",
+                "prompt": OMNIHUMAN_ACTOR_PROMPT,
+            }},
+            timeout=60,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not r.ok:
+        logger.error("Replicate create prediction failed: %s", r.text)
+        raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the actor video."))
+    prediction_id = r.json().get("id")
+    if not prediction_id:
+        raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+    return prediction_id
 
 
 @app.post("/ads/ai-actor-video-status", response_model=AiActorVideoStatusResponse, tags=["ads"])
@@ -7541,35 +7612,48 @@ def check_ai_actor_video_status(
         if not job_res.data:
             raise HTTPException(status_code=404, detail="AI actor video job not found.")
 
-        r = requests.get(
-            f"https://api.replicate.com/v1/predictions/{req.prediction_id}",
-            headers=_replicate_headers(),
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        status = data.get("status")
+        # One prediction normally; two (joined by a comma) for a narration split in two.
+        results = []
+        for pid in req.prediction_id.split(","):
+            r = requests.get(
+                f"https://api.replicate.com/v1/predictions/{pid}",
+                headers=_replicate_headers(),
+                timeout=20,
+            )
+            r.raise_for_status()
+            results.append((pid, r.json()))
 
-        if status not in ("succeeded", "failed", "canceled"):
+        if any(d.get("status") in ("failed", "canceled") for _, d in results):
+            with_retry(lambda: supabase.table("ai_actor_video_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+            for pid, d in results:
+                if d.get("status") in ("failed", "canceled"):
+                    logger.error("Replicate prediction %s finished as %s: %s", pid, d.get("status"), d.get("error"))
+            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        if any(d.get("status") != "succeeded" for _, d in results):
             return {"done": False, "video_base64": None, "credits_remaining": None}
 
         with_retry(lambda: supabase.table("ai_actor_video_jobs").delete().eq("prediction_id", req.prediction_id).execute())
 
-        if status != "succeeded":
-            logger.error("Replicate prediction %s finished as %s: %s", req.prediction_id, status, data.get("error"))
-            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+        clips = []
+        for pid, d in results:
+            video_url = d.get("output")
+            if not video_url:
+                return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+            video_resp = requests.get(video_url, timeout=60)
+            video_resp.raise_for_status()
+            clips.append(video_resp.content)
+            _log_real_cost_metric("ai_actor_video", "replicate", AI_ACTOR_MODEL, d.get("metrics"))
 
-        video_url = data.get("output")
-        if not video_url:
-            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
-        video_resp = requests.get(video_url, timeout=60)
-        video_resp.raise_for_status()
-        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
+        video_bytes = clips[0]
+        if len(clips) > 1:
+            width, height = _video_dims(clips[0], "9:16")
+            video_bytes = _concat_videos(clips[0], clips[1], "16:9" if width > height else "9:16")
 
-        _log_real_cost_metric("ai_actor_video", "replicate", AI_ACTOR_MODEL, data.get("metrics"))
-        new_credits = _spend_ad_credits(user_id, AI_ACTOR_VIDEO_CREDIT_COST, "ai_actor_video")
+        out_seconds = _media_duration_seconds(video_bytes)
+        actor_cost = _omnihuman_actor_cost(out_seconds) if out_seconds else AI_ACTOR_VIDEO_CREDIT_COST
+        new_credits = _spend_ad_credits(user_id, actor_cost, "ai_actor_video")
 
-        return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
+        return {"done": True, "video_base64": base64.b64encode(video_bytes).decode("ascii"), "credits_remaining": new_credits}
     except HTTPException:
         raise
     except requests.RequestException as e:
@@ -7669,12 +7753,21 @@ def start_actor_video_v2(
         if not clip:
             raise HTTPException(status_code=503, detail="This actor isn't ready yet -- try another one.")
 
-        cost = ACTOR_VIDEO_V2_CREDIT_COST
+        # [emotion] tags are direction for the voice, never spoken, so they don't count.
+        spoken = re.sub(r"\[[^\]]*\]", "", narration)
+        if len(spoken) > ACTOR_V2_MAX_NARRATION_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"That's too long for one actor video: keep it under {ACTOR_V2_MAX_NARRATION_CHARS} characters (about 28 seconds). You have {len(spoken)}.",
+            )
+        cost = _actor_v2_cost(_actor_est_seconds(spoken))
         credits = _get_ad_credits(user_id)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
-        audio_bytes = _synthesize_actor_voiceover(narration, actor["gender"], voice_engine, req.elevenlabs_settings)
+        audio_bytes = _synthesize_actor_voiceover(
+            narration, actor["gender"], voice_engine, req.elevenlabs_settings, max_chars=ACTOR_V2_MAX_NARRATION_CHARS + 200,
+        )
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
         r = with_retry(
@@ -7755,7 +7848,10 @@ def check_actor_video_v2_status(
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
         _log_real_cost_metric("actor_video_v2", "replicate", SYNC_MODEL, data.get("metrics"))
-        new_credits = _spend_ad_credits(user_id, ACTOR_VIDEO_V2_CREDIT_COST, "actor_video_v2")
+        # Billed by the real length of the finished video (Sync charges per output second).
+        out_seconds = _media_duration_seconds(video_resp.content)
+        actor_cost = _actor_v2_cost(out_seconds) if out_seconds else ACTOR_VIDEO_V2_CREDIT_COST
+        new_credits = _spend_ad_credits(user_id, actor_cost, "actor_video_v2")
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
     except HTTPException:
@@ -7954,7 +8050,7 @@ def _gender_for_voice_name(voice: str) -> str:
     return "male" if voice in _MALE_OPENAI_VOICE_NAMES else "female"
 
 
-def _synthesize_voiceover_openai(narration: str, voice: str = TTS_VOICE) -> bytes:
+def _synthesize_voiceover_openai(narration: str, voice: str = TTS_VOICE, max_chars: int = MAX_NARRATION_CHARS) -> bytes:
     """The original OpenAI TTS path. Still used for the Ready Actors
     "OpenAI Standard" engine and as the fallback if ElevenLabs is unavailable.
     tts-1/tts-1-hd retire 6 Jan 2027."""
@@ -7962,7 +8058,7 @@ def _synthesize_voiceover_openai(narration: str, voice: str = TTS_VOICE) -> byte
         lambda: client.audio.speech.create(
             model=TTS_MODEL,
             voice=voice if voice in _TTS_VOICES else TTS_VOICE,
-            input=narration[:MAX_NARRATION_CHARS],
+            input=narration[:max_chars],
             response_format="mp3",
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
@@ -8016,23 +8112,23 @@ def _elevenlabs_speech_with_words(text: str, gender: str) -> tuple:
     return audio, _words_from_elevenlabs_alignment(alignment)
 
 
-def _synthesize_voiceover_with_words(narration: str, voice: str = TTS_VOICE) -> tuple:
+def _synthesize_voiceover_with_words(narration: str, voice: str = TTS_VOICE, max_chars: int = MAX_NARRATION_CHARS) -> tuple:
     """Voiceover for Edit Video, Talking Video and custom-actor narration:
     ElevenLabs first (founder's pick after a listening test, 2026-10-05),
     returning (audio, word timings). Falls back to OpenAI TTS — then words is
     None and the caller transcribes — if the key is missing or ElevenLabs
     errors, so a voice outage never blocks a video."""
-    text = narration[:MAX_NARRATION_CHARS]
+    text = narration[:max_chars]
     if ELEVENLABS_API_KEY:
         try:
             return _elevenlabs_speech_with_words(text, _gender_for_voice_name(voice))
         except Exception:
             logger.error("ElevenLabs voiceover failed, falling back to OpenAI TTS", exc_info=True)
-    return _synthesize_voiceover_openai(text, voice), None
+    return _synthesize_voiceover_openai(text, voice, max_chars), None
 
 
-def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
-    return _synthesize_voiceover_with_words(narration, voice)[0]
+def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE, max_chars: int = MAX_NARRATION_CHARS) -> bytes:
+    return _synthesize_voiceover_with_words(narration, voice, max_chars)[0]
 
 
 def _synthesize_actor_voiceover(
@@ -8040,19 +8136,20 @@ def _synthesize_actor_voiceover(
     gender: str,
     voice_engine: str,
     elevenlabs_settings: Optional["ElevenLabsVoiceSettings"] = None,
+    max_chars: int = MAX_NARRATION_CHARS,
 ) -> bytes:
     """One narration track for Punqle Actors v2 (ElevenLabs; voice_engine is
     kept only so older clients that still send an OpenAI value keep working).
     Returns plain audio bytes for the Sync Labs redub step. elevenlabs_settings (a real, user-facing "Audio Settings" panel,
     added 2026-09-11) overrides ELEVENLABS_VOICE_SETTINGS per-field when
     provided -- None (the default) reproduces today's exact behavior."""
-    text = narration[:MAX_NARRATION_CHARS]
+    text = narration[:max_chars]
     voice = AI_ACTOR_VOICE_BY_GENDER.get(gender, TTS_VOICE)
 
     if not ELEVENLABS_API_KEY:
         # A missing key must not take Ready Actors down.
         logger.error("ELEVENLABS_API_KEY missing, using OpenAI TTS for this actor video")
-        return _synthesize_voiceover_openai(text, voice)
+        return _synthesize_voiceover_openai(text, voice, max_chars)
 
     voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
     overrides = elevenlabs_settings.model_dump(exclude_none=True) if elevenlabs_settings else {}
@@ -8075,7 +8172,7 @@ def _synthesize_actor_voiceover(
         return r.content
     # Last resort until OpenAI's TTS shuts down on 6 Jan 2027, so an ElevenLabs outage doesn't block the video.
     logger.error("ElevenLabs TTS failed (%s): %s — falling back to OpenAI TTS", r.status_code, r.text[:300])
-    return _synthesize_voiceover_openai(text, voice)
+    return _synthesize_voiceover_openai(text, voice, max_chars)
 
 
 def _get_actor_video_clip(actor_id: str, situation_id: Optional[str] = None) -> Optional[dict]:
