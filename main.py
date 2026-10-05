@@ -275,6 +275,16 @@ class GenerateVideoRequest(BaseModel):
     # chose, not a fresh (non-deterministic) regeneration of it.
     headline: Optional[str] = None
     narration: Optional[str] = None
+    # "omni" (Gemini Omni, the default) or "kling_3_pro" (Kling 3.0 Pro with its
+    # own sound, a longer-priced alternative the user can pick).
+    engine: str = "omni"
+
+    @field_validator("engine")
+    @classmethod
+    def validate_video_engine(cls, v):
+        if v not in ("omni", "kling_3_pro"):
+            raise ValueError("engine must be 'omni' or 'kling_3_pro'")
+        return v
 
     @field_validator("aspect_ratio")
     @classmethod
@@ -472,8 +482,9 @@ class AvatarVideoStatusResponse(BaseModel):
 class GenerateCinematicUgcRequest(BaseModel):
     item_description: str
     style_prompt: str
-    tier: str = "standard"
+    tier: str = "standard"  # only used when engine == "seedance"
     aspect_ratio: str = "9:16"
+    engine: str = "omni"  # "omni" (default) or "seedance"
 
 
 class CinematicUgcStartResponse(BaseModel):
@@ -4874,6 +4885,7 @@ async def generate_unboxing_shot(
 
 VIDEO_CREDIT_COST = 30  # Video Ad: one fixed 8 s Gemini Omni 1.1 Flash clip at 1080p, sound included. Real cost ~$1.22 ($0.152/s) -> ~62% margin at Pro, ~67% at Growth. History: 10 on Veo 3.1 Lite ($0.40), 48-64 on Kling for a few hours on 2026-10-05 before the Omni trial showed Omni looked better at ~half the cost.
 TRYON_ANIMATE_CREDIT_COST = 30  # Try-On Animate: same Omni 8 s clip (sound included), same cost.
+KLING_VIDEO_AD_CREDIT_COST = 64  # Video Ad on Kling 3.0 Pro: 8 s with native sound = $0.336/s x 8 = ~$2.69 real (Replicate, third-party figure, unverified against an invoice) -> ~61% margin at Pro. Pricier than Omni (30), so it is an opt-in choice and never the free trial.
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 # VideoOverlay-Bold has zero Bangla glyph coverage (confirmed live —
@@ -6267,10 +6279,14 @@ def start_video_generation(
     actually succeeds, same as every other AI action in this app."""
     try:
         credits = _get_ad_credits(user_id)
-        if not _has_unclaimed_trial(user_id, "video_ad") and credits < VIDEO_CREDIT_COST:
+        use_kling = req.engine == "kling_3_pro" and bool(REPLICATE_API_TOKEN)
+        video_cost = KLING_VIDEO_AD_CREDIT_COST if use_kling else VIDEO_CREDIT_COST
+        # The free first Video Ad is Omni only: a free Kling clip would cost ~$2.69.
+        has_trial = (not use_kling) and _has_unclaimed_trial(user_id, "video_ad")
+        if not has_trial and credits < video_cost:
             raise HTTPException(
                 status_code=402,
-                detail=f"Video needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
+                detail=f"Video needs {video_cost} credits — you have {credits}.",
             )
         item_description = (req.item_description or "").strip()
         if not item_description:
@@ -6297,6 +6313,12 @@ def start_video_generation(
             "Professional, well-lit, realistic. No on-screen text, captions, or logos. "
             "Natural ambient sound that fits the scene only — no speech, no music."
         )
+        if use_kling:
+            prediction_id = _kling_start_prediction(
+                prompt, 8, image_bytes, req.image_mime_type or "image/jpeg", req.aspect_ratio,
+                generate_audio=True,
+            )
+            return {"operation": _kling_operation(prediction_id), "headline": script["headline"], "narration": script["narration"]}
         omni_job_id = _omni_start(prompt, 8, image_bytes, req.image_mime_type or "image/jpeg", req.aspect_ratio)
         return {"operation": _omni_operation(omni_job_id), "headline": script["headline"], "narration": script["narration"]}
     except HTTPException:
@@ -6376,7 +6398,9 @@ def check_video_status(
             except Exception as e:
                 logger.error("Watermark overlay failed, returning video without it: %s", str(e), exc_info=True)
 
-        if _claim_feature_trial(user_id, "video_ad"):
+        if _is_kling_operation(req.operation):
+            new_credits = _spend_ad_credits(user_id, KLING_VIDEO_AD_CREDIT_COST, "video_generate", "kling_3_pro")
+        elif _claim_feature_trial(user_id, "video_ad"):
             new_credits = _get_ad_credits(user_id)
         else:
             new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "video_generate")
@@ -6663,7 +6687,8 @@ def start_cinematic_ugc_generation(
     competitors (Creatify, Arcads) use — confirmed live, not assumed."""
     try:
         tier = req.tier if req.tier in CINEMATIC_UGC_CREDIT_COST else "standard"
-        cost = CINEMATIC_UGC_OMNI_CREDIT_COST if GEMINI_API_KEY else CINEMATIC_UGC_CREDIT_COST[tier]
+        use_omni = req.engine != "seedance" and bool(GEMINI_API_KEY)
+        cost = CINEMATIC_UGC_OMNI_CREDIT_COST if use_omni else CINEMATIC_UGC_CREDIT_COST[tier]
         credits = _get_ad_credits(user_id)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
@@ -6672,7 +6697,7 @@ def start_cinematic_ugc_generation(
         if not prompt:
             raise HTTPException(status_code=400, detail="Nothing to generate a video from.")
 
-        if GEMINI_API_KEY:
+        if use_omni:
             omni_job_id = _omni_start(
                 f"Authentic UGC-style phone footage. {prompt}", CINEMATIC_UGC_DURATION_SEC, None, "image/jpeg", req.aspect_ratio,
                 sound_hint="Natural ambient sound that fits the scene only, no speech, no music.",
