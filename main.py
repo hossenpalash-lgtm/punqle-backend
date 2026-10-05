@@ -3756,12 +3756,90 @@ GPT_IMAGE_SIZE_BY_ASPECT_RATIO = {
 # no-photo/fully-AI-generated path — a real uploaded photo always routes
 # to the fixed, cheap gemini-2.5-flash-image edit model regardless of
 # `model` (see _get_banner_image), so that path stays 1 credit.
-IMAGE_GEN_CREDIT_COST = {"nano_banana_pro": 3, "nano_banana_2": 2, "gpt_image": 1}
+# ---------------------------------------------------------------------------
+# Model registry — every provider model id the image pipeline calls, in ONE
+# place, each overridable by an env var (2026-10-05, founder's call after
+# Google/OpenAI kept retiring models: gemini-2.5-flash-image went 2 Oct 2026,
+# all Veo 3.1 previews go 22 Oct, gpt-image-1 goes 1 Dec). A retirement is
+# now one Render env var change, not a code hunt. `_check_model_registry()`
+# (called at startup) lists the provider's live models — a free call — and
+# logs a loud warning when a configured id has vanished, so a shutdown shows
+# up in the logs before it shows up as users' 500s.
+#
+# Quality policy (same date, founder's call: "every single place the highest
+# quality, cost can go up, raise credits as needed"): wherever Punqle itself
+# picks a quality/resolution/model-size knob it picks the top one —
+#   * Gemini images render at 2K (GEMINI_IMAGE_SIZE). 2K, not 4K: Nano Banana
+#     Pro bills 2K at the same $0.134 as 1K, whereas 4K is $0.24 and a ~20 MB
+#     PNG that we base64 into the DB and the browser canvas (and Render has
+#     restarted for memory before).
+#   * photo edits (own-photo upload, Remove BG, Enhance, Unboxing, Show Your
+#     App, Product combine, Refine Actor) use Nano Banana Pro, not the retired
+#     2.5 Flash Image / a Lite model — consistency across edits matters more
+#     than the ~3x cost, and the credit price below absorbs it.
+#   * GPT Image uses gpt-image-2.5-sunburst at quality "max" (measured
+#     2026-10-05: ~$0.17-0.21/image; "high" is ~$0.04-0.05 and visibly close).
+# User-facing Standard/Premium tiers (Avatar, Cinematic UGC, Video Upscale)
+# stay the user's choice — only silent platform defaults were raised.
+def _model_id(env_var: str, default: str) -> str:
+    return (os.getenv(env_var, "") or "").strip() or default
+
+
+GEMINI_IMAGE_EDIT_MODEL = _model_id("GEMINI_IMAGE_EDIT_MODEL", "gemini-3-pro-image")
+GEMINI_IMAGE_SIZE = _model_id("GEMINI_IMAGE_SIZE", "2K")
+GPT_IMAGE_MODEL = _model_id("GPT_IMAGE_MODEL", "gpt-image-2.5-sunburst")
+GPT_IMAGE_QUALITY = _model_id("GPT_IMAGE_QUALITY", "max")
+# Every Gemini-image edit/composite is a Nano Banana Pro call (~$0.134), so
+# it is priced like the default generation, not the old 1-credit Flash tier.
+PHOTO_EDIT_CREDIT_COST = 3
+
+
+# Aspect ratios Gemini's image models accept (the ones we can map an upload onto).
+_GEMINI_RATIOS = {"1:1": 1.0, "2:3": 2 / 3, "3:2": 3 / 2, "3:4": 3 / 4, "4:3": 4 / 3, "4:5": 4 / 5, "5:4": 5 / 4,
+                  "9:16": 9 / 16, "16:9": 16 / 9, "21:9": 21 / 9}
+
+
+def _nearest_gemini_ratio(image_bytes: bytes) -> Optional[str]:
+    """The supported ratio closest to an uploaded photo's own shape. Edit
+    tools (Remove Background, Enhance, Refine Actor) MUST pass this: on a
+    live test (2026-10-05) Nano Banana Pro with no ratio re-composed a
+    square product photo into a 16:9 scene and invented stripes on a plain
+    white sneaker; with the ratio pinned it kept the product exactly and
+    came back sharper than the retired 2.5 Flash. None if unreadable."""
+    try:
+        w, h = Image.open(io.BytesIO(image_bytes)).size
+        r = w / h
+        return min(_GEMINI_RATIOS, key=lambda k: abs(_GEMINI_RATIOS[k] - r))
+    except Exception:
+        return None
+
+
+def _gemini_image_config(aspect_ratio: Optional[str] = None, raw_ratio: Optional[str] = None):
+    """GenerateContentConfig for any Gemini image call: the aspect ratio
+    (when the caller has one) plus the 2K output size. The pinned SDK's
+    ImageConfig only models aspect_ratio, so the size rides in through
+    http_options.extra_body, which the SDK deep-merges into the request's
+    generationConfig.imageConfig — works on every SDK version we might
+    deploy (the local venv is stuck on 1.47 by Python 3.9)."""
+    image_cfg = None
+    if raw_ratio is not None:
+        image_cfg = genai_types.ImageConfig(aspect_ratio=raw_ratio)
+    elif aspect_ratio is not None:
+        image_cfg = genai_types.ImageConfig(aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"))
+    return genai_types.GenerateContentConfig(
+        image_config=image_cfg,
+        http_options=genai_types.HttpOptions(
+            extra_body={"generationConfig": {"imageConfig": {"imageSize": GEMINI_IMAGE_SIZE}}},
+        ),
+    )
+
+
+IMAGE_GEN_CREDIT_COST = {"nano_banana_pro": 3, "nano_banana_2": 2, "gpt_image": 5}
 
 
 def _image_generate_credit_cost(has_photo: bool, model: str) -> int:
     if has_photo:
-        return 1
+        return PHOTO_EDIT_CREDIT_COST
     return IMAGE_GEN_CREDIT_COST.get(model, 3)
 
 
@@ -4020,16 +4098,12 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                 prompt,
             ],
-            config=genai_types.GenerateContentConfig(
-                image_config=genai_types.ImageConfig(
-                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
-                ),
-            ),
+            config=_gemini_image_config(aspect_ratio),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4074,17 +4148,13 @@ def _generate_banner_image_with_actor(
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=persona_bytes, mime_type="image/jpeg"),
                 genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                 prompt,
             ],
-            config=genai_types.GenerateContentConfig(
-                image_config=genai_types.ImageConfig(
-                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
-                ),
-            ),
+            config=_gemini_image_config(aspect_ratio),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4126,17 +4196,13 @@ def _combine_actor_and_product_image(
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=actor_bytes, mime_type=actor_mime_type),
                 genai_types.Part.from_bytes(data=product_bytes, mime_type=product_mime_type),
                 full_prompt,
             ],
-            config=genai_types.GenerateContentConfig(
-                image_config=genai_types.ImageConfig(
-                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
-                ),
-            ),
+            config=_gemini_image_config(aspect_ratio),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4181,17 +4247,13 @@ def _combine_actor_and_app_screenshot_image(
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=actor_bytes, mime_type=actor_mime_type),
                 genai_types.Part.from_bytes(data=screenshot_bytes, mime_type=screenshot_mime_type),
                 full_prompt,
             ],
-            config=genai_types.GenerateContentConfig(
-                image_config=genai_types.ImageConfig(
-                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
-                ),
-            ),
+            config=_gemini_image_config(aspect_ratio),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4278,10 +4340,13 @@ def _generate_ai_banner_image(
         # takes longer and was timing out at 30s) -- override per-call
         # rather than raising the shared client's timeout for everything.
         response = with_retry(
-            lambda: client.with_options(timeout=90.0).images.generate(
-                model="gpt-image-1",
+            lambda: client.with_options(timeout=240.0).images.generate(
+                model=GPT_IMAGE_MODEL,
                 prompt=prompt,
                 size=GPT_IMAGE_SIZE_BY_ASPECT_RATIO.get(aspect_ratio, "1024x1024"),
+                # Explicit on purpose: gpt-image-1 silently defaulted to HIGH when this
+                # was omitted (measured 2026-10-04, $0.166/image sold at 1 credit).
+                quality=GPT_IMAGE_QUALITY,
                 n=1,
             ),
             exceptions=RETRYABLE_OPENAI_ERRORS,
@@ -4295,11 +4360,7 @@ def _generate_ai_banner_image(
         lambda: gemini_client.models.generate_content(
             model=gemini_model,
             contents=[prompt],
-            config=genai_types.GenerateContentConfig(
-                image_config=genai_types.ImageConfig(
-                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
-                ),
-            ),
+            config=_gemini_image_config(aspect_ratio),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4355,11 +4416,12 @@ def _remove_background(image_bytes: bytes, mime_type: str) -> bytes:
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                 prompt,
             ],
+            config=_gemini_image_config(raw_ratio=_nearest_gemini_ratio(image_bytes)),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4387,11 +4449,12 @@ def _enhance_image(image_bytes: bytes, mime_type: str) -> bytes:
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                 prompt,
             ],
+            config=_gemini_image_config(raw_ratio=_nearest_gemini_ratio(image_bytes)),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4469,11 +4532,12 @@ def _refine_actor_photo(image_bytes: bytes, mime_type: str, instruction: str) ->
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
-            model="gemini-2.5-flash-image",
+            model=GEMINI_IMAGE_EDIT_MODEL,
             contents=[
                 genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                 prompt,
             ],
+            config=_gemini_image_config(raw_ratio=_nearest_gemini_ratio(image_bytes)),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -4673,10 +4737,10 @@ async def combine_actor_and_product(
             aspect_ratio = "square"
         has_trial = _has_unclaimed_trial(user_id, "product")
         credits = _get_ad_credits(user_id)
-        if not has_trial and credits <= 0:
+        if not has_trial and credits < PHOTO_EDIT_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {PHOTO_EDIT_CREDIT_COST} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         actor_bytes = await actor_file.read()
@@ -4690,7 +4754,7 @@ async def combine_actor_and_product(
         if has_trial and _claim_feature_trial(user_id, "product"):
             new_credits = _get_ad_credits(user_id)
         else:
-            new_credits = _spend_ad_credit(user_id, "image_generate")
+            new_credits = _spend_ad_credits(user_id, PHOTO_EDIT_CREDIT_COST, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4721,10 +4785,10 @@ async def generate_show_app_shot(
             aspect_ratio = "square"
         has_trial = _has_unclaimed_trial(user_id, "show_app")
         credits = _get_ad_credits(user_id)
-        if not has_trial and credits <= 0:
+        if not has_trial and credits < PHOTO_EDIT_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {PHOTO_EDIT_CREDIT_COST} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         actor_bytes = await actor_file.read()
@@ -4738,7 +4802,7 @@ async def generate_show_app_shot(
         if has_trial and _claim_feature_trial(user_id, "show_app"):
             new_credits = _get_ad_credits(user_id)
         else:
-            new_credits = _spend_ad_credit(user_id, "image_generate")
+            new_credits = _spend_ad_credits(user_id, PHOTO_EDIT_CREDIT_COST, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4779,10 +4843,10 @@ async def generate_unboxing_shot(
             aspect_ratio = "square"
         has_trial = _has_unclaimed_trial(user_id, "unboxing")
         credits = _get_ad_credits(user_id)
-        if not has_trial and credits <= 0:
+        if not has_trial and credits < PHOTO_EDIT_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {PHOTO_EDIT_CREDIT_COST} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         product_bytes = await product_file.read()
@@ -4793,7 +4857,7 @@ async def generate_unboxing_shot(
         if has_trial and _claim_feature_trial(user_id, "unboxing"):
             new_credits = _get_ad_credits(user_id)
         else:
-            new_credits = _spend_ad_credit(user_id, "image_generate")
+            new_credits = _spend_ad_credits(user_id, PHOTO_EDIT_CREDIT_COST, "image_generate")
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
@@ -4806,7 +4870,7 @@ async def generate_unboxing_shot(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-VIDEO_CREDIT_COST = 10  # ~10x an image credit, matching Veo 3.1 Lite's real ~$0.40/8s-720p vs an image's ~$0.04
+VIDEO_CREDIT_COST = 48  # Video Ad + Try-On Animate: one fixed 8 s Kling 3.0 Pro (1080p) clip = 8 s x 6 credits/s. Real cost ~$1.79 (Replicate $0.224/s) -> ~65% margin at Pro. Was 10 on Veo 3.1 Lite ($0.40/8 s).
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 # VideoOverlay-Bold has zero Bangla glyph coverage (confirmed live —
@@ -4848,8 +4912,43 @@ FASHN_API_BASE = "https://api.fashn.ai/v1"
 # constant.
 HEYGEN_API_KEY = os.getenv("HEYGEN_API_KEY", "").strip()
 HEYGEN_API_BASE = "https://api.heygen.com"
-AVATAR_STANDARD_CREDIT_COST = 4
-AVATAR_PREMIUM_CREDIT_COST = VIDEO_CREDIT_COST
+# Avatar videos are billed by HeyGen per OUTPUT SECOND (Standard/Avatar III
+# $1/min, Premium/Avatar V $4/min — 2026-10 re-audit; the earlier flat
+# 4/10-credit prices assumed ~8 s at a lower Avatar V rate). The credit price
+# now scales with the real rendered length so a 15 s Premium script can no
+# longer cost 3x the credits it was priced on. Per-second rates hold ~60%+
+# margin at Pro; the MIN charge is what the old flat price was, so short
+# clips cost exactly what they used to. AVATAR_PREMIUM_CREDIT_COST is a
+# literal now — it used to alias VIDEO_CREDIT_COST, which moves with Veo→Omni.
+AVATAR_STANDARD_CREDIT_COST = 4   # minimum charge
+AVATAR_PREMIUM_CREDIT_COST = 10   # minimum charge
+AVATAR_CREDITS_PER_SECOND = {"standard": 0.5, "premium": 1.6}
+AVATAR_CHARS_PER_SECOND = 13.0    # speech-rate estimate used ONLY for the pre-start balance check
+
+
+def _avatar_credit_cost(tier: str, seconds: float) -> int:
+    minimum = AVATAR_PREMIUM_CREDIT_COST if tier == "premium" else AVATAR_STANDARD_CREDIT_COST
+    return max(minimum, math.ceil(seconds * AVATAR_CREDITS_PER_SECOND["premium" if tier == "premium" else "standard"]))
+
+
+def _estimate_avatar_seconds(narration: str) -> float:
+    return max(3.0, len(narration) / AVATAR_CHARS_PER_SECOND)
+
+
+def _media_duration_seconds(data: bytes, suffix: str = ".mp4") -> Optional[float]:
+    """Duration of a media file's bytes via the bundled ffmpeg's own banner
+    (no ffprobe on Render). None if it can't be read — callers fall back."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix) as f:
+            f.write(data)
+            f.flush()
+            out = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-i", f.name], capture_output=True, text=True, timeout=30)
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", out.stderr or "")
+        if not m:
+            return None
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        return None
 _HEYGEN_ENGINE_BY_TIER = {"standard": "avatar_iii", "premium": "avatar_v"}
 
 # Cinematic UGC (Seedance 2.5, via Replicate) — a third, parallel video
@@ -4915,15 +5014,86 @@ KLING_MODEL = "kwaivgi/kling-v3-video"
 IMAGE_TO_VIDEO_MIN_DURATION = {"veo_3_1": 4, "kling_3_pro": 3, "seedance_2_5": 3}
 IMAGE_TO_VIDEO_MAX_DURATION = {"veo_3_1": 8, "kling_3_pro": 15, "seedance_2_5": 15}
 IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
-    "veo_3_1": 1.25,      # matches the existing VIDEO_CREDIT_COST=10 for Veo's fixed 8s
+    "veo_3_1": 1.25,      # LEGACY: Veo is retired 22 Oct 2026 and is no longer offered; the key stays only so a job already in flight at deploy time can still be polled and charged
     "seedance_2_5": 6,    # matches Cinematic UGC's real, billed 720p rate (~$0.231/s x 25 credits/$)
-    "kling_3_pro": 8,     # PROVISIONAL -- no real billed Replicate invoice checked yet for
+    "kling_3_pro": 6,     # 2026-10-05: 8 -> 6 credits/s (Kling is now the default engine; at 8/s an 8 s Video Ad would be 64 credits and a 15 s clip 120, more than a whole Growth month). 6/s still holds ~65% at Pro on Replicate's $0.224/s (3rd-party figure, still unverified against an invoice). Original note: PROVISIONAL -- no real billed Replicate invoice checked yet for
                            # Kling 3.0 Pro specifically (its own pricing page shows no $ figure).
                            # Set deliberately above Seedance's known real rate since "pro" mode
                            # targets 1080p. Correct this once a real generation's actual billed
                            # cost is checked, same as Cinematic UGC's own rate was corrected
                            # after its first real invoice.
 }
+
+
+# ---------------------------------------------------------------------------
+# Kling 3.0 Pro as THE default video engine (2026-10-05, founder's call:
+# Veo 3.1 previews shut down 22 Oct 2026, and "Kling is fine" — no A/B
+# against Gemini Omni needed). Video Ad and Try-On Animate used to be
+# Veo-only; they now start a Kling prediction on Replicate (the same
+# model/inputs Image→Video's Kling option already used) and hand the
+# client an opaque operation handle {"provider": "replicate",
+# "prediction_id": ...}. check_video_status / check_tryon_animation_status
+# branch on it, so the frontend's round-trip contract is unchanged; a
+# legacy Veo operation (a job in flight at deploy time) still polls the
+# old way until Veo itself goes away.
+#   * mode "pro" = 1080p (Kling's top mode), generate_audio False (same as
+#     every other Kling call here; voiceover/music are added afterwards).
+#   * start_image => aspect ratio comes from the image, so aspect_ratio is
+#     only sent for pure text-to-video.
+# ---------------------------------------------------------------------------
+def _kling_start_prediction(prompt: str, duration: int, image_bytes: Optional[bytes] = None,
+                            image_mime: str = "image/jpeg", aspect_ratio: str = "9:16") -> str:
+    """Starts a Kling 3.0 Pro prediction on Replicate and returns its id."""
+    body = {"prompt": prompt, "duration": duration, "mode": "pro", "generate_audio": False}
+    if image_bytes:
+        body["start_image"] = f"data:{image_mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    else:
+        body["aspect_ratio"] = aspect_ratio if aspect_ratio in ("16:9", "9:16", "1:1") else "9:16"
+    r = with_retry(
+        lambda: requests.post(
+            f"https://api.replicate.com/v1/models/{KLING_MODEL}/predictions",
+            headers=_replicate_headers(), json={"input": body}, timeout=30,
+        ),
+        exceptions=(requests.RequestException,), attempts=2,
+    )
+    if not r.ok:
+        logger.error("Replicate create prediction failed (kling): %s", r.text)
+        raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the video."))
+    prediction_id = r.json().get("id")
+    if not prediction_id:
+        raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
+    return prediction_id
+
+
+def _kling_operation(prediction_id: str) -> dict:
+    return {"provider": "replicate", "prediction_id": prediction_id}
+
+
+def _is_kling_operation(operation: Optional[dict]) -> bool:
+    return isinstance(operation, dict) and operation.get("provider") == "replicate" and bool(operation.get("prediction_id"))
+
+
+def _kling_poll(prediction_id: str, feature: str) -> tuple:
+    """Returns (done, video_bytes_or_None, failed). Raises 502 on a hard
+    failure so callers can surface a friendly message."""
+    r = requests.get(f"https://api.replicate.com/v1/predictions/{prediction_id}", headers=_replicate_headers(), timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    status = data.get("status")
+    if status not in ("succeeded", "failed", "canceled"):
+        return False, None, False
+    if status != "succeeded":
+        logger.error("Kling prediction %s (%s) finished as %s: %s", prediction_id, feature, status, data.get("error"))
+        return True, None, True
+    video_url = data.get("output")
+    if isinstance(video_url, list):
+        video_url = video_url[0] if video_url else None
+    if not video_url:
+        return True, None, True
+    video_resp = requests.get(video_url, timeout=90)
+    video_resp.raise_for_status()
+    _log_real_cost_metric(feature, "replicate", KLING_MODEL, data.get("metrics"))
+    return True, video_resp.content, False
 
 
 def _round_to_even_veo_duration(duration: int) -> int:
@@ -5069,7 +5239,7 @@ _HEYGEN_DEFAULT_VOICE_ID = {
 # `cost = VOICEOVER_CREDIT_COST if wants_voiceover else 0` already
 # degrades correctly to a no-op charge at 0, no other code change needed.
 VOICEOVER_CREDIT_COST = 0
-TTS_MODEL = "tts-1"
+TTS_MODEL = "tts-1-hd"  # HD (2026-10-05 quality pass); tts-1/tts-1-hd both retire 6 Jan 2027, see the OpenAI audio migration note
 TTS_VOICE = "alloy"
 # whisper-1 specifically (not gpt-4o-transcribe/mini) — the SDK's own
 # type signatures only allow response_format="verbose_json" +
@@ -5300,6 +5470,29 @@ Respond with ONLY this JSON format, nothing else:
 _VIDEO_DIMENSIONS = {"16:9": (1280, 720), "9:16": (720, 1280)}
 
 
+def _video_dims(video_bytes: bytes, aspect_ratio: str) -> tuple:
+    """The REAL (width, height) of a video's bytes, read from ffmpeg's own
+    banner; falls back to the 720p table when it can't be read. Needed since
+    2026-10-05: Veo clips were always 720p so every overlay (headline,
+    watermark, captions) was laid out on the fixed 720x1280 / 1280x720
+    table above, but Kling 3.0 Pro returns 1080x1920 — the same overlays on
+    the old table landed small and in the wrong spot (live-caught: headline
+    mid-left, watermark mid-right). Every overlay's font size, margin and
+    position is proportional to video_w/video_h, so feeding it the true size
+    is enough."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+            f.write(video_bytes)
+            f.flush()
+            out = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-i", f.name], capture_output=True, text=True, timeout=30)
+        m = re.search(r"Video:.*?,\s*(\d{3,5})x(\d{3,5})", out.stderr or "")
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+
+
 def _hex_to_rgb(hex_color: str) -> tuple:
     h = hex_color.lstrip("#")
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
@@ -5517,7 +5710,7 @@ def _burn_text_on_video(
         return video_bytes
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+    video_w, video_h = _video_dims(video_bytes, aspect_ratio)
     # Logo sized as 15% of frame width, inset 4% from whichever corner
     # — matches the proportions of the image flow's logo badge closely
     # enough without needing canvas-text.ts's white backing-plate logic
@@ -5722,7 +5915,7 @@ def _add_watermark_to_video(video_bytes: bytes, aspect_ratio: str = "16:9") -> b
     returns the original video rather than blocking the whole result --
     a missing watermark is a much smaller problem than a broken video."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+    video_w, video_h = _video_dims(video_bytes, aspect_ratio)
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "input.mp4")
         badge_path = os.path.join(tmp_dir, "badge.png")
@@ -5810,8 +6003,6 @@ def start_video_generation(
     /ads/video-status. Credits are only spent there, once generation
     actually succeeds, same as every other AI action in this app."""
     try:
-        if gemini_client is None:
-            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
         credits = _get_ad_credits(user_id)
         if not _has_unclaimed_trial(user_id, "video_ad") and credits < VIDEO_CREDIT_COST:
             raise HTTPException(
@@ -5822,12 +6013,7 @@ def start_video_generation(
         if not item_description:
             raise HTTPException(status_code=400, detail="Tell us what the video is about.")
 
-        image = None
-        if req.image_base64:
-            image = genai_types.Image(
-                image_bytes=base64.b64decode(req.image_base64),
-                mime_type=req.image_mime_type or "image/jpeg",
-            )
+        image_bytes = base64.b64decode(req.image_base64) if req.image_base64 else None
 
         # Both set → the caller (Video Ad's angle picker) already has an
         # exact script the user reviewed and chose; use it verbatim rather
@@ -5847,17 +6033,10 @@ def start_video_generation(
             f"A short, eye-catching social media ad video for a small business. {item_description}. "
             "Professional, well-lit, realistic. No on-screen text, captions, or logos."
         )
-        operation = gemini_client.models.generate_videos(
-            model=VEO_MODEL,
-            prompt=prompt,
-            image=image,
-            config=genai_types.GenerateVideosConfig(
-                aspect_ratio=req.aspect_ratio,
-                resolution="720p",
-                duration_seconds="8",
-            ),
+        prediction_id = _kling_start_prediction(
+            prompt, 8, image_bytes, req.image_mime_type or "image/jpeg", req.aspect_ratio,
         )
-        return {"operation": operation.model_dump(mode="json"), "headline": script["headline"], "narration": script["narration"]}
+        return {"operation": _kling_operation(prediction_id), "headline": script["headline"], "narration": script["narration"]}
     except HTTPException:
         raise
     except genai_errors.ClientError as e:
@@ -5882,21 +6061,29 @@ def check_video_status(
     client instead of being kept in server memory, so a mid-generation
     backend restart/redeploy on Render doesn't strand anyone's job."""
     try:
-        if gemini_client is None:
-            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
-        operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
-        operation = gemini_client.operations.get(operation)
-        if not operation.done:
-            return {"done": False, "video_base64": None, "credits_remaining": None}
+        if _is_kling_operation(req.operation):
+            done, video_bytes, failed = _kling_poll(req.operation["prediction_id"], "video_generate")
+            if not done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            if failed or not video_bytes:
+                raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
+        else:
+            # Legacy: a Veo job that was already running when Kling took over.
+            if gemini_client is None:
+                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+            operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
+            operation = gemini_client.operations.get(operation)
+            if not operation.done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
 
-        if operation.error:
-            raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
+            if operation.error:
+                raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
 
-        result = operation.result or operation.response
-        if not result or not result.generated_videos:
-            raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
-        generated = result.generated_videos[0]
-        video_bytes = gemini_client.files.download(file=generated.video)
+            result = operation.result or operation.response
+            if not result or not result.generated_videos:
+                raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
+            generated = result.generated_videos[0]
+            video_bytes = gemini_client.files.download(file=generated.video)
 
         headline = (req.headline or "").strip()
         profile = _get_business_profile(user_id)
@@ -6012,10 +6199,13 @@ def start_avatar_video_generation(
         if not narration:
             raise HTTPException(status_code=400, detail="Nothing for the avatar to say.")
 
-        cost = AVATAR_PREMIUM_CREDIT_COST if req.tier == "premium" else AVATAR_STANDARD_CREDIT_COST
+        # Real price is set from the rendered length when the video lands
+        # (check_avatar_video_status); this is just the up-front balance check,
+        # on a speech-rate estimate, so nobody starts a job they can't pay for.
+        cost = _avatar_credit_cost(req.tier, _estimate_avatar_seconds(narration))
         credits = _get_ad_credits(user_id)
         if credits < cost:
-            raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
+            raise HTTPException(status_code=402, detail=f"This needs about {cost} credits — you have {credits}.")
 
         voice_id = req.voice_id or _HEYGEN_DEFAULT_VOICE_ID["english"]["male" if req.gender == "male" else "female"]
 
@@ -6120,7 +6310,20 @@ def check_avatar_video_status(
         video_resp.raise_for_status()
         video_base64 = base64.b64encode(video_resp.content).decode("ascii")
 
-        cost = AVATAR_PREMIUM_CREDIT_COST if tier == "premium" else AVATAR_STANDARD_CREDIT_COST
+        # Bill the REAL rendered length: HeyGen's own `duration` if it sends
+        # one, else read it off the file we just downloaded, else assume 10 s.
+        seconds = None
+        try:
+            seconds = float(data.get("duration")) if data.get("duration") else None
+        except (TypeError, ValueError):
+            seconds = None
+        if not seconds:
+            seconds = _media_duration_seconds(video_resp.content) or 10.0
+        cost = _avatar_credit_cost(tier, seconds)
+        # The video already exists (and was paid for), so if the balance moved
+        # below the final price since the start check, charge what is left
+        # rather than throw the finished video away.
+        cost = min(cost, max(_get_ad_credits(user_id), 1))
         new_credits = _spend_ad_credits(user_id, cost, "avatar_video", tier)
 
         return {"done": True, "video_base64": video_base64, "credits_remaining": new_credits}
@@ -6435,13 +6638,13 @@ def start_image_to_video(
     back from the client -- same reasoning as cinematic_ugc_jobs's own
     tier tracking."""
     try:
-        model = req.model
+        # Veo is retired (22 Oct 2026): a stale client that still sends
+        # "veo_3_1" gets Kling 3.0 Pro, the default engine now.
+        model = "kling_3_pro" if req.model == "veo_3_1" else req.model
         duration = max(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
         )
-        if model == "veo_3_1":
-            duration = _round_to_even_veo_duration(duration)
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model])
         credits = _get_ad_credits(user_id)
         if credits < cost:
@@ -6452,38 +6655,6 @@ def start_image_to_video(
             raise HTTPException(status_code=400, detail="Describe the motion you want.")
         if not req.image_base64:
             raise HTTPException(status_code=400, detail="Missing the image to animate.")
-
-        if model == "veo_3_1":
-            if gemini_client is None:
-                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
-            image = genai_types.Image(
-                image_bytes=base64.b64decode(req.image_base64),
-                mime_type=req.image_mime_type,
-            )
-            # Real, live-caught error (2026-09-13): Veo only accepts
-            # "16:9"/"9:16" -- confirmed via a real 400 INVALID_ARGUMENT
-            # when "1:1" was sent (the home page's own generated images
-            # are square). Kling/Seedance don't have this restriction
-            # (Kling ignores aspect_ratio entirely once a start_image is
-            # given), so this clamp is Veo-specific, not applied above.
-            veo_aspect_ratio = req.aspect_ratio if req.aspect_ratio in ("16:9", "9:16") else "9:16"
-            operation = gemini_client.models.generate_videos(
-                model=VEO_MODEL,
-                prompt=prompt,
-                image=image,
-                config=genai_types.GenerateVideosConfig(
-                    aspect_ratio=veo_aspect_ratio,
-                    resolution="720p",
-                    duration_seconds=str(duration),
-                ),
-            )
-            job_res = with_retry(lambda: supabase.table("image_to_video_jobs").insert({
-                "owner_id": user_id,
-                "model": model,
-                "duration_seconds": duration,
-            }).execute())
-            job_id = ensure_supabase_response(job_res, "create image-to-video job").data[0]["id"]
-            return {"job_id": job_id, "operation": operation.model_dump(mode="json")}
 
         replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
         image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
@@ -6648,13 +6819,11 @@ def start_talking_video(
     redubbed video is in hand (motion-cost + TALKING_VIDEO_REDUB_SURCHARGE),
     never on partial success."""
     try:
-        model = req.model
+        model = "kling_3_pro" if req.model == "veo_3_1" else req.model  # Veo retired, see start_image_to_video
         duration = max(
             IMAGE_TO_VIDEO_MIN_DURATION[model],
             min(IMAGE_TO_VIDEO_MAX_DURATION[model], req.duration_seconds),
         )
-        if model == "veo_3_1":
-            duration = _round_to_even_veo_duration(duration)
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model]) + TALKING_VIDEO_REDUB_SURCHARGE
         credits = _get_ad_credits(user_id)
         if credits < cost:
@@ -6665,35 +6834,6 @@ def start_talking_video(
             raise HTTPException(status_code=400, detail="Write what they should say.")
         if not req.image_base64:
             raise HTTPException(status_code=400, detail="Missing the image to animate.")
-
-        if model == "veo_3_1":
-            if gemini_client is None:
-                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
-            image = genai_types.Image(
-                image_bytes=base64.b64decode(req.image_base64),
-                mime_type=req.image_mime_type,
-            )
-            veo_aspect_ratio = req.aspect_ratio if req.aspect_ratio in ("16:9", "9:16") else "9:16"
-            operation = gemini_client.models.generate_videos(
-                model=VEO_MODEL,
-                prompt="A person naturally talking to the camera, subtle head and hand movement, no on-screen text.",
-                image=image,
-                config=genai_types.GenerateVideosConfig(
-                    aspect_ratio=veo_aspect_ratio,
-                    resolution="720p",
-                    duration_seconds=str(duration),
-                ),
-            )
-            job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
-                "owner_id": user_id,
-                "model": model,
-                "duration_seconds": duration,
-                "narration": narration,
-                "voice_gender": req.voice_gender,
-                "stage": "animating",
-            }).execute())
-            job_id = ensure_supabase_response(job_res, "create talking video job").data[0]["id"]
-            return {"job_id": job_id, "operation": operation.model_dump(mode="json")}
 
         replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
         image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
@@ -7329,7 +7469,10 @@ def _concat_videos(first_bytes: bytes, second_bytes: bytes, aspect_ratio: str) -
     no transition effect or multi-track editing — a first version of
     this capability, not a timeline editor."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    width, height = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["9:16"])
+    # Render at the LARGER of the two inputs: a 1080p Kling clip next to a 720p
+    # HeyGen presenter must not be squashed down to 720p.
+    _d1, _d2 = _video_dims(first_bytes, aspect_ratio), _video_dims(second_bytes, aspect_ratio)
+    width, height = max(_d1, _d2, key=lambda d: d[0] * d[1])
     with tempfile.TemporaryDirectory() as tmp_dir:
         first_path = os.path.join(tmp_dir, "first.mp4")
         second_path = os.path.join(tmp_dir, "second.mp4")
@@ -7587,6 +7730,19 @@ def _download_operation_video(operation: dict) -> bytes:
     only by the Edit Video flow (_render_edited_video); check_video_
     status has its own inline version of this, deliberately left
     untouched so its already-verified default behavior can't regress."""
+    if _is_kling_operation(operation):
+        # Replicate keeps a prediction's output files for about an hour, so
+        # editing a Kling video long after it was made needs a fresh one.
+        r = requests.get(f"https://api.replicate.com/v1/predictions/{operation['prediction_id']}", headers=_replicate_headers(), timeout=20)
+        r.raise_for_status()
+        out = r.json().get("output")
+        out = out[0] if isinstance(out, list) and out else out
+        if not out:
+            raise Exception("This video isn't ready yet.")
+        fr = requests.get(out, timeout=90)
+        if not fr.ok:
+            raise Exception("This video has expired — generate a new one to edit it.")
+        return fr.content
     op = genai_types.GenerateVideosOperation.model_validate(operation)
     op = gemini_client.operations.get(op)
     if not op.done:
@@ -7612,7 +7768,7 @@ def _compose_audio_and_captions(
     with, so captions don't visually jump to a different look/spot
     once the hook window ends."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["16:9"])
+    video_w, video_h = _video_dims(video_bytes, aspect_ratio)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "input.mp4")
@@ -7898,7 +8054,7 @@ def _overlay_captions_on_video(
     if not caption_segments:
         return video_bytes
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    video_w, video_h = _VIDEO_DIMENSIONS.get(aspect_ratio, _VIDEO_DIMENSIONS["9:16"])
+    video_w, video_h = _video_dims(video_bytes, aspect_ratio)
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "input.mp4")
         output_path = os.path.join(tmp_dir, "output.mp4")
@@ -8120,27 +8276,15 @@ def start_tryon_animation(
     marginal cost is exactly one Veo 3.1 Lite 8s/720p call — FASHN was
     already charged when the still image was generated."""
     try:
-        if gemini_client is None:
-            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
         credits = _get_ad_credits(user_id)
         if credits < VIDEO_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
                 detail=f"Animating needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
             )
-        image = genai_types.Image(image_bytes=base64.b64decode(req.image_base64), mime_type="image/png")
         prompt = req.motion_prompt.strip() if req.motion_prompt and req.motion_prompt.strip() else _TRYON_ANIMATE_PROMPT
-        operation = gemini_client.models.generate_videos(
-            model=VEO_MODEL,
-            prompt=prompt,
-            image=image,
-            config=genai_types.GenerateVideosConfig(
-                aspect_ratio="9:16",
-                resolution="720p",
-                duration_seconds="8",
-            ),
-        )
-        return {"operation": operation.model_dump(mode="json")}
+        prediction_id = _kling_start_prediction(prompt, 8, base64.b64decode(req.image_base64), "image/png", "9:16")
+        return {"operation": _kling_operation(prediction_id)}
     except HTTPException:
         raise
     except genai_errors.ClientError as e:
@@ -8164,20 +8308,28 @@ def check_tryon_animation_status(
     person's photo (animated or not) has no business sitting in a shared
     history table."""
     try:
-        if gemini_client is None:
-            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
-        operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
-        operation = gemini_client.operations.get(operation)
-        if not operation.done:
-            return {"done": False, "video_base64": None, "credits_remaining": None}
+        if _is_kling_operation(req.operation):
+            done, video_bytes, failed = _kling_poll(req.operation["prediction_id"], "tryon_animate")
+            if not done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            if failed or not video_bytes:
+                raise HTTPException(status_code=502, detail="Animating this photo failed. Please try again.")
+        else:
+            # Legacy Veo job already running at deploy time.
+            if gemini_client is None:
+                raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+            operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
+            operation = gemini_client.operations.get(operation)
+            if not operation.done:
+                return {"done": False, "video_base64": None, "credits_remaining": None}
 
-        if operation.error:
-            raise HTTPException(status_code=502, detail="Animating this photo failed. Please try again.")
+            if operation.error:
+                raise HTTPException(status_code=502, detail="Animating this photo failed. Please try again.")
 
-        result = operation.result or operation.response
-        if not result or not result.generated_videos:
-            raise HTTPException(status_code=502, detail="Didn't get a video back. Please try again.")
-        video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
+            result = operation.result or operation.response
+            if not result or not result.generated_videos:
+                raise HTTPException(status_code=502, detail="Didn't get a video back. Please try again.")
+            video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
 
         new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "tryon_animate")
         return {
@@ -8202,22 +8354,22 @@ async def remove_background(
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Standalone quick-edit tool — same 1-credit-per-image-call pricing
-    as the main generation, since this hits the same paid Gemini image
-    model."""
+    """Standalone quick-edit tool — priced PHOTO_EDIT_CREDIT_COST (3), the
+    same as a default Nano Banana Pro generation, since it is now a Nano
+    Banana Pro call."""
     try:
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if credits < PHOTO_EDIT_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {PHOTO_EDIT_CREDIT_COST} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         image_bytes = await file.read()
         mime_type = file.content_type or "image/jpeg"
         result_bytes = await run_in_threadpool(_remove_background, image_bytes, mime_type)
 
-        new_credits = _spend_ad_credit(user_id, "remove_background")
+        new_credits = _spend_ad_credits(user_id, PHOTO_EDIT_CREDIT_COST, "remove_background")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
@@ -8237,22 +8389,22 @@ async def enhance_image(
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Standalone quick-edit tool — same 1-credit-per-image-call pricing
-    as the main generation, since this hits the same paid Gemini image
-    model."""
+    """Standalone quick-edit tool — priced PHOTO_EDIT_CREDIT_COST (3), the
+    same as a default Nano Banana Pro generation, since it is now a Nano
+    Banana Pro call."""
     try:
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if credits < PHOTO_EDIT_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {PHOTO_EDIT_CREDIT_COST} credits — you have {credits}. Upgrade to keep generating.",
             )
 
         image_bytes = await file.read()
         mime_type = file.content_type or "image/jpeg"
         result_bytes = await run_in_threadpool(_enhance_image, image_bytes, mime_type)
 
-        new_credits = _spend_ad_credit(user_id, "enhance_image")
+        new_credits = _spend_ad_credits(user_id, PHOTO_EDIT_CREDIT_COST, "enhance_image")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
@@ -8320,14 +8472,14 @@ async def refine_actor_photo(
         if not req.instruction.strip():
             raise HTTPException(status_code=400, detail="Describe what you want to change.")
         credits = _get_ad_credits(user_id)
-        if credits <= 0:
+        if credits < PHOTO_EDIT_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail="You're out of ad credits. Upgrade to keep generating.",
+                detail=f"This needs {PHOTO_EDIT_CREDIT_COST} credits — you have {credits}. Upgrade to keep generating.",
             )
         image_bytes = base64.b64decode(req.image_base64)
         result_bytes = await run_in_threadpool(_refine_actor_photo, image_bytes, req.mime_type, req.instruction)
-        new_credits = _spend_ad_credit(user_id, "refine_actor_photo")
+        new_credits = _spend_ad_credits(user_id, PHOTO_EDIT_CREDIT_COST, "refine_actor_photo")
 
         return {
             "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
@@ -11848,3 +12000,84 @@ async def stripe_webhook(request: Request):
         # Still 200 — Stripe retries on non-2xx, and a bug on our side
         # shouldn't cause the same event to hammer this endpoint forever.
         return {"received": True, "error": "internal"}
+
+
+# ---------------------------------------------------------------------------
+# Model registry health check (2026-10-05) — see the registry comment above
+# GEMINI_IMAGE_EDIT_MODEL. Provider model lists are free calls, so this runs
+# at every boot (and on demand via /health/models) and says out loud when a
+# model Punqle is configured to call has disappeared from the provider's
+# live list — i.e. it was retired — long before users hit the 404.
+# ---------------------------------------------------------------------------
+def _registry_models() -> list:
+    """(provider, model id, what it powers). Keep in step with the
+    constants above — adding a provider model to the code means adding a
+    row here."""
+    rows = [
+        ("gemini", GEMINI_IMAGE_EDIT_MODEL, "photo edits & composites"),
+        ("gemini", GEMINI_IMAGE_MODEL_BY_CHOICE["nano_banana_pro"], "image generation (Nano Banana Pro)"),
+        ("gemini", GEMINI_IMAGE_MODEL_BY_CHOICE["nano_banana_2"], "image generation (Nano Banana 2)"),
+        ("replicate", KLING_MODEL, "video (Video Ad, Try-On Animate, Image→Video, Talking Video) — default engine"),
+        ("replicate", SEEDANCE_MODEL, "Cinematic UGC + Seedance image→video"),
+        ("replicate", SYNC_MODEL, "lip-sync redub (Ready Actors, Talking Video)"),
+        ("replicate", AI_ACTOR_MODEL, "custom AI actor video (OmniHuman)"),
+        ("openai", GPT_IMAGE_MODEL, "GPT Image generation"),
+        ("openai", TTS_MODEL, "voiceover"),
+        ("openai", OPENAI_NATURAL_TTS_MODEL, "Ready Actors natural voice"),
+        ("openai", TRANSCRIBE_MODEL, "caption word timestamps"),
+        ("openai", "gpt-4o-mini", "copy, scripts and plans"),
+    ]
+    return rows
+
+
+def _check_model_registry() -> dict:
+    """Returns {"ok": bool, "missing": [label strings]}. Never raises — a
+    health check must not be able to take the app down."""
+    missing, checked = [], 0
+    live = {"gemini": None, "openai": None}
+    try:
+        if gemini_client is not None:
+            live["gemini"] = {(m.name or "").replace("models/", "") for m in gemini_client.models.list()}
+    except Exception:
+        logger.warning("Model registry check: couldn't list Gemini models", exc_info=True)
+    try:
+        if OPENAI_API_KEY:
+            live["openai"] = {m.id for m in client.models.list()}
+    except Exception:
+        logger.warning("Model registry check: couldn't list OpenAI models", exc_info=True)
+    for provider, model_id, purpose in _registry_models():
+        if provider == "replicate":
+            # Replicate has no cheap "list everything" call; GET the model itself (free).
+            try:
+                rr = requests.get(f"https://api.replicate.com/v1/models/{model_id}", headers=_replicate_headers(), timeout=15)
+            except Exception:
+                continue
+            if rr.status_code in (401, 403, 429, 500, 502, 503, 504):
+                continue  # auth/transient trouble is not a retirement
+            checked += 1
+            if rr.status_code == 404:
+                missing.append(f"{purpose} (replicate: {model_id})")
+            continue
+        models = live.get(provider)
+        if models is None:
+            continue  # couldn't list this provider — say nothing rather than cry wolf
+        checked += 1
+        if model_id not in models:
+            missing.append(f"{purpose} ({provider}: {model_id})")
+    if missing:
+        logger.error("MODEL RETIRED OR MISSING — these configured models are no longer offered: %s", "; ".join(missing))
+    else:
+        logger.info("Model registry check OK (%d models verified against the providers' live lists)", checked)
+    return {"ok": not missing, "missing": missing, "checked": checked}
+
+
+@app.get("/health/models", tags=["meta"])
+def health_models():
+    """Public, read-only, no secrets: whether every provider model we call
+    still exists. Point an uptime monitor at it. Lists purposes + model ids
+    only for the ones that are missing."""
+    return _check_model_registry()
+
+
+import threading as _threading
+_threading.Thread(target=_check_model_registry, daemon=True, name="model-registry-check").start()
