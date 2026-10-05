@@ -4870,7 +4870,8 @@ async def generate_unboxing_shot(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-VIDEO_CREDIT_COST = 48  # Video Ad + Try-On Animate: one fixed 8 s Kling 3.0 Pro (1080p) clip = 8 s x 6 credits/s. Real cost ~$1.79 (Replicate $0.224/s) -> ~65% margin at Pro. Was 10 on Veo 3.1 Lite ($0.40/8 s).
+VIDEO_CREDIT_COST = 64  # Video Ad: one fixed 8 s Kling 3.0 Pro (1080p) clip WITH native sound = 8 s x 8 credits/s. Real cost ~$2.69 (Replicate $0.336/s with audio) -> ~61% margin at Pro, ~67% at Growth. Was 10 on Veo 3.1 Lite ($0.40/8 s).
+TRYON_ANIMATE_CREDIT_COST = 48  # Try-On Animate: 8 s Kling 3.0 Pro (1080p), silent = 8 s x 6 credits/s. Real cost ~$1.79 -> ~65% at Pro.
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 # VideoOverlay-Bold has zero Bangla glyph coverage (confirmed live —
@@ -5042,9 +5043,14 @@ IMAGE_TO_VIDEO_CREDIT_PER_SECOND = {
 #     only sent for pure text-to-video.
 # ---------------------------------------------------------------------------
 def _kling_start_prediction(prompt: str, duration: int, image_bytes: Optional[bytes] = None,
-                            image_mime: str = "image/jpeg", aspect_ratio: str = "9:16") -> str:
-    """Starts a Kling 3.0 Pro prediction on Replicate and returns its id."""
-    body = {"prompt": prompt, "duration": duration, "mode": "pro", "generate_audio": False}
+                            image_mime: str = "image/jpeg", aspect_ratio: str = "9:16",
+                            generate_audio: bool = False) -> str:
+    """Starts a Kling 3.0 Pro prediction on Replicate and returns its id.
+    generate_audio adds Kling's native sound track (ambient/foley) at ~+50%
+    cost ($0.336/s vs $0.224/s) — on for Video Ad only (founder liked the
+    sample, 2026-10-05); Try-On Animate, Image->Video and Talking Video
+    stay silent (the latter two get their own voice)."""
+    body = {"prompt": prompt, "duration": duration, "mode": "pro", "generate_audio": generate_audio}
     if image_bytes:
         body["start_image"] = f"data:{image_mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
     else:
@@ -6031,10 +6037,12 @@ def start_video_generation(
 
         prompt = (
             f"A short, eye-catching social media ad video for a small business. {item_description}. "
-            "Professional, well-lit, realistic. No on-screen text, captions, or logos."
+            "Professional, well-lit, realistic. No on-screen text, captions, or logos. "
+            "Natural ambient sound that fits the scene only — no speech, no music."
         )
         prediction_id = _kling_start_prediction(
             prompt, 8, image_bytes, req.image_mime_type or "image/jpeg", req.aspect_ratio,
+            generate_audio=True,
         )
         return {"operation": _kling_operation(prediction_id), "headline": script["headline"], "narration": script["narration"]}
     except HTTPException:
@@ -7378,12 +7386,14 @@ def check_actor_video_v2_status(
 
 def _mix_music_under_video_audio(video_bytes: bytes, music_bytes: bytes, music_volume: float = 0.15) -> bytes:
     """Mixes a background music track UNDER a video's existing audio
-    (the avatar's dialogue) rather than replacing it — the opposite of
-    _compose_audio_and_captions below, which intentionally replaces the
-    whole track for voiceover (no mixing precedent existed before this).
-    Music is looped if shorter than the video and ducked to
-    music_volume so it never competes with the avatar's speech; output
-    duration matches the video's own (dialogue) track, not the music's."""
+    (the avatar's dialogue, or Kling's native ambience) rather than
+    replacing it — the opposite of _compose_audio_and_captions below,
+    which intentionally replaces the whole track for voiceover. Music is
+    looped if shorter than the video and ducked to music_volume so it never
+    competes with speech; output duration matches the video. If the video
+    has NO audio stream at all (a silent Kling clip, or a muted edit) the
+    music becomes the whole track, at a fuller volume since nothing sits
+    under it."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     with tempfile.TemporaryDirectory() as tmp_dir:
         input_path = os.path.join(tmp_dir, "input.mp4")
@@ -7394,17 +7404,32 @@ def _mix_music_under_video_audio(video_bytes: bytes, music_bytes: bytes, music_v
         with open(music_path, "wb") as f:
             f.write(music_bytes)
 
-        filter_complex = (
-            f"[1:a]volume={music_volume},aloop=loop=-1:size=2e9[music];"
-            "[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-        )
-        cmd = [
-            ffmpeg_exe, "-y", "-i", input_path, "-i", music_path,
-            "-filter_complex", filter_complex,
-            "-map", "0:v", "-map", "[aout]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-            output_path,
-        ]
+        probe = subprocess.run([ffmpeg_exe, "-i", input_path], capture_output=True, text=True, timeout=30)
+        has_audio = "Audio:" in (probe.stderr or "")
+        if has_audio:
+            filter_complex = (
+                f"[1:a]volume={music_volume},aloop=loop=-1:size=2e9[music];"
+                "[0:a][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+            )
+            cmd = [
+                ffmpeg_exe, "-y", "-i", input_path, "-i", music_path,
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                output_path,
+            ]
+        else:
+            # Explicit -t: with an endlessly looped music stream and a copied
+            # video stream, -shortest never fires and ffmpeg runs forever.
+            duration = _media_duration_seconds(video_bytes) or 8.0
+            filter_complex = "[1:a]volume=0.5,aloop=loop=-1:size=2e9[aout]"
+            cmd = [
+                ffmpeg_exe, "-y", "-i", input_path, "-i", music_path,
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[aout]", "-t", f"{duration:.2f}",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                output_path,
+            ]
         result_proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result_proc.returncode != 0:
             logger.error("ffmpeg music mix failed: %s", result_proc.stderr[-2000:])
@@ -7412,6 +7437,25 @@ def _mix_music_under_video_audio(video_bytes: bytes, music_bytes: bytes, music_v
 
         with open(output_path, "rb") as f:
             return f.read()
+
+
+def _fetch_music_track(mood: str) -> bytes:
+    """One real, licensed background track from HeyGen's music catalog
+    (free search) for one of the 4 curated moods — shared by the avatar
+    result's music chips and Video Ad's Edit panel."""
+    r = requests.get(
+        f"{HEYGEN_API_BASE}/v3/audio/sounds",
+        headers=_heygen_headers(),
+        params={"query": _AVATAR_MUSIC_MOODS[mood], "limit": 1},
+        timeout=20,
+    )
+    r.raise_for_status()
+    tracks = r.json().get("data", [])
+    if not tracks:
+        raise HTTPException(status_code=502, detail="Couldn't find a matching music track.")
+    music_resp = requests.get(tracks[0]["audio_url"], timeout=30)
+    music_resp.raise_for_status()
+    return music_resp.content
 
 
 @app.post("/ads/avatar-video-add-music", response_model=AddMusicToAvatarVideoResponse, tags=["ads"])
@@ -7430,23 +7474,7 @@ def add_music_to_avatar_video(
     post-generation edit in this app."""
     try:
         video_bytes = base64.b64decode(req.video_base64)
-        query = _AVATAR_MUSIC_MOODS[req.mood]
-        r = requests.get(
-            f"{HEYGEN_API_BASE}/v3/audio/sounds",
-            headers=_heygen_headers(),
-            params={"query": query, "limit": 1},
-            timeout=20,
-        )
-        r.raise_for_status()
-        tracks = r.json().get("data", [])
-        if not tracks:
-            raise HTTPException(status_code=502, detail="Couldn't find a matching music track.")
-        music_url = tracks[0]["audio_url"]
-
-        music_resp = requests.get(music_url, timeout=30)
-        music_resp.raise_for_status()
-
-        mixed = _mix_music_under_video_audio(video_bytes, music_resp.content)
+        mixed = _mix_music_under_video_audio(video_bytes, _fetch_music_track(req.mood))
         return {"video_base64": base64.b64encode(mixed).decode("ascii")}
     except HTTPException:
         raise
@@ -7830,6 +7858,7 @@ def _render_edited_video(
     voiceover_enabled: bool,
     captions_enabled: bool,
     muted: bool,
+    music_mood: Optional[str] = None,
 ) -> tuple:
     """Single entry point for the Edit Video panel — always starts from
     a fresh re-download (never the already-composited video the client
@@ -7856,12 +7885,16 @@ def _render_edited_video(
             words = _transcribe_word_timestamps(audio_bytes)
             caption_segments = _group_words_into_captions(words, hook_duration, MAX_CAPTION_SEGMENTS)
         video_bytes = _compose_audio_and_captions(video_bytes, audio_bytes, caption_segments, aspect_ratio, brand_color, text_position)
+        if music_mood:
+            video_bytes = _mix_music_under_video_audio(video_bytes, _fetch_music_track(music_mood))
         return video_bytes, True
 
     video_bytes = _burn_text_on_video(
         video_bytes, headline, aspect_ratio, logo_base64, logo_mime_type,
         brand_color=brand_color, text_position=text_position, logo_position=logo_position, muted=muted,
     )
+    if music_mood:
+        video_bytes = _mix_music_under_video_audio(video_bytes, _fetch_music_track(music_mood))
     return video_bytes, False
 
 
@@ -7881,6 +7914,17 @@ class EditVideoRequest(BaseModel):
     voice: str = TTS_VOICE
     captions_enabled: bool = True
     muted: bool = False
+    # Optional background music (one of _AVATAR_MUSIC_MOODS). Free; mixed
+    # under whatever audio the edited video ends up with (native Kling sound,
+    # the voiceover, or nothing at all when muted).
+    music_mood: Optional[str] = None
+
+    @field_validator("music_mood")
+    @classmethod
+    def validate_edit_music_mood(cls, v):
+        if v is not None and v not in _AVATAR_MUSIC_MOODS:
+            raise ValueError(f"music_mood must be one of {list(_AVATAR_MUSIC_MOODS)}")
+        return v
 
     @field_validator("aspect_ratio")
     @classmethod
@@ -7932,8 +7976,6 @@ def edit_video(
     credit cost) is completely unaffected by this endpoint's existence.
     Free unless voiceover audio actually gets (re)synthesized."""
     try:
-        if gemini_client is None:
-            raise HTTPException(status_code=503, detail="Video editing isn't available right now.")
         wants_voiceover = req.voiceover_enabled and req.narration.strip() and not req.muted
         cost = VOICEOVER_CREDIT_COST if wants_voiceover else 0
         if cost:
@@ -7951,6 +7993,7 @@ def edit_video(
             logo_base64, logo_mime_type, req.logo_position,
             brand_color, req.text_position,
             req.narration, req.voice, req.voiceover_enabled, req.captions_enabled, req.muted,
+            req.music_mood,
         )
 
         charged = cost if used_voiceover else 0
@@ -8277,10 +8320,10 @@ def start_tryon_animation(
     already charged when the still image was generated."""
     try:
         credits = _get_ad_credits(user_id)
-        if credits < VIDEO_CREDIT_COST:
+        if credits < TRYON_ANIMATE_CREDIT_COST:
             raise HTTPException(
                 status_code=402,
-                detail=f"Animating needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
+                detail=f"Animating needs {TRYON_ANIMATE_CREDIT_COST} credits — you have {credits}.",
             )
         prompt = req.motion_prompt.strip() if req.motion_prompt and req.motion_prompt.strip() else _TRYON_ANIMATE_PROMPT
         prediction_id = _kling_start_prediction(prompt, 8, base64.b64decode(req.image_base64), "image/png", "9:16")
@@ -8331,7 +8374,7 @@ def check_tryon_animation_status(
                 raise HTTPException(status_code=502, detail="Didn't get a video back. Please try again.")
             video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
 
-        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST, "tryon_animate")
+        new_credits = _spend_ad_credits(user_id, TRYON_ANIMATE_CREDIT_COST, "tryon_animate")
         return {
             "done": True,
             "video_base64": base64.b64encode(video_bytes).decode("ascii"),
