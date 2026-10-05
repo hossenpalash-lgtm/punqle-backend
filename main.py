@@ -618,6 +618,16 @@ class GenerateAiActorVideoRequest(BaseModel):
     custom_actor_id: Optional[str] = None
     narration: str
     language: str = "english"
+    # Only matters for a custom actor's narration over ~30 s: "720p" = one
+    # continuous take (default), "1080p" = full HD, joined once at a sentence break.
+    resolution: str = "720p"
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_actor_resolution(cls, v):
+        if v not in ("720p", "1080p"):
+            raise ValueError("resolution must be '720p' or '1080p'")
+        return v
 
 
 # A custom actor is just a saved photo + name + gender (for voice
@@ -5454,7 +5464,15 @@ def _actor_v2_cost(seconds: float) -> int:
 # and the two clips are joined. ~$0.16 per output second (third-party figure,
 # unverified against a Replicate invoice) -> 3.5 credits per second (~57% at Pro);
 # the old flat 30 credits only held up to ~8 s.
-CUSTOM_ACTOR_MAX_NARRATION_CHARS = 675  # ~45 s
+CUSTOM_ACTOR_MAX_NARRATION_CHARS = 900  # ~60 s
+# Over ~30 s a custom actor can be made as ONE take on fal.ai's OmniHuman 1.5 at
+# 720p (audio < 60 s there; at 1080p the limit is 30 s), or as two 1080p calls
+# joined at a sentence break on Replicate. FAL_KEY enables the first; without it
+# (or when the user picks 1080p) the second is used.
+FAL_KEY = os.getenv("FAL_KEY", "").strip()
+FAL_OMNIHUMAN_SUBMIT_URL = "https://queue.fal.run/fal-ai/bytedance/omnihuman/v1.5"
+FAL_QUEUE_BASE = "https://queue.fal.run/fal-ai/bytedance"  # the status/result URLs fal returns live under this base
+FAL_MAX_AUDIO_SECONDS_720P = 59
 CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS = 30
 OMNIHUMAN_CREDITS_PER_SECOND = 3.5
 OMNIHUMAN_ACTOR_PROMPT = (
@@ -7534,24 +7552,34 @@ def start_ai_actor_video_generation(
             job_id = ensure_supabase_response(job_res, "create actor video job").data[0]["id"]
             return {"prediction_id": f"tv:{job_id}"}
 
-        # Longer narration: OmniHuman 1.5 (photo + audio). It takes under 35 s of audio
-        # per call, so a narration over ~30 s is split at a sentence break into two
-        # calls whose clips are joined when both finish.
+        # Longer narration: OmniHuman 1.5 (photo + audio).
+        #  - up to ~30 s: one Replicate call (output is already full HD or better);
+        #  - over ~30 s, 720p (default): ONE take on fal.ai, audio under 60 s;
+        #  - over ~30 s, 1080p (or no fal key): two Replicate calls split at a
+        #    sentence break (each under 35 s), joined when both finish.
         est_seconds = _actor_est_seconds(narration)
         cost = _omnihuman_actor_cost(est_seconds)
         if credits < cost:
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
         voice = AI_ACTOR_VOICE_BY_GENDER.get(actor_gender, TTS_VOICE)
-        parts = [narration] if est_seconds <= CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS else list(_split_narration_in_two(narration))
-        prediction_ids = []
-        for part in parts:
-            audio_bytes = _synthesize_voiceover(part, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
+        use_fal = est_seconds > CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS and req.resolution != "1080p" and bool(FAL_KEY)
+        if use_fal:
+            audio_bytes = _synthesize_voiceover(narration, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
             audio_seconds = _media_duration_seconds(audio_bytes, ".mp3")
-            if audio_seconds and audio_seconds >= 34.5:
+            if audio_seconds and audio_seconds >= FAL_MAX_AUDIO_SECONDS_720P:
                 raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
-            prediction_ids.append(_start_omnihuman_prediction(image_b64, image_mime_type, audio_bytes))
-        prediction_id = ",".join(prediction_ids)
+            prediction_id = _start_fal_omnihuman(image_b64, image_mime_type, audio_bytes, "720p")
+        else:
+            parts = [narration] if est_seconds <= CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS else list(_split_narration_in_two(narration))
+            prediction_ids = []
+            for part in parts:
+                audio_bytes = _synthesize_voiceover(part, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
+                audio_seconds = _media_duration_seconds(audio_bytes, ".mp3")
+                if audio_seconds and audio_seconds >= 34.5:
+                    raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
+                prediction_ids.append(_start_omnihuman_prediction(image_b64, image_mime_type, audio_bytes))
+            prediction_id = ",".join(prediction_ids)
 
         with_retry(lambda: supabase.table("ai_actor_video_jobs").insert({
             "prediction_id": prediction_id,
@@ -7564,6 +7592,45 @@ def start_ai_actor_video_generation(
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _fal_headers() -> dict:
+    return {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+
+
+def _fal_upload(data: bytes, content_type: str, file_name: str) -> str:
+    """Uploads a file to fal's storage and returns its URL (fal rejects audio sent
+    as a base64 data URI, so files go up this way, same as fal's own client)."""
+    r = requests.post(
+        "https://rest.alpha.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3",
+        headers=_fal_headers(), json={"content_type": content_type, "file_name": file_name}, timeout=60,
+    )
+    r.raise_for_status()
+    info = r.json()
+    up = requests.put(info["upload_url"], data=data, headers={"Content-Type": content_type}, timeout=180)
+    up.raise_for_status()
+    return info["file_url"]
+
+
+def _start_fal_omnihuman(image_b64: str, image_mime_type: str, audio_bytes: bytes, resolution: str) -> str:
+    """Starts OmniHuman 1.5 on fal.ai and returns an opaque "fal:<request id>"."""
+    try:
+        image_url = _fal_upload(base64.b64decode(image_b64), image_mime_type, "actor.png")
+        audio_url = _fal_upload(audio_bytes, "audio/mpeg", "narration.mp3")
+        r = requests.post(
+            FAL_OMNIHUMAN_SUBMIT_URL, headers=_fal_headers(), timeout=120,
+            json={"image_url": image_url, "audio_url": audio_url, "resolution": resolution, "prompt": OMNIHUMAN_ACTOR_PROMPT},
+        )
+    except requests.RequestException as e:
+        logger.error("fal.ai request failed: %s", type(e).__name__)
+        raise HTTPException(status_code=502, detail="Couldn't start the actor video.")
+    if not r.ok:
+        logger.error("fal.ai submit failed (%s): %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail="Couldn't start the actor video.")
+    request_id = r.json().get("request_id")
+    if not request_id:
+        raise HTTPException(status_code=502, detail="The video service didn't return a job id.")
+    return f"fal:{request_id}"
 
 
 def _start_omnihuman_prediction(image_b64: str, image_mime_type: str, audio_bytes: bytes) -> str:
@@ -7611,6 +7678,25 @@ def check_ai_actor_video_status(
         job_res = ensure_supabase_response(job_res, "get ai actor video job")
         if not job_res.data:
             raise HTTPException(status_code=404, detail="AI actor video job not found.")
+
+        if req.prediction_id.startswith("fal:"):
+            rid = req.prediction_id[4:]
+            st = requests.get(f"{FAL_QUEUE_BASE}/requests/{rid}/status", headers=_fal_headers(), timeout=20)
+            st.raise_for_status()
+            if st.json().get("status") != "COMPLETED":
+                return {"done": False, "video_base64": None, "credits_remaining": None}
+            with_retry(lambda: supabase.table("ai_actor_video_jobs").delete().eq("prediction_id", req.prediction_id).execute())
+            res = requests.get(f"{FAL_QUEUE_BASE}/requests/{rid}", headers=_fal_headers(), timeout=60)
+            video_url = (res.json().get("video") or {}).get("url") if res.ok else None
+            if not video_url:
+                logger.error("fal.ai job %s finished without a video (HTTP %s): %s", rid, res.status_code, res.text[:200])
+                return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
+            video_resp = requests.get(video_url, timeout=120)
+            video_resp.raise_for_status()
+            out_seconds = _media_duration_seconds(video_resp.content)
+            actor_cost = _omnihuman_actor_cost(out_seconds) if out_seconds else AI_ACTOR_VIDEO_CREDIT_COST
+            new_credits = _spend_ad_credits(user_id, actor_cost, "ai_actor_video", "fal_720p")
+            return {"done": True, "video_base64": base64.b64encode(video_resp.content).decode("ascii"), "credits_remaining": new_credits}
 
         # One prediction normally; two (joined by a comma) for a narration split in two.
         results = []
