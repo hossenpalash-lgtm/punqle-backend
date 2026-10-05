@@ -5344,7 +5344,11 @@ def _round_to_even_veo_duration(duration: int) -> int:
 # generation itself, so a flat number is simpler than a second per-
 # second rate; correct once a real invoice is checked, same as the
 # other PROVISIONAL rates above.
-TALKING_VIDEO_REDUB_SURCHARGE = 10
+# 2026-10-05: 10 -> 18. Sync Labs bills ~$0.083 per OUTPUT second and the
+# output is as long as the narration (not the Omni clip), so a typical 8-10 s
+# narration costs ~$0.75 on top of the Omni clip: at 10 credits Talking Video
+# held only ~54% at Pro, at 18 it holds ~62% (a 15 s narration ~52%).
+TALKING_VIDEO_REDUB_SURCHARGE = 18
 
 # AI Actor talking video (OmniHuman, via Replicate) — a fourth video
 # path: like Avatar (HeyGen), a presenter reads your script, but using
