@@ -669,7 +669,7 @@ class ElevenLabsVoiceSettings(BaseModel):
 class GenerateActorVideoV2Request(BaseModel):
     actor_id: str
     narration: str
-    voice_engine: str = "openai_standard"
+    voice_engine: str = "elevenlabs"
     situation_id: Optional[str] = None  # omitted by the frontend today; picked at random among the actor's clips when unset
     elevenlabs_settings: Optional[ElevenLabsVoiceSettings] = None
 
@@ -7279,7 +7279,7 @@ def start_actor_video_v2(
         if not actor:
             raise HTTPException(status_code=400, detail="Unknown actor.")
 
-        voice_engine = req.voice_engine if req.voice_engine in ACTOR_VOICE_ENGINES else "openai_standard"
+        voice_engine = req.voice_engine if req.voice_engine in ACTOR_VOICE_ENGINES else "elevenlabs"
 
         clip = _get_actor_video_clip(req.actor_id, req.situation_id)
         if not clip:
@@ -7560,9 +7560,20 @@ def concat_videos(
 
 
 _TTS_VOICES = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+# The voiceover picker historically stored OpenAI voice names. Voiceovers are
+# ElevenLabs-first now (2026-10-05), which has two curated voices (female /
+# male, ELEVENLABS_VOICE_BY_GENDER) — the old names just select a gender.
+_MALE_OPENAI_VOICE_NAMES = {"onyx", "echo", "fable"}
 
 
-def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
+def _gender_for_voice_name(voice: str) -> str:
+    return "male" if voice in _MALE_OPENAI_VOICE_NAMES else "female"
+
+
+def _synthesize_voiceover_openai(narration: str, voice: str = TTS_VOICE) -> bytes:
+    """The original OpenAI TTS path. Still used for the Ready Actors
+    "OpenAI Standard" engine and as the fallback if ElevenLabs is unavailable.
+    tts-1/tts-1-hd retire 6 Jan 2027."""
     response = with_retry(
         lambda: client.audio.speech.create(
             model=TTS_MODEL,
@@ -7573,6 +7584,71 @@ def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
     return response.content
+
+
+def _words_from_elevenlabs_alignment(alignment: dict) -> list:
+    """Groups ElevenLabs' per-character timings into the same
+    [{"word","start","end"}] shape _transcribe_word_timestamps returns, so
+    caption code is engine-agnostic. Words are runs of non-space characters."""
+    chars = alignment.get("characters") or []
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    words, cur, w_start, w_end = [], "", None, None
+    for c, a, b in zip(chars, starts, ends):
+        if c.isspace():
+            if cur:
+                words.append({"word": cur, "start": w_start, "end": w_end})
+                cur, w_start = "", None
+        else:
+            if w_start is None:
+                w_start = a
+            cur += c
+            w_end = b
+    if cur:
+        words.append({"word": cur, "start": w_start, "end": w_end})
+    return words
+
+
+def _elevenlabs_speech_with_words(text: str, gender: str) -> tuple:
+    """(mp3 bytes, word timings) from ElevenLabs' /with-timestamps endpoint.
+    Because we generate the voice ourselves, the timing comes with the audio —
+    no speech-to-text pass, and no whisper-1 (retires 26 Feb 2027) needed."""
+    voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
+    r = with_retry(
+        lambda: requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps",
+            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            json={"text": text, "model_id": ELEVENLABS_MODEL, "voice_settings": {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0}},
+            timeout=60,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not r.ok:
+        raise Exception(f"ElevenLabs TTS failed ({r.status_code}): {r.text[:200]}")
+    data = r.json()
+    audio = base64.b64decode(data["audio_base64"])
+    alignment = data.get("alignment") or data.get("normalized_alignment") or {}
+    return audio, _words_from_elevenlabs_alignment(alignment)
+
+
+def _synthesize_voiceover_with_words(narration: str, voice: str = TTS_VOICE) -> tuple:
+    """Voiceover for Edit Video, Talking Video and custom-actor narration:
+    ElevenLabs first (founder's pick after a listening test, 2026-10-05),
+    returning (audio, word timings). Falls back to OpenAI TTS — then words is
+    None and the caller transcribes — if the key is missing or ElevenLabs
+    errors, so a voice outage never blocks a video."""
+    text = narration[:MAX_NARRATION_CHARS]
+    if ELEVENLABS_API_KEY:
+        try:
+            return _elevenlabs_speech_with_words(text, _gender_for_voice_name(voice))
+        except Exception:
+            logger.error("ElevenLabs voiceover failed, falling back to OpenAI TTS", exc_info=True)
+    return _synthesize_voiceover_openai(text, voice), None
+
+
+def _synthesize_voiceover(narration: str, voice: str = TTS_VOICE) -> bytes:
+    return _synthesize_voiceover_with_words(narration, voice)[0]
 
 
 def _synthesize_actor_voiceover(
@@ -7595,9 +7671,12 @@ def _synthesize_actor_voiceover(
     provided -- None (the default) reproduces today's exact behavior."""
     text = narration[:MAX_NARRATION_CHARS]
 
+    if voice_engine == "elevenlabs" and not ELEVENLABS_API_KEY:
+        # ElevenLabs is the default engine now; a missing key must not take Ready Actors down.
+        logger.error("ELEVENLABS_API_KEY missing, using OpenAI Natural for this actor video")
+        voice_engine = "openai_natural"
+
     if voice_engine == "elevenlabs":
-        if not ELEVENLABS_API_KEY:
-            raise HTTPException(status_code=503, detail="That voice isn't available right now -- try a different one.")
         voice_id = ELEVENLABS_VOICE_BY_GENDER.get(gender, ELEVENLABS_VOICE_BY_GENDER["female"])
         overrides = elevenlabs_settings.model_dump(exclude_none=True) if elevenlabs_settings else {}
         voice_settings = {**ELEVENLABS_VOICE_SETTINGS, "speed": 1.0, **overrides}
@@ -7615,10 +7694,10 @@ def _synthesize_actor_voiceover(
             exceptions=(requests.RequestException,),
             attempts=2,
         )
-        if not r.ok:
-            logger.error("ElevenLabs TTS failed: %s", r.text)
-            raise HTTPException(status_code=502, detail="Couldn't generate that voice. Try a different one.")
-        return r.content
+        if r.ok:
+            return r.content
+        logger.error("ElevenLabs TTS failed (%s): %s — falling back to OpenAI Natural", r.status_code, r.text[:300])
+        voice_engine = "openai_natural"
 
     voice = AI_ACTOR_VOICE_BY_GENDER.get(gender, TTS_VOICE)
 
@@ -7638,7 +7717,7 @@ def _synthesize_actor_voiceover(
 
     # "openai_standard" (or any unrecognized value) -- the existing,
     # already-proven plain path, unchanged from the OmniHuman-era feature.
-    return _synthesize_voiceover(text, voice)
+    return _synthesize_voiceover_openai(text, voice)
 
 
 def _get_actor_video_clip(actor_id: str, situation_id: Optional[str] = None) -> Optional[dict]:
@@ -7879,10 +7958,11 @@ def _render_edited_video(
             hook_duration_seconds=HOOK_DURATION_SECONDS if headline else None,
             brand_color=brand_color, text_position=text_position, logo_position=logo_position,
         )
-        audio_bytes = _synthesize_voiceover(narration, voice)
+        audio_bytes, words = _synthesize_voiceover_with_words(narration, voice)
         caption_segments = []
         if captions_enabled:
-            words = _transcribe_word_timestamps(audio_bytes)
+            if words is None:  # OpenAI fallback path: no timings came with the audio
+                words = _transcribe_word_timestamps(audio_bytes)
             caption_segments = _group_words_into_captions(words, hook_duration, MAX_CAPTION_SEGMENTS)
         video_bytes = _compose_audio_and_captions(video_bytes, audio_bytes, caption_segments, aspect_ratio, brand_color, text_position)
         if music_mood:
