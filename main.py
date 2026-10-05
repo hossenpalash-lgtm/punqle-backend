@@ -5473,7 +5473,7 @@ FAL_KEY = os.getenv("FAL_KEY", "").strip()
 FAL_OMNIHUMAN_SUBMIT_URL = "https://queue.fal.run/fal-ai/bytedance/omnihuman/v1.5"
 FAL_QUEUE_BASE = "https://queue.fal.run/fal-ai/bytedance"  # the status/result URLs fal returns live under this base
 FAL_MAX_AUDIO_SECONDS_720P = 59
-CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS = 30
+REPLICATE_OMNIHUMAN_MAX_AUDIO_SECONDS = 34.5  # Replicate's OmniHuman 1.5 errors at 35 s of audio
 OMNIHUMAN_CREDITS_PER_SECOND = 3.5
 OMNIHUMAN_ACTOR_PROMPT = (
     "A person talking casually to the camera, natural small gestures and head movement, "
@@ -7563,22 +7563,26 @@ def start_ai_actor_video_generation(
             raise HTTPException(status_code=402, detail=f"This needs {cost} credits — you have {credits}.")
 
         voice = AI_ACTOR_VOICE_BY_GENDER.get(actor_gender, TTS_VOICE)
-        use_fal = est_seconds > CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS and req.resolution != "1080p" and bool(FAL_KEY)
-        if use_fal:
-            audio_bytes = _synthesize_voiceover(narration, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
-            audio_seconds = _media_duration_seconds(audio_bytes, ".mp3")
-            if audio_seconds and audio_seconds >= FAL_MAX_AUDIO_SECONDS_720P:
-                raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
-            prediction_id = _start_fal_omnihuman(image_b64, image_mime_type, audio_bytes, "720p")
+        # The route is chosen from the REAL length of the voice, not the estimate:
+        # under ~35 s one Replicate call (full HD or better); longer, one 720p take
+        # on fal.ai, or (user picked 1080p, or no fal key) two Replicate calls
+        # split at a sentence break and joined.
+        full_audio = _synthesize_voiceover(narration, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
+        audio_seconds = _media_duration_seconds(full_audio, ".mp3") or est_seconds
+        if audio_seconds >= FAL_MAX_AUDIO_SECONDS_720P:
+            raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
+        if audio_seconds < REPLICATE_OMNIHUMAN_MAX_AUDIO_SECONDS:
+            prediction_id = _start_omnihuman_prediction(image_b64, image_mime_type, full_audio)
+        elif FAL_KEY and req.resolution != "1080p":
+            prediction_id = _start_fal_omnihuman(image_b64, image_mime_type, full_audio, "720p")
         else:
-            parts = [narration] if est_seconds <= CUSTOM_ACTOR_SINGLE_CALL_MAX_SECONDS else list(_split_narration_in_two(narration))
             prediction_ids = []
-            for part in parts:
-                audio_bytes = _synthesize_voiceover(part, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
-                audio_seconds = _media_duration_seconds(audio_bytes, ".mp3")
-                if audio_seconds and audio_seconds >= 34.5:
+            for part in _split_narration_in_two(narration):
+                part_audio = _synthesize_voiceover(part, voice, CUSTOM_ACTOR_MAX_NARRATION_CHARS)
+                part_seconds = _media_duration_seconds(part_audio, ".mp3")
+                if part_seconds and part_seconds >= REPLICATE_OMNIHUMAN_MAX_AUDIO_SECONDS:
                     raise HTTPException(status_code=400, detail="That narration is too long. Please shorten it a little.")
-                prediction_ids.append(_start_omnihuman_prediction(image_b64, image_mime_type, audio_bytes))
+                prediction_ids.append(_start_omnihuman_prediction(image_b64, image_mime_type, part_audio))
             prediction_id = ",".join(prediction_ids)
 
         with_retry(lambda: supabase.table("ai_actor_video_jobs").insert({
