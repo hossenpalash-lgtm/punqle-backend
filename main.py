@@ -7178,7 +7178,7 @@ def _start_sync_redub(video_bytes: bytes, audio_bytes: bytes) -> str:
                 "sync_mode": "loop",
                 "temperature": SYNC_TEMPERATURE,
             }},
-            timeout=60,
+            timeout=180,  # an Omni 1080p clip is ~14 MB (~19 MB as base64); a probe took 37 s to upload
         ),
         exceptions=(requests.RequestException,),
         attempts=2,
