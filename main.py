@@ -8011,7 +8011,7 @@ def _get_actor_video_clip(actor_id: str, situation_id: Optional[str] = None) -> 
 _WHISPER_LANGUAGE_CODE = {"english": "en"}
 
 
-def _transcribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = None) -> list:
+def _whisper_word_timestamps(audio_bytes: bytes, language: Optional[str] = None) -> list:
     """Whisper on our own just-synthesized TTS audio, not to figure out
     WHAT was said (we already know — we wrote the script) but WHEN each
     word actually lands, since TTS speech pacing/pauses aren't uniform
@@ -8040,6 +8040,55 @@ def _transcribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = No
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
     return [{"word": w.word, "start": w.start, "end": w.end} for w in (response.words or [])]
+
+
+# ElevenLabs Scribe replaces whisper-1 (retires 26 Feb 2027) for word timings.
+# Measured 2026-10-05 on English and Bangla clips: every word found, timing
+# error 0.05-0.14 s, correct Bengali script (whisper-1 returned Devanagari/
+# Hindi for the same Bangla audio). ~$0.22 per hour of audio, a bit cheaper
+# than whisper-1's $0.36. Needs the `speech_to_text` permission on the key.
+_SCRIBE_LANGUAGE_CODE = {"english": "eng", "bangla": "ben"}
+
+
+def _scribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = None) -> list:
+    data = {"model_id": "scribe_v2", "timestamps_granularity": "word"}
+    code = _SCRIBE_LANGUAGE_CODE.get(language or "")
+    if code:
+        data["language_code"] = code
+    r = with_retry(
+        lambda: requests.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+            files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
+            data=data,
+            timeout=120,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    if not r.ok:
+        raise Exception(f"ElevenLabs speech-to-text failed ({r.status_code}): {r.text[:200]}")
+    return [
+        {"word": w["text"], "start": w["start"], "end": w["end"]}
+        for w in (r.json().get("words") or [])
+        if w.get("type") == "word" and w.get("start") is not None and w.get("end") is not None
+    ]
+
+
+def _transcribe_word_timestamps(audio_bytes: bytes, language: Optional[str] = None) -> list:
+    """Word timings for a clip whose script we already know (see
+    _whisper_word_timestamps for why only WHEN each word lands matters).
+    ElevenLabs Scribe first; whisper-1 only as a safety net while it still
+    exists, so a missing permission or an ElevenLabs outage never blocks a
+    video."""
+    if ELEVENLABS_API_KEY:
+        try:
+            words = _scribe_word_timestamps(audio_bytes, language)
+            if words:
+                return words
+        except Exception as e:
+            logger.error("Scribe word timings failed, falling back to whisper-1: %s", str(e)[:200])
+    return _whisper_word_timestamps(audio_bytes, language)
 
 
 def _align_known_text_to_timings(known_text: str, detected_words: list) -> list:
