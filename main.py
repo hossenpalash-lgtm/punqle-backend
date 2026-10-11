@@ -2812,22 +2812,47 @@ def _verify_youtube_state(state: str) -> str:
     return user_id
 
 
+_DEAD_REFRESH_TOKEN_ERRORS = ("invalid_grant", "invalid_refresh_token", "refresh_token_expired", "token_revoked")
+
+
+def _refresh_failure_is_permanent(resp: requests.Response) -> bool:
+    """True only when the provider says the refresh token ITSELF is dead
+    (revoked, expired, already used). Anything else — a provider outage
+    (5xx), a bad/missing client id or secret on OUR side (invalid_client),
+    a rate limit — says nothing about the user's connection, so deleting
+    the stored connection on those would log users out for a problem that
+    isn't theirs. (Found 2026-10-11: a refresh attempted with the Google
+    client secret missing from a local .env wiped a real connection row.)"""
+    if resp.status_code >= 500:
+        return False
+    try:
+        err = str(resp.json().get("error", "")).lower()
+    except Exception:
+        return False
+    return err in _DEAD_REFRESH_TOKEN_ERRORS
+
+
 def _refresh_youtube_token(user_id: str, refresh_token: str) -> Optional[str]:
     """Returns a fresh access_token and persists it + the new
-    token_expires_at, or None (deleting the connection row) if the
-    refresh_token itself is dead. While the app is unverified with Google
+    token_expires_at, or None — deleting the connection row only when
+    Google says the refresh_token itself is dead (see
+    _refresh_failure_is_permanent). While the app was unverified with Google
     ("Testing" publishing status), every refresh_token for a sensitive
     scope expires after exactly 7 days — this isn't a rare edge case
     during that window, it's the expected weekly outcome for every
     connected user until App Review clears."""
-    resp = requests.post("https://oauth2.googleapis.com/token", data={
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-    }, timeout=15)
+    try:
+        resp = requests.post("https://oauth2.googleapis.com/token", data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+        }, timeout=15)
+    except requests.RequestException:
+        return None  # couldn't reach Google — keep the connection, try again next time
     if not resp.ok:
-        supabase.table("youtube_connections").delete().eq("owner_id", user_id).execute()
+        if _refresh_failure_is_permanent(resp):
+            supabase.table("youtube_connections").delete().eq("owner_id", user_id).execute()
         return None
     data = resp.json()
     access_token = data["access_token"]
@@ -2886,14 +2911,18 @@ def _refresh_tiktok_token(user_id: str, refresh_token: str) -> Optional[str]:
     (24h, confirmed via their own oauth docs) — much shorter than Meta's
     effectively-non-expiring Page tokens, closer to YouTube's own
     refresh cadence, so this mirrors _refresh_youtube_token's shape."""
-    resp = requests.post(_TIKTOK_TOKEN_URL, data={
-        "client_key": TIKTOK_CLIENT_KEY,
-        "client_secret": TIKTOK_CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+    try:
+        resp = requests.post(_TIKTOK_TOKEN_URL, data={
+            "client_key": TIKTOK_CLIENT_KEY,
+            "client_secret": TIKTOK_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+    except requests.RequestException:
+        return None  # couldn't reach TikTok — keep the connection, try again next time
     if not resp.ok:
-        supabase.table("tiktok_connections").delete().eq("owner_id", user_id).execute()
+        if _refresh_failure_is_permanent(resp):
+            supabase.table("tiktok_connections").delete().eq("owner_id", user_id).execute()
         return None
     data = resp.json()
     access_token = data.get("access_token")
@@ -11590,11 +11619,13 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
         youtube_stats = _fetch_youtube_video_stats(user_id, youtube_ids)
 
         fb_token = None
+        connected_page_id = None
         if any(r["platform"] in ("facebook", "instagram") for r in stale_rows):
             conn_res = with_retry(lambda: supabase.table("meta_connections")
-                .select("page_access_token").eq("owner_id", user_id).execute())
+                .select("page_access_token,page_id").eq("owner_id", user_id).execute())
             conn_res = ensure_supabase_response(conn_res, "get meta connection for performance")
             fb_token = conn_res.data[0]["page_access_token"] if conn_res.data else None
+            connected_page_id = conn_res.data[0].get("page_id") if conn_res.data else None
 
         unavailable_reasons: dict[str, str] = {}
         for row in stale_rows:
@@ -11610,6 +11641,17 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
             elif row["platform"] == "facebook":
                 if not fb_token:
                     unavailable_reasons[row["id"]] = "Connect Facebook to see engagement."
+                    continue
+                # A Facebook post id is "<page id>_<post id>". A post made on a
+                # Page other than the one connected now can't be read with
+                # this Page's token — say that, instead of Meta's confusing
+                # "object does not exist" permission error.
+                post_page_id = row["external_post_id"].split("_")[0] if "_" in row["external_post_id"] else None
+                if post_page_id and connected_page_id and post_page_id != str(connected_page_id):
+                    unavailable_reasons[row["id"]] = (
+                        "This post was published to a different Facebook Page than the one connected now, "
+                        "so its numbers can't be read."
+                    )
                     continue
                 metrics, reason = _fetch_facebook_post_engagement(row["external_post_id"], fb_token)
                 if metrics is None:
