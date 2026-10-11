@@ -9762,11 +9762,14 @@ def get_meta_connect_url(insights: bool = False, user_id: str = Depends(get_curr
         # DOES see Business-Portfolio-governed pages regardless of classic
         # per-Page access. Works immediately for app admins/testers even
         # before this permission clears its own App Review.
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management"
-        # Opt-in only (Competitive Edge "Unlock Instagram stats"): never part of
-        # the default Connect, because a scope Meta hasn't approved yet must not
-        # be able to break the normal connection for users without an app role.
-        + (",instagram_manage_insights" if insights else ""),
+        # instagram_manage_insights was APPROVED by Meta on 2026-10-11, so it is
+        # now part of every normal Connect (before that it was opt-in only, so
+        # an unapproved scope couldn't break the connection for users without an
+        # app role). The `insights` query param is kept so old links still work;
+        # it no longer changes anything. Users who connected BEFORE this date
+        # hold a token without the scope and must reconnect once — Performance
+        # and Competitive Edge show an "Unlock" button for exactly that case.
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management,instagram_manage_insights",
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
@@ -11412,11 +11415,97 @@ def _fetch_facebook_post_engagement(post_id: str, page_access_token: str) -> tup
     }, None
 
 
+# Instagram's per-post insight metrics, each asked for on its own if the
+# combined call is refused (a metric can be unsupported for one media type or
+# Graph version while the rest work). `views` replaced the old impressions/
+# plays metrics; `saved` and `shares` are the strong "people want this" signals.
+IG_POST_INSIGHT_METRICS = ["reach", "views", "saved", "shares", "total_interactions"]
+IG_PERMISSION_ERROR_CODES = (10, 200, 299)
+
+
+def _read_ig_insight_values(data: dict) -> dict:
+    out: dict = {}
+    for item in data.get("data", []):
+        name = item.get("name")
+        values = item.get("values") or []
+        value = values[0].get("value") if values else (item.get("total_value") or {}).get("value")
+        if name and isinstance(value, (int, float)):
+            out[name] = int(value)
+    return out
+
+
+def _fetch_instagram_post_metrics(media_id: str, page_access_token: str) -> tuple[Optional[dict], Optional[str]]:
+    """Returns (metrics, unavailable_reason) — exactly one is non-None.
+    Likes/comments come from the media object itself (instagram_basic);
+    reach/views/saves/shares come from the Insights edge, which needs
+    instagram_manage_insights (approved 2026-10-11, but a token minted
+    before then lacks it — Meta answers code 10 "Application does not have
+    permission"). That case still returns the likes/comments we CAN read,
+    with raw["insights_state"] = "needs_permission" so the UI can offer a
+    one-click reconnect instead of silently showing fewer numbers."""
+    try:
+        media_resp = requests.get(
+            f"{META_GRAPH_URL}/{media_id}",
+            params={"fields": "like_count,comments_count,media_type,media_product_type,permalink,timestamp",
+                    "access_token": page_access_token},
+            timeout=15,
+        )
+    except requests.RequestException:
+        return None, "Couldn't reach Instagram."
+    if not media_resp.ok:
+        message, _code = _meta_graph_error_message(media_resp)
+        return None, message
+    media = media_resp.json()
+
+    insights: dict = {}
+    state = "ok"
+    try:
+        resp = requests.get(
+            f"{META_GRAPH_URL}/{media_id}/insights",
+            params={"metric": ",".join(IG_POST_INSIGHT_METRICS), "access_token": page_access_token},
+            timeout=15,
+        )
+        if resp.ok:
+            insights = _read_ig_insight_values(resp.json())
+        else:
+            _message, code = _meta_graph_error_message(resp)
+            if code in IG_PERMISSION_ERROR_CODES:
+                state = "needs_permission"
+            else:
+                # Probably one metric Meta doesn't offer for this post — ask
+                # for each separately and keep whatever answers.
+                for metric in IG_POST_INSIGHT_METRICS:
+                    one = requests.get(
+                        f"{META_GRAPH_URL}/{media_id}/insights",
+                        params={"metric": metric, "access_token": page_access_token},
+                        timeout=15,
+                    )
+                    if one.ok:
+                        insights.update(_read_ig_insight_values(one.json()))
+                if not insights:
+                    state = "unavailable"
+    except requests.RequestException:
+        state = "unavailable"
+
+    return {
+        "likes": media.get("like_count"),
+        "comments": media.get("comments_count"),
+        "views": insights.get("views"),
+        "shares": insights.get("shares"),
+        "raw": {"media": media, "insights": insights, "insights_state": state},
+    }, None
+
+
 class PostMetricsOut(BaseModel):
     views: Optional[int] = None
     likes: Optional[int] = None
     comments: Optional[int] = None
     shares: Optional[int] = None
+    # Instagram only (read out of the snapshot's raw payload — no extra
+    # database columns, so no migration is needed for these).
+    reach: Optional[int] = None
+    saves: Optional[int] = None
+    total_interactions: Optional[int] = None
     fetched_at: Optional[str] = None
 
 
@@ -11429,6 +11518,9 @@ class PerformancePostOut(BaseModel):
     scheduled_time: str
     metrics: Optional[PostMetricsOut] = None
     metrics_unavailable_reason: Optional[str] = None
+    # "unlock_instagram_insights" when the connection's token predates the
+    # instagram_manage_insights approval — the UI shows a reconnect button.
+    metrics_action: Optional[str] = None
     goal: Optional[str] = None
     angle: Optional[str] = None
     style: Optional[str] = None
@@ -11498,7 +11590,7 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
         youtube_stats = _fetch_youtube_video_stats(user_id, youtube_ids)
 
         fb_token = None
-        if any(r["platform"] == "facebook" for r in stale_rows):
+        if any(r["platform"] in ("facebook", "instagram") for r in stale_rows):
             conn_res = with_retry(lambda: supabase.table("meta_connections")
                 .select("page_access_token").eq("owner_id", user_id).execute())
             conn_res = ensure_supabase_response(conn_res, "get meta connection for performance")
@@ -11529,13 +11621,18 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                     "raw": m["raw"],
                 }, on_conflict="scheduled_post_id,fetch_bucket").execute())
             elif row["platform"] == "instagram":
-                # Saved so the history exists, but reading an Instagram
-                # post's numbers needs instagram_manage_insights, which
-                # Meta hasn't approved yet — an honest "not yet", never a
-                # made-up zero.
-                unavailable_reasons[row["id"]] = (
-                    "Instagram numbers will appear here once Meta approves Punqle's Instagram insights access."
-                )
+                if not fb_token:
+                    unavailable_reasons[row["id"]] = "Connect Instagram to see engagement."
+                    continue
+                metrics, reason = _fetch_instagram_post_metrics(row["external_post_id"], fb_token)
+                if metrics is None:
+                    unavailable_reasons[row["id"]] = reason or "Couldn't fetch Instagram numbers."
+                    continue
+                with_retry(lambda m=metrics, r=row: supabase.table("organic_post_metrics").upsert({
+                    "scheduled_post_id": r["id"], "platform": "instagram", "external_post_id": r["external_post_id"],
+                    "views": m["views"], "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
+                    "raw": m["raw"],
+                }, on_conflict="scheduled_post_id,fetch_bucket").execute())
             else:
                 # TikTok (or any future platform this function hasn't been
                 # taught yet) — this `else` used to silently assume
@@ -11557,6 +11654,9 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
         posts = []
         for row in rows:
             snap = latest_snapshot.get(row["id"])
+            raw = (snap.get("raw") or {}) if snap else {}
+            ig_insights = raw.get("insights") or {} if row["platform"] == "instagram" else {}
+            needs_unlock = row["platform"] == "instagram" and raw.get("insights_state") == "needs_permission"
             posts.append({
                 "id": row["id"], "platform": row["platform"], "external_post_id": row["external_post_id"],
                 "caption": row["caption"], "image_base64": row.get("image_base64"),
@@ -11564,8 +11664,11 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                 "metrics": {
                     "views": snap["views"], "likes": snap["likes"], "comments": snap["comments"],
                     "shares": snap["shares"], "fetched_at": snap["fetched_at"],
+                    "reach": ig_insights.get("reach"), "saves": ig_insights.get("saved"),
+                    "total_interactions": ig_insights.get("total_interactions"),
                 } if snap else None,
                 "metrics_unavailable_reason": unavailable_reasons.get(row["id"]),
+                "metrics_action": "unlock_instagram_insights" if needs_unlock else None,
                 "goal": row.get("goal"), "angle": row.get("angle"), "style": row.get("style"),
             })
         return {"posts": posts}
