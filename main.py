@@ -11931,6 +11931,19 @@ class IgTimelinePoint(BaseModel):
     engagement: int
 
 
+class IgOwnSummary(BaseModel):
+    """The connected user's OWN Instagram account, summarised with the same
+    maths as the competitor's, so the two can be compared like for like."""
+    username: str = ""
+    followers: Optional[int] = None
+    analyzed_posts: int = 0
+    posts_per_week: Optional[float] = None
+    avg_engagement: Optional[float] = None
+    engagement_rate_pct: Optional[float] = None
+    best_type: Optional[str] = None
+    best_type_avg: Optional[float] = None
+
+
 class IgStatsResponse(BaseModel):
     status: str
     message: str = ""
@@ -11956,6 +11969,11 @@ class IgStatsResponse(BaseModel):
     themes: list[IgThemeStat] = []
     top_posts: list[IgTopPost] = []
     takeaways: list[str] = []
+    posts_per_week: Optional[float] = None
+    # "You vs them" (Competitive Edge): None when the user's own account
+    # couldn't be read; `compare` is empty until they have enough own posts.
+    own: Optional[IgOwnSummary] = None
+    compare: list[str] = []
 
 
 class _IgError(Exception):
@@ -12224,7 +12242,89 @@ def _aggregate_instagram_stats(username: str, profile: dict, media: list, theme_
         if lift["posts"] >= 3 and lift["engagement_share_pct"] - lift["share_pct"] >= 3:
             take.append(f"\"{lift['theme']}\" is {lift['share_pct']:.0f}% of their posts but {lift['engagement_share_pct']:.0f}% of their engagement.")
     out["takeaways"] = take
+    out["posts_per_week"] = round(per_week, 1)
     return out
+
+
+IG_OWN_MIN_POSTS = 3
+
+
+def _fetch_own_instagram(ig_user_id: str, token: str) -> Optional[tuple]:
+    """(profile, media) for the connected user's OWN Instagram account, read
+    straight from their account's media edge (instagram_basic is enough —
+    no Business Discovery, no insights permission). Same fields and paging
+    as the competitor fetch so the two summaries are comparable. Returns
+    None on any failure: the comparison is a bonus and must never break the
+    competitor stats around it."""
+    try:
+        prof_resp = requests.get(
+            f"{META_GRAPH_URL}/{ig_user_id}",
+            params={"fields": "username,followers_count,media_count,name", "access_token": token},
+            timeout=20,
+        )
+        if not prof_resp.ok:
+            return None
+        prof = prof_resp.json()
+        profile = {"followers": prof.get("followers_count"), "total_posts": prof.get("media_count"),
+                   "name": prof.get("name") or "", "website": "", "username": prof.get("username") or ""}
+        media: list = []
+        params = {"fields": _IG_MEDIA_FIELDS, "limit": IG_MEDIA_PAGE_SIZE, "access_token": token}
+        for _ in range(IG_MAX_PAGES):
+            resp = requests.get(f"{META_GRAPH_URL}/{ig_user_id}/media", params=params, timeout=25)
+            if not resp.ok:
+                break
+            body = resp.json()
+            media.extend(body.get("data", []))
+            after = ((body.get("paging") or {}).get("cursors") or {}).get("after")
+            if not after or not body.get("data"):
+                break
+            params = {**params, "after": after}
+        return profile, media
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _own_summary_and_compare(ig_user_id: str, token: str, theirs: dict) -> tuple[Optional[dict], list[str]]:
+    fetched = _fetch_own_instagram(ig_user_id, token)
+    if not fetched:
+        return None, []
+    profile, media = fetched
+    agg = _aggregate_instagram_stats(profile.get("username") or "you", profile, media)
+    n = agg.get("analyzed_posts", 0)
+    types = [t for t in agg.get("types", []) if t["type"] != "other"]
+    best = max(types, key=lambda t: t["avg_engagement"]) if types else None
+    own = {
+        "username": profile.get("username") or "", "followers": profile.get("followers"),
+        "analyzed_posts": n,
+        "posts_per_week": agg.get("posts_per_week") if n >= IG_OWN_MIN_POSTS else None,
+        "avg_engagement": agg.get("avg_engagement") if n else None,
+        "engagement_rate_pct": agg.get("engagement_rate_pct") if n >= IG_OWN_MIN_POSTS else None,
+        "best_type": best["label"] if best and n >= IG_OWN_MIN_POSTS else None,
+        "best_type_avg": best["avg_engagement"] if best and n >= IG_OWN_MIN_POSTS else None,
+    }
+    if n < IG_OWN_MIN_POSTS:
+        return own, []
+
+    lines: list[str] = []
+    mine, theirs_rate = own["engagement_rate_pct"], theirs.get("engagement_rate_pct")
+    if mine is not None and theirs_rate is not None and theirs_rate > 0:
+        if mine >= theirs_rate * 1.15:
+            lines.append(f"You're ahead on engagement: {mine}% of your followers engage per post vs {theirs_rate}% for them.")
+        elif mine * 1.15 <= theirs_rate:
+            lines.append(f"Their audience engages more: {theirs_rate}% of their followers per post vs {mine}% of yours.")
+        else:
+            lines.append(f"Your engagement rate is about the same as theirs ({mine}% vs {theirs_rate}%).")
+    their_eng, my_eng = theirs.get("avg_engagement"), own["avg_engagement"]
+    if their_eng is not None and my_eng is not None:
+        lines.append(f"Per post, they average {_fmt_num(their_eng)} interactions and you average {_fmt_num(my_eng)}.")
+    their_pw, my_pw = theirs.get("posts_per_week"), own["posts_per_week"]
+    if their_pw is not None and my_pw is not None:
+        lines.append(f"They post about {their_pw}x a week; you post about {my_pw}x a week.")
+    their_types = [t for t in theirs.get("types", []) if t["type"] != "other" and t["posts"] >= 3]
+    their_best = max(their_types, key=lambda t: t["avg_engagement"]) if their_types else None
+    if their_best and own["best_type"] and their_best["label"] != own["best_type"]:
+        lines.append(f"Their best format is {their_best['label']}; yours is {own['best_type']}. Worth testing {their_best['label']} yourself.")
+    return own, lines[:4]
 
 
 @app.post("/ads/competitor-instagram-stats", response_model=IgStatsResponse, tags=["ads"])
@@ -12246,7 +12346,7 @@ def competitor_instagram_stats(
         return hit[1]
     try:
         res = with_retry(lambda: supabase.table("meta_connections")
-            .select("page_access_token, ig_user_id")
+            .select("page_access_token, ig_user_id, ig_username")
             .eq("owner_id", user_id)
             .execute())
         res = ensure_supabase_response(res, "get meta connection for instagram stats")
@@ -12257,6 +12357,9 @@ def competitor_instagram_stats(
         profile, media = _fetch_instagram_business_discovery(conn["ig_user_id"], conn["page_access_token"], username)
         labels = _label_instagram_themes([m.get("caption") or "" for m in media])
         result = _aggregate_instagram_stats(username, profile, media, labels)
+        if result["status"] == "ok" and (conn.get("ig_username") or "").lower() != username.lower():
+            own, compare = _own_summary_and_compare(conn["ig_user_id"], conn["page_access_token"], result)
+            result["own"], result["compare"] = own, compare
     except _IgError as e:
         return {"status": e.status, "message": e.message, "username": username}
     except HTTPException:
