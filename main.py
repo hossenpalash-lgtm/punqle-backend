@@ -1378,6 +1378,7 @@ META_GRAPH_URL = f"https://graph.facebook.com/{META_GRAPH_VERSION}"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
+YOUTUBE_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
 YOUTUBE_CATEGORY_ID = "22"  # People & Blogs — generic small-business default; no category picker in v1
 # Live-verified end to end (real connect, generate, publish, viewed on
 # YouTube) on 2026-08-25 before flipping this from "unlisted" to "public".
@@ -9757,7 +9758,7 @@ def sync_shopify_products(request: Request, user_id: str = Depends(get_current_u
 
 
 @app.get("/meta/connect-url", response_model=MetaConnectUrlResponse, tags=["meta"])
-def get_meta_connect_url(insights: bool = False, user_id: str = Depends(get_current_user_id)):
+def get_meta_connect_url(insights: bool = False, reach: bool = False, user_id: str = Depends(get_current_user_id)):
     """Returns the Facebook OAuth dialog URL for the frontend to
     navigate the browser to directly — generated via an authenticated
     call specifically so the signed state param can be tied to this
@@ -9798,7 +9799,13 @@ def get_meta_connect_url(insights: bool = False, user_id: str = Depends(get_curr
         # it no longer changes anything. Users who connected BEFORE this date
         # hold a token without the scope and must reconnect once — Performance
         # and Competitive Edge show an "Unlock" button for exactly that case.
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management,instagram_manage_insights",
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management,instagram_manage_insights"
+        # read_insights (Facebook post reach/views) is requested from Meta on
+        # 2026-10-12 and NOT approved yet — opt-in only (Performance "Unlock
+        # Facebook reach"), so an unapproved scope can't break the normal
+        # Connect for users without an app role. Move it into the line above
+        # once Meta approves it, and delete this param.
+        + (",read_insights" if reach else ""),
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
@@ -10493,7 +10500,7 @@ def _publish_to_instagram(ig_user_id: str, page_access_token: str, image_bytes: 
 
 
 @app.get("/youtube/connect-url", response_model=YouTubeConnectUrlResponse, tags=["youtube"])
-def get_youtube_connect_url(user_id: str = Depends(get_current_user_id)):
+def get_youtube_connect_url(analytics: bool = False, user_id: str = Depends(get_current_user_id)):
     """Returns the Google OAuth dialog URL for the frontend to navigate
     the browser to directly — same shape as /meta/connect-url.
     access_type=offline + prompt=consent together are what guarantee a
@@ -10507,7 +10514,11 @@ def get_youtube_connect_url(user_id: str = Depends(get_current_user_id)):
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": f"{BACKEND_URL}/youtube/callback",
         "response_type": "code",
-        "scope": YOUTUBE_UPLOAD_SCOPE,
+        # yt-analytics.readonly (watch time, retention, impressions) is being
+        # verified by Google (submitted 2026-10-12) — opt-in until then, same
+        # idea as Meta's reach=true. Move it into YOUTUBE_UPLOAD_SCOPE once
+        # Google approves it.
+        "scope": YOUTUBE_UPLOAD_SCOPE + (f" {YOUTUBE_ANALYTICS_SCOPE}" if analytics else ""),
         "access_type": "offline",
         "prompt": "consent",
         "state": state,
@@ -10628,7 +10639,7 @@ def disconnect_youtube(user_id: str = Depends(get_current_user_id)):
 
 
 @app.get("/tiktok/connect-url", response_model=TikTokConnectUrlResponse, tags=["tiktok"])
-def get_tiktok_connect_url(user_id: str = Depends(get_current_user_id)):
+def get_tiktok_connect_url(analytics: bool = False, user_id: str = Depends(get_current_user_id)):
     """Returns the TikTok OAuth dialog URL for the frontend to navigate
     the browser to directly — same shape as /meta/connect-url and
     /youtube/connect-url. Real posts stay private (SELF_ONLY) and capped
@@ -10649,7 +10660,11 @@ def get_tiktok_connect_url(user_id: str = Depends(get_current_user_id)):
     params = {
         "client_key": TIKTOK_CLIENT_KEY,
         "response_type": "code",
-        "scope": TIKTOK_SCOPE,
+        # video.list (a post's views/likes/comments/shares) is a new scope on
+        # the TikTok app (revision submitted 2026-10-12) — opt-in until TikTok
+        # approves it; asking for an unapproved scope makes TikTok refuse the
+        # whole authorization.
+        "scope": TIKTOK_SCOPE + (",video.list" if analytics else ""),
         "redirect_uri": f"{BACKEND_URL}/tiktok/callback",
         "state": state,
         "disable_auto_auth": "1",
@@ -11372,6 +11387,12 @@ def cancel_scheduled_post(request: Request, post_id: str, user_id: str = Depends
 
 
 PERFORMANCE_METRICS_FRESHNESS_MINUTES = 15
+_INSIGHTS_UNLOCK_ACTION = {
+    "instagram": "unlock_instagram_insights",
+    "facebook": "unlock_facebook_insights",
+    "youtube": "unlock_youtube_analytics",
+    "tiktok": "unlock_tiktok_stats",
+}
 
 
 def _fetch_youtube_video_stats(user_id: str, video_ids: list[str]) -> dict[str, dict]:
@@ -11436,12 +11457,53 @@ def _fetch_facebook_post_engagement(post_id: str, page_access_token: str) -> tup
         message, _code = _meta_graph_error_message(resp)
         return None, message
     data = resp.json()
+    insights, state = _fetch_facebook_post_insights(post_id, page_access_token)
     return {
         "likes": (data.get("likes") or {}).get("summary", {}).get("total_count"),
         "comments": (data.get("comments") or {}).get("summary", {}).get("total_count"),
         "shares": (data.get("shares") or {}).get("count", 0),
-        "raw": data,
+        "views": insights.get("views"),
+        "raw": {"post": data, "insights": insights, "insights_state": state},
     }, None
+
+
+# Facebook replaced post_impressions / post_impressions_unique with these two
+# (the old names return "invalid metric" since Nov 2025 / June 2025). Both need
+# read_insights on top of pages_read_engagement.
+FB_POST_INSIGHT_KEYS = {"post_total_media_view_unique": "reach", "post_media_view": "views"}
+
+
+def _fetch_facebook_post_insights(post_id: str, page_access_token: str) -> tuple[dict, str]:
+    """({"reach": n, "views": n}, state) — state is "ok", "needs_permission"
+    (the token has no read_insights) or "unavailable". Never raises: the likes/
+    comments next to it must still be shown when this part can't be read."""
+    def _ask(metric: str) -> Optional[requests.Response]:
+        try:
+            return requests.get(
+                f"{META_GRAPH_URL}/{post_id}/insights",
+                params={"metric": metric, "access_token": page_access_token},
+                timeout=15,
+            )
+        except requests.RequestException:
+            return None
+
+    resp = _ask(",".join(FB_POST_INSIGHT_KEYS))
+    if resp is None:
+        return {}, "unavailable"
+    if resp.ok:
+        found = {FB_POST_INSIGHT_KEYS[k]: v for k, v in _read_ig_insight_values(resp.json()).items() if k in FB_POST_INSIGHT_KEYS}
+        return found, ("ok" if found else "unavailable")
+    _message, code = _meta_graph_error_message(resp)
+    if code in IG_PERMISSION_ERROR_CODES:
+        return {}, "needs_permission"
+    found = {}
+    for metric, key in FB_POST_INSIGHT_KEYS.items():
+        one = _ask(metric)
+        if one is not None and one.ok:
+            got = _read_ig_insight_values(one.json())
+            if metric in got:
+                found[key] = got[metric]
+    return found, ("ok" if found else "unavailable")
 
 
 # Instagram's per-post insight metrics, each asked for on its own if the
@@ -11525,6 +11587,246 @@ def _fetch_instagram_post_metrics(media_id: str, page_access_token: str) -> tupl
     }, None
 
 
+# ---- YouTube: Analytics API (watch time, retention) + Reporting API (impressions) ----
+# Both need yt-analytics.readonly, which Google is verifying (submitted 2026-10-12).
+# Thumbnail impressions / click-through rate are NOT in the interactive Analytics
+# API; since 15 Jan 2026 they come from the Reporting API's "reach" report, an
+# asynchronous daily file (a job is created once, the first file lands within
+# ~48 h, and YouTube back-fills the 30 days before the job existed).
+YT_ANALYTICS_URL = "https://youtubeanalytics.googleapis.com/v2/reports"
+YT_REPORTING_URL = "https://youtubereporting.googleapis.com/v1"
+YT_REACH_REPORT_TYPE = "channel_reach_basic_a1"
+YT_ANALYTICS_METRICS = "views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained,shares"
+_YT_REACH_CACHE: dict = {}  # user_id -> (timestamp, ({video_id: {...}}, state))
+YT_REACH_CACHE_SECONDS = 6 * 3600
+_YT_REPORT_FILE_CACHE: dict = {}  # report id -> parsed rows (a finished daily file never changes)
+
+
+def _google_error_reason(resp: requests.Response) -> str:
+    try:
+        err = resp.json().get("error", {})
+        details = err.get("errors") or []
+        return str((details[0].get("reason") if details else "") or err.get("status") or "").lower()
+    except Exception:
+        return ""
+
+
+def _fetch_youtube_analytics(access_token: str, video_ids: list, start_date: str) -> tuple[dict, str]:
+    """({video_id: {watch_minutes, avg_view_seconds, avg_view_pct, subscribers_gained, shares}}, state)
+    state: "ok" | "needs_permission" | "unavailable"."""
+    out: dict = {}
+    state = "ok"
+    end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for i in range(0, len(video_ids), 200):
+        batch = video_ids[i:i + 200]
+        try:
+            resp = requests.get(
+                YT_ANALYTICS_URL,
+                params={"ids": "channel==MINE", "startDate": start_date, "endDate": end_date,
+                        "metrics": YT_ANALYTICS_METRICS, "dimensions": "video",
+                        "filters": "video==" + ",".join(batch), "maxResults": 200},
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=20,
+            )
+        except requests.RequestException:
+            return out, ("ok" if out else "unavailable")
+        if resp.status_code in (401, 403):
+            return out, "needs_permission"
+        if not resp.ok:
+            return out, ("ok" if out else "unavailable")
+        body = resp.json()
+        names = [h.get("name") for h in body.get("columnHeaders", [])]
+        for row in body.get("rows", []):
+            rec = dict(zip(names, row))
+            vid = rec.get("video")
+            if not vid:
+                continue
+            out[vid] = {
+                "watch_minutes": round(float(rec.get("estimatedMinutesWatched") or 0), 1),
+                "avg_view_seconds": int(rec.get("averageViewDuration") or 0),
+                "avg_view_pct": round(float(rec.get("averageViewPercentage") or 0), 1),
+                "subscribers_gained": int(rec.get("subscribersGained") or 0),
+                "shares": int(rec.get("shares") or 0),
+            }
+    return out, state
+
+
+def _aggregate_youtube_reach_rows(rows: list) -> dict:
+    """Daily rows -> {video_id: {"impressions": n, "ctr_pct": x}}; the click-
+    through rate is weighted by each day's impressions."""
+    acc: dict = {}
+    ratios = []
+    for r in rows:
+        try:
+            vid = r["video_id"]
+            imp = float(r.get("video_thumbnail_impressions") or 0)
+            ctr = float(r.get("video_thumbnail_impressions_ctr") or 0)
+        except (KeyError, ValueError):
+            continue
+        ratios.append(ctr)
+        a = acc.setdefault(vid, {"imp": 0.0, "clicks": 0.0})
+        a["imp"] += imp
+        a["clicks"] += imp * ctr
+    as_percent = any(c > 1 for c in ratios)  # tolerate a file that already holds percentages
+    return {
+        vid: {"impressions": int(a["imp"]), "ctr_pct": round((a["clicks"] / a["imp"]) * (1 if as_percent else 100), 2) if a["imp"] else None}
+        for vid, a in acc.items()
+    }
+
+
+def _youtube_reach_by_video(access_token: str, user_id: str) -> tuple[dict, str]:
+    """Thumbnail impressions + click-through rate per video from the Reporting
+    API's reach report. Returns ({video_id: {...}}, state): "ok", "building"
+    (job exists, first file not ready yet), "needs_permission", "unavailable"."""
+    hit = _YT_REACH_CACHE.get(user_id)
+    if hit and time.time() - hit[0] < YT_REACH_CACHE_SECONDS:
+        return hit[1]
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        listing = requests.get(f"{YT_REPORTING_URL}/jobs", headers=headers, timeout=20)
+        if listing.status_code in (401, 403):
+            return {}, "needs_permission"
+        if not listing.ok:
+            return {}, "unavailable"
+        job = next((j for j in listing.json().get("jobs", []) if j.get("reportTypeId") == YT_REACH_REPORT_TYPE), None)
+        if job is None:
+            created = requests.post(f"{YT_REPORTING_URL}/jobs", headers=headers, timeout=20,
+                                    json={"reportTypeId": YT_REACH_REPORT_TYPE, "name": "Punqle thumbnail reach"})
+            if created.status_code in (401, 403):
+                return {}, "needs_permission"
+            if not created.ok:
+                return {}, "unavailable"
+            job = created.json()
+        since = (datetime.now(timezone.utc) - timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        reports: list = []
+        token = None
+        while len(reports) < 80:
+            params = {"createdAfter": since, "pageSize": 50, **({"pageToken": token} if token else {})}
+            page = requests.get(f"{YT_REPORTING_URL}/jobs/{job['id']}/reports", params=params, headers=headers, timeout=20)
+            if not page.ok:
+                break
+            body = page.json()
+            reports.extend(body.get("reports", []))
+            token = body.get("nextPageToken")
+            if not token:
+                break
+        # one file per day: if a day was regenerated keep the newest
+        newest: dict = {}
+        for r in reports:
+            day = r.get("startTime")
+            if day and (day not in newest or r.get("createTime", "") > newest[day].get("createTime", "")):
+                newest[day] = r
+        if not newest:
+            result = ({}, "building")
+        else:
+            rows: list = []
+            for r in newest.values():
+                cached = _YT_REPORT_FILE_CACHE.get(r["id"])
+                if cached is None:
+                    dl = requests.get(r["downloadUrl"], headers={**headers, "Accept-Encoding": "gzip"}, timeout=30)
+                    if not dl.ok:
+                        continue
+                    cached = list(csv.DictReader(io.StringIO(dl.text)))
+                    _YT_REPORT_FILE_CACHE[r["id"]] = cached
+                rows.extend(cached)
+            result = (_aggregate_youtube_reach_rows(rows), "ok")
+    except (requests.RequestException, KeyError, ValueError):
+        return {}, "unavailable"
+    _YT_REACH_CACHE[user_id] = (time.time(), result)
+    return result
+
+
+# ---- TikTok: a post's own counts through the Display API (scope video.list) ----
+TIKTOK_STATS_CACHE_SECONDS = 15 * 60
+_TIKTOK_STATS_CACHE: dict = {}  # scheduled_posts id -> (timestamp, result dict)
+_TIKTOK_SCOPE_ERRORS = ("scope_not_authorized", "scope_permission_missed", "scope_not_authorize")
+
+
+def _tiktok_public_video_id(access_token: str, publish_id: str) -> Optional[str]:
+    """Direct Post hands back a publish_id; the Display API wants the public
+    video id, which only exists once the post is live (TikTok spells the field
+    "publicaly_available_post_id")."""
+    try:
+        resp = requests.post(
+            "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json; charset=UTF-8"},
+            json={"publish_id": publish_id}, timeout=15,
+        )
+        if not resp.ok:
+            return None
+        ids = (resp.json().get("data") or {}).get("publicaly_available_post_id") or []
+        return str(ids[0]) if ids else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _tiktok_stats_for_rows(user_id: str, rows: list) -> dict:
+    """{scheduled_post_id: {"state", "metrics"?, "reason"?}} — state is "ok",
+    "needs_permission" or "unavailable". Not stored in organic_post_metrics
+    (that table doesn't allow platform 'tiktok'); a short in-memory cache keeps
+    this to one lookup per post per 15 minutes."""
+    out: dict = {}
+    todo: list = []
+    for r in rows:
+        hit = _TIKTOK_STATS_CACHE.get(r["id"])
+        if hit and time.time() - hit[0] < TIKTOK_STATS_CACHE_SECONDS:
+            out[r["id"]] = hit[1]
+        else:
+            todo.append(r)
+    if not todo:
+        return out
+    token = _get_valid_tiktok_token(user_id)
+    if not token:
+        for r in todo:
+            out[r["id"]] = {"state": "unavailable", "reason": "Connect TikTok to see numbers."}
+        return out
+    by_video: dict = {}
+    for r in todo:
+        vid = _tiktok_public_video_id(token, r["external_post_id"])
+        if vid:
+            by_video[vid] = r["id"]
+        else:
+            res = {"state": "unavailable", "reason": "TikTok hasn't made this post public yet, so it has no numbers."}
+            out[r["id"]] = res
+    video_ids = list(by_video)
+    for i in range(0, len(video_ids), 20):
+        batch = video_ids[i:i + 20]
+        try:
+            resp = requests.post(
+                "https://open.tiktokapis.com/v2/video/query/",
+                params={"fields": "id,view_count,like_count,comment_count,share_count"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"filters": {"video_ids": batch}}, timeout=20,
+            )
+            body = resp.json()
+        except (requests.RequestException, ValueError):
+            for vid in batch:
+                out[by_video[vid]] = {"state": "unavailable", "reason": "Couldn't reach TikTok."}
+            continue
+        code = str((body.get("error") or {}).get("code") or "ok").lower()
+        if code in _TIKTOK_SCOPE_ERRORS or "scope" in code:
+            for vid in batch:
+                out[by_video[vid]] = {"state": "needs_permission", "reason": "TikTok numbers need one more permission."}
+            continue
+        if code != "ok":
+            for vid in batch:
+                out[by_video[vid]] = {"state": "unavailable", "reason": "Couldn't read this post's TikTok numbers."}
+            continue
+        seen = {str(v.get("id")): v for v in (body.get("data") or {}).get("videos", [])}
+        for vid in batch:
+            v = seen.get(vid)
+            out[by_video[vid]] = (
+                {"state": "ok", "metrics": {"views": v.get("view_count"), "likes": v.get("like_count"),
+                                            "comments": v.get("comment_count"), "shares": v.get("share_count")}}
+                if v else {"state": "unavailable", "reason": "TikTok didn't return this post."}
+            )
+    for r in todo:
+        res = out.get(r["id"])
+        if res:
+            _TIKTOK_STATS_CACHE[r["id"]] = (time.time(), res)
+    return out
+
+
 class PostMetricsOut(BaseModel):
     views: Optional[int] = None
     likes: Optional[int] = None
@@ -11535,6 +11837,13 @@ class PostMetricsOut(BaseModel):
     reach: Optional[int] = None
     saves: Optional[int] = None
     total_interactions: Optional[int] = None
+    # YouTube (Analytics + Reporting APIs).
+    impressions: Optional[int] = None
+    ctr_pct: Optional[float] = None
+    watch_minutes: Optional[float] = None
+    avg_view_seconds: Optional[int] = None
+    avg_view_pct: Optional[float] = None
+    subscribers_gained: Optional[int] = None
     fetched_at: Optional[str] = None
 
 
@@ -11547,9 +11856,12 @@ class PerformancePostOut(BaseModel):
     scheduled_time: str
     metrics: Optional[PostMetricsOut] = None
     metrics_unavailable_reason: Optional[str] = None
-    # "unlock_instagram_insights" when the connection's token predates the
-    # instagram_manage_insights approval — the UI shows a reconnect button.
+    # "unlock_instagram_insights" / "unlock_facebook_insights" /
+    # "unlock_youtube_analytics" / "unlock_tiktok_stats" when the connection's
+    # token lacks the permission that unlocks more numbers — the UI shows a
+    # reconnect button. metrics_note: a gentle "still building" hint.
     metrics_action: Optional[str] = None
+    metrics_note: Optional[str] = None
     goal: Optional[str] = None
     angle: Optional[str] = None
     style: Optional[str] = None
@@ -11615,8 +11927,24 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
             or datetime.fromisoformat(latest_snapshot[r["id"]]["fetched_at"].replace("Z", "+00:00")) < cutoff
         ]
 
-        youtube_ids = [r["external_post_id"] for r in stale_rows if r["platform"] == "youtube"]
+        youtube_rows = [r for r in stale_rows if r["platform"] == "youtube"]
+        youtube_ids = [r["external_post_id"] for r in youtube_rows]
         youtube_stats = _fetch_youtube_video_stats(user_id, youtube_ids)
+        # Watch time / retention (Analytics API) and thumbnail impressions
+        # (Reporting API) — both need yt-analytics.readonly; without it the
+        # basic views/likes/comments above still show and the UI offers an unlock.
+        yt_analytics: dict = {}
+        yt_reach: dict = {}
+        yt_analytics_state, yt_reach_state = "unavailable", "unavailable"
+        if youtube_stats:
+            yt_token = _get_valid_youtube_token(user_id)
+            if yt_token:
+                yt_start = min(r["scheduled_time"] for r in youtube_rows)[:10]
+                yt_analytics, yt_analytics_state = _fetch_youtube_analytics(yt_token, youtube_ids, yt_start)
+                if yt_analytics_state == "needs_permission":
+                    yt_reach_state = "needs_permission"
+                else:
+                    yt_reach, yt_reach_state = _youtube_reach_by_video(yt_token, user_id)
 
         fb_token = None
         connected_page_id = None
@@ -11632,11 +11960,23 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
             if row["platform"] == "youtube":
                 stats = youtube_stats.get(row["external_post_id"])
                 if stats is None:
+                    unavailable_reasons[row["id"]] = (
+                        "Connect YouTube to see views and likes." if not youtube_stats
+                        else "YouTube didn't return this video — it may have been removed."
+                    )
                     continue
-                with_retry(lambda s=stats, r=row: supabase.table("organic_post_metrics").upsert({
+                ins = dict(yt_analytics.get(row["external_post_id"], {}))
+                ins.update(yt_reach.get(row["external_post_id"], {}))
+                if yt_analytics_state == "needs_permission":
+                    ins_state = "needs_permission"
+                elif yt_reach_state == "building":
+                    ins_state = "building"
+                else:
+                    ins_state = "ok" if ins else "unavailable"
+                with_retry(lambda s=stats, r=row, i=ins, st=ins_state: supabase.table("organic_post_metrics").upsert({
                     "scheduled_post_id": r["id"], "platform": "youtube", "external_post_id": r["external_post_id"],
-                    "views": s["views"], "likes": s["likes"], "comments": s["comments"], "shares": None,
-                    "raw": s["raw"],
+                    "views": s["views"], "likes": s["likes"], "comments": s["comments"], "shares": i.get("shares"),
+                    "raw": {"statistics": s["raw"], "insights": i, "insights_state": st},
                 }, on_conflict="scheduled_post_id,fetch_bucket").execute())
             elif row["platform"] == "facebook":
                 if not fb_token:
@@ -11659,9 +11999,11 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                     continue
                 with_retry(lambda m=metrics, r=row: supabase.table("organic_post_metrics").upsert({
                     "scheduled_post_id": r["id"], "platform": "facebook", "external_post_id": r["external_post_id"],
-                    "views": None, "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
+                    "views": m.get("views"), "likes": m["likes"], "comments": m["comments"], "shares": m["shares"],
                     "raw": m["raw"],
                 }, on_conflict="scheduled_post_id,fetch_bucket").execute())
+            elif row["platform"] == "tiktok":
+                continue  # read live from TikTok below — organic_post_metrics doesn't hold TikTok rows
             elif row["platform"] == "instagram":
                 if not fb_token:
                     unavailable_reasons[row["id"]] = "Connect Instagram to see engagement."
@@ -11688,7 +12030,14 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
                 # endpoint for a Sandbox app (posts are private anyway
                 # while unaudited), so this is an honest "not yet", not a
                 # silently-wrong number.
-                unavailable_reasons[row["id"]] = "TikTok performance isn't available yet."
+                unavailable_reasons[row["id"]] = "Numbers for this platform aren't available yet."
+
+        tiktok_rows = [r for r in rows if r["platform"] == "tiktok"]
+        tiktok_results = _tiktok_stats_for_rows(user_id, tiktok_rows) if tiktok_rows else {}
+        for r in tiktok_rows:
+            res = tiktok_results.get(r["id"]) or {"state": "unavailable", "reason": "TikTok performance isn't available yet."}
+            if res["state"] != "ok":
+                unavailable_reasons[r["id"]] = res.get("reason") or "TikTok performance isn't available yet."
 
         if any(row["id"] not in unavailable_reasons for row in stale_rows):
             latest_snapshot = _latest_snapshots()
@@ -11697,20 +12046,34 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
         for row in rows:
             snap = latest_snapshot.get(row["id"])
             raw = (snap.get("raw") or {}) if snap else {}
-            ig_insights = raw.get("insights") or {} if row["platform"] == "instagram" else {}
-            needs_unlock = row["platform"] == "instagram" and raw.get("insights_state") == "needs_permission"
+            ins = (raw.get("insights") or {}) if isinstance(raw, dict) else {}
+            ins_state = raw.get("insights_state") if isinstance(raw, dict) else None
+            action = _INSIGHTS_UNLOCK_ACTION.get(row["platform"]) if ins_state == "needs_permission" else None
+            note = ("Impressions appear about 2 days after you connect YouTube analytics — YouTube prepares them as a daily report."
+                    if ins_state == "building" else None)
+            tiktok_metrics = None
+            if row["platform"] == "tiktok":
+                tres = tiktok_results.get(row["id"]) or {}
+                if tres.get("state") == "ok":
+                    tiktok_metrics = {**tres["metrics"], "fetched_at": datetime.now(timezone.utc).isoformat()}
+                elif tres.get("state") == "needs_permission":
+                    action = _INSIGHTS_UNLOCK_ACTION["tiktok"]
             posts.append({
                 "id": row["id"], "platform": row["platform"], "external_post_id": row["external_post_id"],
                 "caption": row["caption"], "image_base64": row.get("image_base64"),
                 "scheduled_time": row["scheduled_time"],
-                "metrics": {
+                "metrics": tiktok_metrics if row["platform"] == "tiktok" else ({
                     "views": snap["views"], "likes": snap["likes"], "comments": snap["comments"],
                     "shares": snap["shares"], "fetched_at": snap["fetched_at"],
-                    "reach": ig_insights.get("reach"), "saves": ig_insights.get("saved"),
-                    "total_interactions": ig_insights.get("total_interactions"),
-                } if snap else None,
+                    "reach": ins.get("reach"), "saves": ins.get("saved"),
+                    "total_interactions": ins.get("total_interactions"),
+                    "impressions": ins.get("impressions"), "ctr_pct": ins.get("ctr_pct"),
+                    "watch_minutes": ins.get("watch_minutes"), "avg_view_seconds": ins.get("avg_view_seconds"),
+                    "avg_view_pct": ins.get("avg_view_pct"), "subscribers_gained": ins.get("subscribers_gained"),
+                } if snap else None),
                 "metrics_unavailable_reason": unavailable_reasons.get(row["id"]),
-                "metrics_action": "unlock_instagram_insights" if needs_unlock else None,
+                "metrics_action": action,
+                "metrics_note": note,
                 "goal": row.get("goal"), "angle": row.get("angle"), "style": row.get("style"),
             })
         return {"posts": posts}
