@@ -9800,12 +9800,14 @@ def get_meta_connect_url(insights: bool = False, reach: bool = False, user_id: s
         # hold a token without the scope and must reconnect once — Performance
         # and Competitive Edge show an "Unlock" button for exactly that case.
         "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management,instagram_manage_insights"
-        # read_insights (Facebook post reach/views) is requested from Meta on
-        # 2026-10-12 and NOT approved yet — opt-in only (Performance "Unlock
-        # Facebook reach"), so an unapproved scope can't break the normal
-        # Connect for users without an app role. Move it into the line above
-        # once Meta approves it, and delete this param.
-        + (",read_insights" if reach else ""),
+        # read_insights (Facebook post reach/views) and pages_read_user_content
+        # (the reaction + comment COUNTS on a Page post — found 2026-10-12 that
+        # pages_read_engagement alone is no longer enough to read them) are
+        # requested from Meta together and NOT approved yet — opt-in only
+        # (Performance "Reconnect Facebook"), so an unapproved scope can't break
+        # the normal Connect for users without an app role. Move them into the
+        # line above once Meta approves them, and delete this param.
+        + (",read_insights,pages_read_user_content" if reach else ""),
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
@@ -11453,17 +11455,27 @@ def _fetch_facebook_post_engagement(post_id: str, page_access_token: str) -> tup
         )
     except requests.RequestException:
         return None, "Couldn't reach Facebook."
+    engagement_state = "ok"
     if not resp.ok:
-        message, _code = _meta_graph_error_message(resp)
-        return None, message
-    data = resp.json()
+        message, code = _meta_graph_error_message(resp)
+        # 2026: reading the reaction/comment counts of a post needs
+        # pages_read_user_content (the error names it) — not just
+        # pages_read_engagement. Keep what we CAN read (shares, insights) and
+        # flag the rest, instead of showing Meta's raw permission error.
+        if code in IG_PERMISSION_ERROR_CODES and ("pages_read_user_content" in message or "pages_read_engagement" in message):
+            engagement_state = "needs_permission"
+            data = {}
+        else:
+            return None, message
+    else:
+        data = resp.json()
     insights, state = _fetch_facebook_post_insights(post_id, page_access_token)
     return {
-        "likes": (data.get("likes") or {}).get("summary", {}).get("total_count"),
-        "comments": (data.get("comments") or {}).get("summary", {}).get("total_count"),
-        "shares": (data.get("shares") or {}).get("count", 0),
+        "likes": (data.get("likes") or {}).get("summary", {}).get("total_count") if data else None,
+        "comments": (data.get("comments") or {}).get("summary", {}).get("total_count") if data else None,
+        "shares": (data.get("shares") or {}).get("count", 0) if data else None,
         "views": insights.get("views"),
-        "raw": {"post": data, "insights": insights, "insights_state": state},
+        "raw": {"post": data, "insights": insights, "insights_state": state, "engagement_state": engagement_state},
     }, None
 
 
@@ -12048,9 +12060,12 @@ def list_organic_performance(user_id: str = Depends(get_current_user_id)):
             raw = (snap.get("raw") or {}) if snap else {}
             ins = (raw.get("insights") or {}) if isinstance(raw, dict) else {}
             ins_state = raw.get("insights_state") if isinstance(raw, dict) else None
-            action = _INSIGHTS_UNLOCK_ACTION.get(row["platform"]) if ins_state == "needs_permission" else None
+            eng_missing = isinstance(raw, dict) and raw.get("engagement_state") == "needs_permission"
+            action = _INSIGHTS_UNLOCK_ACTION.get(row["platform"]) if (ins_state == "needs_permission" or eng_missing) else None
             note = ("Impressions appear about 2 days after you connect YouTube analytics — YouTube prepares them as a daily report."
                     if ins_state == "building" else None)
+            if eng_missing:
+                note = "Likes and comments on Facebook posts are waiting on one more Meta permission, which Punqle has requested."
             tiktok_metrics = None
             if row["platform"] == "tiktok":
                 tres = tiktok_results.get(row["id"]) or {}
