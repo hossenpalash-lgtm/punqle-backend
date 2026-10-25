@@ -372,6 +372,10 @@ class AvatarOptionOut(BaseModel):
     gender: Optional[str] = None
     preview_image_url: Optional[str] = None
     preview_video_url: Optional[str] = None
+    # Best engine tier HeyGen offers this presenter per video format, e.g.
+    # {"portrait": "premium", "landscape": "standard"}. Empty while the
+    # catalog is still loading — the picker then shows the presenter anyway.
+    formats: dict[str, str] = {}
 
 
 class AvatarOptionsResponse(BaseModel):
@@ -6631,36 +6635,188 @@ def _heygen_headers() -> dict:
     return {"X-Api-Key": HEYGEN_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
 
 
+# HeyGen retired GET /v2/avatars on 2026-10-31. Its v3 replacement splits a
+# presenter into a GROUP (the person — GET /v3/avatars, ~1,240 public ones) and
+# LOOKS (outfit/scene/format variants — GET /v3/avatars/looks, ~9,750 public
+# ones, 50 per page). POST /v3/videos takes a LOOK id (a group id is rejected
+# with avatar_not_found, confirmed live 2026-10-26), and a look has one fixed
+# orientation: a landscape look rendered at 9:16 comes out as a small picture
+# on a white canvas. Cursor paging can't be parallelised, so the full crawl
+# takes ~8 minutes — it runs in a background thread, is held in memory and is
+# refreshed every 6 h (signed preview-image URLs expire after 2-7 days) while
+# the old copy keeps serving.
+_HEYGEN_CATALOG_TTL = 6 * 3600
+_HEYGEN_CATALOG_RETRY_AFTER = 600
+_heygen_catalog: dict = {"groups": [], "looks": {}, "looks_at": 0.0, "retry_at": 0.0, "refreshing": False}
+_heygen_catalog_lock = threading.Lock()
+
+
+def _heygen_get_page(path: str, params: dict) -> dict:
+    """One HeyGen GET, retried on 429/5xx/connection errors — a ~200-request
+    crawl will meet one now and then."""
+    last: Optional[Exception] = None
+    for attempt in range(4):
+        try:
+            r = requests.get(f"{HEYGEN_API_BASE}{path}", headers=_heygen_headers(), params=params, timeout=30)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise requests.HTTPError(f"HeyGen {r.status_code}", response=r)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            last = e
+            status = getattr(e.response, "status_code", None)
+            if status is not None and status != 429 and status < 500:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+    raise last  # type: ignore[misc]
+
+
+def _heygen_iter(path: str, params: dict):
+    """Items across HeyGen v3 cursor pages (50 per page, `token` cursor)."""
+    token = None
+    for _ in range(500):
+        page = _heygen_get_page(path, {**params, "limit": 50, **({"token": token} if token else {})})
+        yield from page.get("data") or []
+        token = page.get("next_token")
+        if not page.get("has_more") or not token:
+            return
+
+
+def _heygen_gender(raw) -> Optional[str]:
+    g = str(raw or "").strip().lower()
+    return "female" if g in ("female", "woman") else "male" if g in ("male", "man") else None
+
+
+def _heygen_note_look(by_group: dict, look: dict) -> None:
+    """Fold one look into its group's summary: which formats the presenter
+    can render in and on which tier, plus the card picture/clip (a portrait
+    look with a preview clip is preferred — the picker card is portrait)."""
+    group_id = look.get("group_id")
+    orientation = look.get("preferred_orientation")
+    engines = look.get("supported_api_engines") or []
+    if not group_id or orientation not in ("portrait", "landscape"):
+        return
+    if _HEYGEN_ENGINE_BY_TIER["premium"] in engines:
+        tier = "premium"
+    elif _HEYGEN_ENGINE_BY_TIER["standard"] in engines:
+        tier = "standard"
+    else:
+        return
+    info = by_group.setdefault(group_id, {"formats": {}, "rep": None, "rep_score": -1})
+    if info["formats"].get(orientation) != "premium":
+        info["formats"][orientation] = tier
+    score = (2 if orientation == "portrait" else 0) + (1 if look.get("preview_video_url") else 0)
+    if look.get("preview_image_url") and score > info["rep_score"]:
+        info["rep_score"] = score
+        info["rep"] = (look["preview_image_url"], look.get("preview_video_url"))
+
+
+def _heygen_refresh_catalog() -> None:
+    with _heygen_catalog_lock:
+        if _heygen_catalog["refreshing"]:
+            return
+        _heygen_catalog["refreshing"] = True
+    started = time.time()
+    try:
+        groups = [
+            {
+                "id": g["id"],
+                "name": g.get("name") or g["id"],
+                "gender": _heygen_gender(g.get("gender")),
+                "image": g.get("preview_image_url"),
+                "video": g.get("preview_video_url"),
+            }
+            for g in _heygen_iter("/v3/avatars", {"ownership": "public"})
+            if g.get("id")
+        ]
+        # The group list alone is enough to show the picker; the looks crawl
+        # below then adds format/tier info and swaps in over several minutes.
+        with _heygen_catalog_lock:
+            _heygen_catalog["groups"] = groups
+        by_group: dict = {}
+        n_looks = 0
+        for look in _heygen_iter("/v3/avatars/looks", {"ownership": "public"}):
+            if look.get("status") in (None, "completed"):
+                _heygen_note_look(by_group, look)
+                n_looks += 1
+        with _heygen_catalog_lock:
+            _heygen_catalog["looks"] = by_group
+            _heygen_catalog["looks_at"] = time.time()
+        logger.info("HeyGen catalog refreshed: %d presenters, %d looks, %.0fs", len(groups), n_looks, time.time() - started)
+    except Exception as e:
+        logger.error("HeyGen catalog refresh failed: %s", str(e), exc_info=True)
+        with _heygen_catalog_lock:
+            _heygen_catalog["retry_at"] = time.time() + _HEYGEN_CATALOG_RETRY_AFTER
+    finally:
+        with _heygen_catalog_lock:
+            _heygen_catalog["refreshing"] = False
+
+
+def _heygen_ensure_catalog() -> None:
+    """Starts a background refresh when the catalog is missing or older than
+    the TTL. Never blocks the caller."""
+    if not HEYGEN_API_KEY:
+        return
+    now = time.time()
+    with _heygen_catalog_lock:
+        due = (
+            now - _heygen_catalog["looks_at"] > _HEYGEN_CATALOG_TTL
+            and now >= _heygen_catalog["retry_at"]
+            and not _heygen_catalog["refreshing"]
+        )
+    if due:
+        threading.Thread(target=_heygen_refresh_catalog, daemon=True, name="heygen-catalog").start()
+
+
+def _heygen_pick_look(avatar_id: str, aspect_ratio: str, engine_type: str) -> Optional[str]:
+    """The look id to render this presenter with: first of its public looks
+    in the wanted orientation that the engine supports. None if there is no
+    such look. An id that isn't a group at all (a look id from an older
+    client) is passed through for HeyGen itself to validate."""
+    want = "portrait" if aspect_ratio == "9:16" else "landscape"
+    seen_any = False
+    for look in _heygen_iter("/v3/avatars/looks", {"group_id": avatar_id, "ownership": "public"}):
+        seen_any = True
+        if (
+            look.get("preferred_orientation") == want
+            and look.get("status") in (None, "completed")
+            and engine_type in (look.get("supported_api_engines") or [])
+        ):
+            return look["id"]
+    return None if seen_any else avatar_id
+
+
 @app.get("/ads/avatar-options", response_model=AvatarOptionsResponse, tags=["ads"])
 def list_avatar_options(user_id: str = Depends(get_current_user_id)):
-    """Free — thin proxy over HeyGen's own stock avatar catalog (1264+
-    real avatars confirmed live 2026-09-03), fetched live rather than
-    stored, since it's HeyGen's catalog, not Punqle's data. No credit
-    gate — browsing doesn't generate anything."""
-    try:
-        r = requests.get(f"{HEYGEN_API_BASE}/v2/avatars", headers=_heygen_headers(), timeout=20)
-        r.raise_for_status()
-        raw = r.json().get("data", {}).get("avatars", [])
-        avatars = [
+    """Free — HeyGen's public stock presenters (v3 groups), served from the
+    background-refreshed catalog above. `formats` says which video formats
+    (portrait/landscape) each presenter can render and on which tier; it is
+    empty for a few minutes after a server restart, while the looks crawl
+    finishes. No credit gate — browsing doesn't generate anything."""
+    _heygen_ensure_catalog()
+    with _heygen_catalog_lock:
+        groups = list(_heygen_catalog["groups"])
+        by_group = _heygen_catalog["looks"]
+        complete = _heygen_catalog["looks_at"] > 0
+    if not groups:
+        raise HTTPException(status_code=503, detail="Presenters are still loading — please try again in a minute.")
+    avatars = []
+    for g in groups:
+        info = by_group.get(g["id"])
+        if complete and not info:
+            continue  # no public look to render it with
+        rep = info["rep"] if info and info["rep"] else None
+        avatars.append(
             {
-                "avatar_id": a.get("avatar_id"),
-                "name": a.get("avatar_name") or a.get("avatar_id"),
-                "gender": a.get("gender"),
-                "preview_image_url": a.get("preview_image_url"),
-                "preview_video_url": a.get("preview_video_url"),
+                "avatar_id": g["id"],
+                "name": g["name"],
+                "gender": g["gender"],
+                "preview_image_url": rep[0] if rep else g["image"],
+                "preview_video_url": rep[1] if rep else g["video"],
+                "formats": info["formats"] if info else {},
             }
-            for a in raw
-            if a.get("avatar_id")
-        ]
-        return {"avatars": avatars}
-    except HTTPException:
-        raise
-    except requests.RequestException as e:
-        logger.error("HeyGen avatar list error: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=502, detail="Couldn't load avatars right now.")
-    except Exception as e:
-        logger.error("ERROR: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        )
+    return {"avatars": avatars}
 
 
 @app.get("/ads/avatar-voices", response_model=AvatarVoicesResponse, tags=["ads"])
@@ -6707,10 +6863,10 @@ def start_avatar_video_generation(
 
         voice_id = req.voice_id or _HEYGEN_DEFAULT_VOICE_ID["english"]["male" if req.gender == "male" else "female"]
 
-        def _try_heygen_generate(engine_type: str):
+        def _try_heygen_generate(look_id: str, engine_type: str):
             payload = {
                 "type": "avatar",
-                "avatar_id": req.avatar_id,
+                "avatar_id": look_id,
                 "script": narration[:2000],
                 "voice_id": voice_id,
                 "aspect_ratio": req.aspect_ratio,
@@ -6724,25 +6880,53 @@ def start_avatar_video_generation(
             msg = (resp.json().get("error", {}).get("message") or "").lower()
             return "does not support" in msg
 
-        r = _try_heygen_generate(_HEYGEN_ENGINE_BY_TIER[req.tier])
+        # The picker hands over a presenter (HeyGen v3 group); HeyGen renders
+        # a look of it, in one fixed orientation — pick the one matching the
+        # video format so a landscape look never lands on a 9:16 canvas.
+        engine = _HEYGEN_ENGINE_BY_TIER[req.tier]
+        look_id = _heygen_pick_look(req.avatar_id, req.aspect_ratio, engine)
         actual_tier = req.tier
         fell_back = False
 
-        # Confirmed live: not every avatar in the catalog supports every
-        # engine tier (some reject Premium entirely). Rather than surface
-        # that as a dead-end failure the user has to notice, retry
-        # automatically with Standard/avatar_iii — confirmed to work on
-        # every avatar tried — and charge the lower, correct price for
-        # what was actually delivered instead of what was requested.
-        # check_avatar_video_status charges off avatar_video_jobs.tier
-        # below, so storing actual_tier there (not req.tier) is what
-        # makes the lower charge automatic — no separate credit-refund
-        # logic needed.
-        if req.tier == "premium" and _is_unsupported_engine_error(r):
-            r = _try_heygen_generate(_HEYGEN_ENGINE_BY_TIER["standard"])
+        # Not every presenter has a Premium look in the chosen format. Rather
+        # than surface that as a dead-end failure the user has to notice,
+        # drop to Standard/avatar_iii — which every look supports — and
+        # charge the lower, correct price for what was actually delivered
+        # instead of what was requested. check_avatar_video_status charges
+        # off avatar_video_jobs.tier below, so storing actual_tier there
+        # (not req.tier) is what makes the lower charge automatic — no
+        # separate credit-refund logic needed.
+        if look_id is None and req.tier == "premium":
+            engine = _HEYGEN_ENGINE_BY_TIER["standard"]
+            look_id = _heygen_pick_look(req.avatar_id, req.aspect_ratio, engine)
             actual_tier = "standard"
             fell_back = True
+        if look_id is None:
+            fmt = "vertical (9:16)" if req.aspect_ratio == "9:16" else "horizontal (16:9)"
+            raise HTTPException(
+                status_code=400,
+                detail=f"This presenter isn't available in {fmt} — pick another presenter or change the video format.",
+            )
 
+        r = _try_heygen_generate(look_id, engine)
+
+        # Safety net for any look whose engine list was wrong: HeyGen itself
+        # says "does not support" — retry once on Standard, same pricing rule.
+        if actual_tier == "premium" and _is_unsupported_engine_error(r):
+            standard_engine = _HEYGEN_ENGINE_BY_TIER["standard"]
+            standard_look = _heygen_pick_look(req.avatar_id, req.aspect_ratio, standard_engine)
+            if standard_look:
+                r = _try_heygen_generate(standard_look, standard_engine)
+                actual_tier = "standard"
+                fell_back = True
+
+        if r.status_code == 402:
+            # HeyGen's prepaid wallet is empty (auto-reload is off) — nothing a
+            # user can fix, so say so plainly and make Sentry shout.
+            logger.error("HEYGEN WALLET EMPTY — AI Presenter can't start videos until it is topped up: %s", r.text[:200])
+            raise HTTPException(status_code=503, detail="AI Presenter is temporarily unavailable — please try again later.")
+        if r.status_code == 404:
+            raise HTTPException(status_code=400, detail="That presenter isn't available any more — please pick another.")
         if r.status_code == 400:
             heygen_message = r.json().get("error", {}).get("message") or ""
             raise HTTPException(status_code=400, detail=heygen_message or "Couldn't start the avatar video.")
@@ -13449,3 +13633,7 @@ def health_models():
 
 import threading as _threading
 _threading.Thread(target=_check_model_registry, daemon=True, name="model-registry-check").start()
+# Warm the HeyGen presenter catalog now so the picker is ready by the time
+# anyone opens it (set HEYGEN_CATALOG_WARMUP=0 for tests that import this).
+if os.getenv("HEYGEN_CATALOG_WARMUP", "1") != "0":
+    _heygen_ensure_catalog()
