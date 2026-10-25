@@ -4915,7 +4915,7 @@ async def generate_unboxing_shot(
 
 VIDEO_CREDIT_COST = 30  # Video Ad: one fixed 8 s Gemini Omni 1.1 Flash clip at 1080p, sound included. Real cost ~$1.22 ($0.152/s) -> ~62% margin at Pro, ~67% at Growth. History: 10 on Veo 3.1 Lite ($0.40), 48-64 on Kling for a few hours on 2026-10-05 before the Omni trial showed Omni looked better at ~half the cost.
 TRYON_ANIMATE_CREDIT_COST = 30  # Try-On Animate: same Omni 8 s clip (sound included), same cost.
-KLING_VIDEO_AD_CREDIT_COST = 64  # Video Ad on Kling 3.0 Pro: 8 s with native sound = $0.336/s x 8 = ~$2.69 real (Replicate, third-party figure, unverified against an invoice) -> ~61% margin at Pro. Pricier than Omni (30), so it is an opt-in choice and never the free trial.
+KLING_VIDEO_AD_CREDIT_COST = 64  # NOTE 2026-10-25: Kling now runs on fal.ai ($0.168/s with sound = $1.34 per 8 s, list price) — this price was set for Replicate's $0.336/s; margin is now ~80%, left unchanged on purpose. Original note: Video Ad on Kling 3.0 Pro: 8 s with native sound = $0.336/s x 8 = ~$2.69 real (Replicate, third-party figure, unverified against an invoice) -> ~61% margin at Pro. Pricier than Omni (30), so it is an opt-in choice and never the free trial.
 VEO_MODEL = "veo-3.1-lite-generate-preview"
 VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
 # VideoOverlay-Bold has zero Bangla glyph coverage (confirmed live —
@@ -5189,7 +5189,7 @@ def _omni_try_kling_fallback(job_id: str, fb: Optional[dict], reason: str) -> bo
     Image->Video, Talking Video, custom actors) benefits with no changes. The user
     is charged the normal price (the margin is thinner only during an outage).
     Returns True when the clip was produced."""
-    if not fb or not REPLICATE_API_TOKEN:
+    if not fb or _kling_provider() is None:
         return False
     try:
         logger.error("Omni job %s failed (%s): continuing on Kling", job_id, reason)
@@ -5353,14 +5353,93 @@ def _omni_poll(job_id: str, feature: str) -> tuple:
 #   * start_image => aspect ratio comes from the image, so aspect_ratio is
 #     only sent for pure text-to-video.
 # ---------------------------------------------------------------------------
+# fal.ai hosts the same Kling 3.0 Pro at HALF Replicate's price (2026-10-25: fal's own
+# page says $0.112/s audio off, $0.168/s audio on; Replicate's figure is $0.224/$0.336,
+# a reseller number). Punqle's policy is to prefer the direct provider when it is
+# genuinely cheaper, and FAL_KEY is already set (OmniHuman). KLING_PROVIDER=replicate
+# switches back without a deploy; if fal fails to START a job and a Replicate token
+# exists, the job is started on Replicate instead. Job ids from fal carry the prefix
+# "fal-kling:" so every poller can tell the two apart.
+FAL_KLING_I2V_MODEL = "fal-ai/kling-video/v3/pro/image-to-video"
+FAL_KLING_T2V_MODEL = "fal-ai/kling-video/v3/pro/text-to-video"
+FAL_KLING_QUEUE_BASE = "https://queue.fal.run/fal-ai/kling-video"
+FAL_KLING_PREFIX = "fal-kling:"
+KLING_PROVIDER = os.getenv("KLING_PROVIDER", "fal").strip().lower()
+
+
+def _kling_provider() -> Optional[str]:
+    """"fal" (default, half the price), "replicate", or None when neither is configured."""
+    if KLING_PROVIDER != "replicate" and FAL_KEY:
+        return "fal"
+    if REPLICATE_API_TOKEN:
+        return "replicate"
+    return None
+
+
+def _fal_kling_start(prompt: str, duration: int, image_bytes: Optional[bytes], image_mime: str,
+                     aspect_ratio: str, generate_audio: bool) -> str:
+    """Starts Kling 3.0 Pro on fal.ai (always the 1080p "pro" endpoints) and returns
+    "fal-kling:<request id>". With a start image the aspect ratio comes from the image."""
+    body: dict = {"prompt": prompt, "duration": str(int(duration)), "generate_audio": bool(generate_audio)}
+    try:
+        if image_bytes:
+            body["start_image_url"] = _fal_upload(image_bytes, image_mime, "start.png" if "png" in image_mime else "start.jpg")
+            model = FAL_KLING_I2V_MODEL
+        else:
+            body["aspect_ratio"] = aspect_ratio if aspect_ratio in ("16:9", "9:16", "1:1") else "9:16"
+            model = FAL_KLING_T2V_MODEL
+        r = with_retry(
+            lambda: requests.post(f"https://queue.fal.run/{model}", headers=_fal_headers(), json=body, timeout=60),
+            exceptions=(requests.RequestException,), attempts=2,
+        )
+    except requests.RequestException as e:
+        logger.error("fal.ai Kling request failed: %s", type(e).__name__)
+        raise HTTPException(status_code=502, detail="Couldn't start the video.")
+    if not r.ok:
+        logger.error("fal.ai Kling submit failed (%s): %s", r.status_code, r.text[:300])
+        raise HTTPException(status_code=502, detail="Couldn't start the video.")
+    request_id = r.json().get("request_id")
+    if not request_id:
+        raise HTTPException(status_code=502, detail="The video service didn't return a job id.")
+    return f"{FAL_KLING_PREFIX}{request_id}"
+
+
+def _fal_kling_poll(request_id: str, feature: str) -> tuple:
+    """Returns (done, video_bytes_or_None, failed) — same contract as _kling_poll."""
+    st = requests.get(f"{FAL_KLING_QUEUE_BASE}/requests/{request_id}/status", headers=_fal_headers(), timeout=20)
+    st.raise_for_status()
+    if str(st.json().get("status") or "").upper() != "COMPLETED":
+        return False, None, False  # IN_QUEUE / IN_PROGRESS
+    res = requests.get(f"{FAL_KLING_QUEUE_BASE}/requests/{request_id}", headers=_fal_headers(), timeout=60)
+    video_url = ((res.json() or {}).get("video") or {}).get("url") if res.ok else None
+    if not video_url:
+        logger.error("fal.ai Kling job %s (%s) finished without a video (HTTP %s): %s", request_id, feature, res.status_code, res.text[:200])
+        return True, None, True
+    video_resp = requests.get(video_url, timeout=90)
+    video_resp.raise_for_status()
+    seconds = _media_duration_seconds(video_resp.content)
+    _log_real_cost_metric(feature, "fal", FAL_KLING_I2V_MODEL,
+                          {"video_seconds": round(seconds, 2) if seconds else None, "usd_per_second_list_price": "0.112 silent / 0.168 with sound"})
+    return True, video_resp.content, False
+
+
 def _kling_start_prediction(prompt: str, duration: int, image_bytes: Optional[bytes] = None,
                             image_mime: str = "image/jpeg", aspect_ratio: str = "9:16",
                             generate_audio: bool = False) -> str:
-    """Starts a Kling 3.0 Pro prediction on Replicate and returns its id.
-    generate_audio adds Kling's native sound track (ambient/foley) at ~+50%
-    cost ($0.336/s vs $0.224/s) — on for Video Ad only (founder liked the
-    sample, 2026-10-05); Try-On Animate, Image->Video and Talking Video
-    stay silent (the latter two get their own voice)."""
+    """Starts a Kling 3.0 Pro job (fal.ai by default, Replicate as the fallback) and
+    returns its id. generate_audio adds Kling's native sound track (ambient/foley):
+    +50% cost on both providers — on for Video Ad / Image->Video / the Omni fallback;
+    Try-On Animate and Talking Video stay silent (the latter gets its own voice)."""
+    provider = _kling_provider()
+    if provider is None:
+        raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+    if provider == "fal":
+        try:
+            return _fal_kling_start(prompt, duration, image_bytes, image_mime, aspect_ratio, generate_audio)
+        except HTTPException:
+            if not REPLICATE_API_TOKEN:
+                raise
+            logger.error("fal.ai Kling start failed — starting this job on Replicate instead")
     body = {"prompt": prompt, "duration": duration, "mode": "pro", "generate_audio": generate_audio}
     if image_bytes:
         body["start_image"] = f"data:{image_mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
@@ -5383,16 +5462,19 @@ def _kling_start_prediction(prompt: str, duration: int, image_bytes: Optional[by
 
 
 def _kling_operation(prediction_id: str) -> dict:
-    return {"provider": "replicate", "prediction_id": prediction_id}
+    return {"provider": "fal" if prediction_id.startswith(FAL_KLING_PREFIX) else "replicate", "prediction_id": prediction_id}
 
 
 def _is_kling_operation(operation: Optional[dict]) -> bool:
-    return isinstance(operation, dict) and operation.get("provider") == "replicate" and bool(operation.get("prediction_id"))
+    return (isinstance(operation, dict) and operation.get("provider") in ("replicate", "fal")
+            and bool(operation.get("prediction_id")))
 
 
 def _kling_poll(prediction_id: str, feature: str) -> tuple:
-    """Returns (done, video_bytes_or_None, failed). Raises 502 on a hard
-    failure so callers can surface a friendly message."""
+    """Returns (done, video_bytes_or_None, failed) for a job on either provider. Raises
+    on a hard HTTP failure so callers can surface a friendly message."""
+    if prediction_id.startswith(FAL_KLING_PREFIX):
+        return _fal_kling_poll(prediction_id[len(FAL_KLING_PREFIX):], feature)
     r = requests.get(f"https://api.replicate.com/v1/predictions/{prediction_id}", headers=_replicate_headers(), timeout=20)
     r.raise_for_status()
     data = r.json()
@@ -6403,7 +6485,7 @@ def start_video_generation(
     actually succeeds, same as every other AI action in this app."""
     try:
         credits = _get_ad_credits(user_id)
-        use_kling = req.engine == "kling_3_pro" and bool(REPLICATE_API_TOKEN)
+        use_kling = req.engine == "kling_3_pro" and _kling_provider() is not None
         video_cost = KLING_VIDEO_AD_CREDIT_COST if use_kling else VIDEO_CREDIT_COST
         # The free first Video Ad is Omni only: a free Kling clip would cost ~$2.69.
         has_trial = (not use_kling) and _has_unclaimed_trial(user_id, "video_ad")
@@ -7107,34 +7189,12 @@ def start_image_to_video(
             job_id = ensure_supabase_response(job_res, "create image-to-video job").data[0]["id"]
             return {"job_id": job_id, "operation": None}
 
-        # Kling 3.0 Pro (the only Replicate model offered here now): 1080p with its own
+        # Kling 3.0 Pro (fal.ai by default, Replicate as the fallback): 1080p with its own
         # sound, since the founder's rule is the best quality everywhere (9 credits/s).
-        replicate_model_id = KLING_MODEL
-        image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
-        input_body = {
-            "prompt": prompt,
-            "start_image": image_uri,
-            "duration": duration,
-            "mode": "pro",
-            "generate_audio": True,
-        }
-
-        r = with_retry(
-            lambda: requests.post(
-                f"https://api.replicate.com/v1/models/{replicate_model_id}/predictions",
-                headers=_replicate_headers(),
-                json={"input": input_body},
-                timeout=20,
-            ),
-            exceptions=(requests.RequestException,),
-            attempts=2,
+        prediction_id = _kling_start_prediction(
+            prompt, duration, base64.b64decode(req.image_base64), req.image_mime_type, req.aspect_ratio,
+            generate_audio=True,
         )
-        if not r.ok:
-            logger.error("Replicate create prediction failed (%s): %s", model, r.text)
-            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the video."))
-        prediction_id = r.json().get("id")
-        if not prediction_id:
-            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
 
         job_res = with_retry(lambda: supabase.table("image_to_video_jobs").insert({
             "owner_id": user_id,
@@ -7213,33 +7273,16 @@ def check_image_to_video_status(
             return {"done": True, "video_base64": base64.b64encode(video_bytes).decode("ascii"), "credits_remaining": new_credits}
 
         prediction_id = job["prediction_id"]
-        r = requests.get(
-            f"https://api.replicate.com/v1/predictions/{prediction_id}",
-            headers=_replicate_headers(),
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        status = data.get("status")
-        if status not in ("succeeded", "failed", "canceled"):
+        done, video_bytes, failed = _kling_poll(prediction_id, "image_to_video")
+        if not done:
             return {"done": False, "video_base64": None, "credits_remaining": None}
 
         with_retry(lambda: supabase.table("image_to_video_jobs").delete().eq("id", req.job_id).execute())
 
-        if status != "succeeded":
-            logger.error("Replicate prediction %s (%s) finished as %s: %s", prediction_id, model, status, data.get("error"))
+        if failed or not video_bytes:
             return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
 
-        video_url = data.get("output")
-        if isinstance(video_url, list):
-            video_url = video_url[0] if video_url else None
-        if not video_url:
-            return {"done": True, "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
-        video_resp = requests.get(video_url, timeout=60)
-        video_resp.raise_for_status()
-        video_base64 = base64.b64encode(video_resp.content).decode("ascii")
-
-        _log_real_cost_metric("image_to_video", "replicate", model, data.get("metrics"))
+        video_base64 = base64.b64encode(video_bytes).decode("ascii")
         cost = math.ceil(duration * IMAGE_TO_VIDEO_CREDIT_PER_SECOND[model])
         new_credits = _spend_ad_credits(user_id, cost, "image_to_video", model)
 
@@ -7307,43 +7350,14 @@ def start_talking_video(
             job_id = ensure_supabase_response(job_res, "create talking video job").data[0]["id"]
             return {"job_id": job_id, "operation": None}
 
-        replicate_model_id = KLING_MODEL if model == "kling_3_pro" else SEEDANCE_MODEL
-        image_uri = f"data:{req.image_mime_type};base64,{req.image_base64}"
+        # Kling 3.0 Pro is the only non-Omni model left (Seedance was retired, Veo mapped to
+        # Omni above): fal.ai by default, Replicate as the fallback. Silent on purpose — the
+        # voice comes from the Sync Labs redub afterwards.
         motion_prompt = "A person naturally talking to the camera, subtle head and hand movement, no on-screen text."
-        if model == "kling_3_pro":
-            input_body = {
-                "prompt": motion_prompt,
-                "start_image": image_uri,
-                "duration": duration,
-                "mode": "pro",
-                "generate_audio": False,
-            }
-        else:
-            input_body = {
-                "prompt": motion_prompt,
-                "image": image_uri,
-                "duration": duration,
-                "resolution": "720p",
-                "aspect_ratio": req.aspect_ratio,
-                "generate_audio": False,
-            }
-
-        r = with_retry(
-            lambda: requests.post(
-                f"https://api.replicate.com/v1/models/{replicate_model_id}/predictions",
-                headers=_replicate_headers(),
-                json={"input": input_body},
-                timeout=20,
-            ),
-            exceptions=(requests.RequestException,),
-            attempts=2,
+        prediction_id = _kling_start_prediction(
+            motion_prompt, duration, base64.b64decode(req.image_base64), req.image_mime_type, req.aspect_ratio,
+            generate_audio=False,
         )
-        if not r.ok:
-            logger.error("Replicate create prediction failed (%s): %s", model, r.text)
-            raise HTTPException(status_code=502, detail=_replicate_error_detail(r, "Couldn't start the video."))
-        prediction_id = r.json().get("id")
-        if not prediction_id:
-            raise HTTPException(status_code=502, detail="Replicate didn't return a job id.")
 
         job_res = with_retry(lambda: supabase.table("talking_video_jobs").insert({
             "owner_id": user_id,
@@ -7444,31 +7458,12 @@ def check_talking_video_status(
                     raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
                 video_bytes = gemini_client.files.download(file=result.generated_videos[0].video)
             else:
-                prediction_id = job["prediction_id"]
-                r = requests.get(
-                    f"https://api.replicate.com/v1/predictions/{prediction_id}",
-                    headers=_replicate_headers(),
-                    timeout=20,
-                )
-                r.raise_for_status()
-                data = r.json()
-                status = data.get("status")
-                if status not in ("succeeded", "failed", "canceled"):
+                done, video_bytes, failed = _kling_poll(job["prediction_id"], "talking_video_motion")
+                if not done:
                     return {"done": False, "stage": "animating", "video_base64": None, "credits_remaining": None}
-                if status != "succeeded":
-                    with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
-                    logger.error("Replicate prediction %s (%s) finished as %s: %s", prediction_id, model, status, data.get("error"))
-                    return {"done": True, "stage": "animating", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
-                video_url = data.get("output")
-                if isinstance(video_url, list):
-                    video_url = video_url[0] if video_url else None
-                if not video_url:
+                if failed or not video_bytes:
                     with_retry(lambda: supabase.table("talking_video_jobs").delete().eq("id", req.job_id).execute())
                     return {"done": True, "stage": "animating", "video_base64": None, "credits_remaining": _get_ad_credits(user_id)}
-                video_resp = requests.get(video_url, timeout=60)
-                video_resp.raise_for_status()
-                video_bytes = video_resp.content
-                _log_real_cost_metric("talking_video_motion", "replicate", model, data.get("metrics"))
 
             # Motion clip is ready -- synthesize narration and kick off
             # the redub, moving this job into its second stage.
